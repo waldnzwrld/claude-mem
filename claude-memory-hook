@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+#
+# Claude Code persistent-memory hook.
+#   SessionStart -> inject the memory index (TOC) + recent journals as context,
+#                   and, on the first session of a new day, flag journals that
+#                   have aged out of the retention window for condensation.
+#   PreCompact   -> best-effort reminder to flush unsaved notes to the journal
+#                   before the context is compacted.
+#
+# Reads the hook JSON on stdin, writes a hookSpecificOutput JSON on stdout.
+# Wired via ~/.claude/settings.json. Designed to never fail a session (exit 0).
+# See ~/.claude/memory/AGENTS.md for the protocol this supports.
+
+OUTL="${OUTL_BIN:-/opt/homebrew/bin/outl}"
+WS="$HOME/.claude/memory"
+MARKER="$WS/.last-session-date"
+TODAY="$(date +%F)"
+
+input="$(cat)"
+event="$(printf '%s' "$input" | python3 -c 'import sys, json
+try:
+    print(json.load(sys.stdin).get("hook_event_name", ""))
+except Exception:
+    print("")' 2>/dev/null)"
+
+# emit <hookEventName>  (context text taken from $CTX)
+emit() {
+  python3 -c 'import json, os, sys
+print(json.dumps({"hookSpecificOutput": {"hookEventName": sys.argv[1], "additionalContext": os.environ.get("CTX", "")}}))' "$1"
+}
+
+if [ "$event" = "PreCompact" ]; then
+  CTX="Before this context is compacted: append any unsaved decisions, discoveries, or new durable facts from this session to today's journal ($TODAY) using the outl tools, per ~/.claude/memory/AGENTS.md." \
+    emit "PreCompact"
+  exit 0
+fi
+
+# ---- SessionStart (default) ----
+ctx="You have persistent memory: an outl graph at ~/.claude/memory. Current state is below; retrieve detail on demand with outl_page_get (do not brute-force the graph). Protocol: ~/.claude/memory/AGENTS.md."$'\n\n'
+
+# Table of contents (index page), with a raw-file fallback.
+toc="$("$OUTL" export md index -w "$WS" 2>/dev/null)"
+[ -z "$toc" ] && [ -f "$WS/pages/index.md" ] && toc="$(cat "$WS/pages/index.md" 2>/dev/null)"
+[ -n "$toc" ] && ctx+="## Memory index (TOC)"$'\n\n'"$toc"$'\n\n'
+
+# Recent journals: today + yesterday.
+for d in "$TODAY" "$(date -v-1d +%F)"; do
+  f="$WS/journals/$d.md"
+  [ -f "$f" ] && ctx+="## Journal $d"$'\n\n'"$(cat "$f" 2>/dev/null)"$'\n\n'
+done
+
+# Consolidation flag: only on the first session of a new day.
+last=""
+[ -f "$MARKER" ] && last="$(cat "$MARKER" 2>/dev/null)"
+if [ "$last" != "$TODAY" ]; then
+  keep="$(date -v-4d +%F)"   # retention window = today .. today-4; anything older has aged out
+  aged=""
+  if [ -d "$WS/journals" ]; then
+    for f in "$WS/journals"/*.md; do
+      [ -e "$f" ] || continue
+      b="$(basename "$f" .md)"
+      case "$b" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+        *) continue ;;
+      esac
+      if [[ "$b" < "$keep" ]]; then
+        aged="$aged $b"
+      fi
+    done
+  fi
+  aged="$(printf '%s' "$aged" | xargs 2>/dev/null)"
+  if [ -n "$aged" ]; then
+    ctx+="⚠ Consolidation due (first session of a new day) for: $aged — each journal has aged out of the today+4 window; distill it into knowledge pages, prune low-frecency knowledge, then delete the raw journal, per the Condensation section of AGENTS.md."$'\n\n'
+  fi
+  printf '%s' "$TODAY" > "$MARKER" 2>/dev/null || true
+fi
+
+CTX="$ctx" emit "SessionStart"
+exit 0
