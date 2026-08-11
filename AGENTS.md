@@ -55,9 +55,12 @@ Depth is not fixed — add a level whenever one gets crowded.
 - **Leaf documents** (`type:: knowledge`, `parent:: [[<toc>]]`) — the actual subject matter.
   Props `project::`, `updated::`, `summary::`, `tags::`, plus frecency `frecency::` (int) /
   `seen::` (date). `pin:: true` protects a foundational leaf from pruning.
-- **Journals** — one per day, slug `YYYY-MM-DD`. Sections: `## Focus`, `## Decisions`,
-  `## Discoveries`, `## Open threads`, `## Links` (the `journal` template — see
-  `templates-journal`). Raw and short-lived; distilled into the tree by condensation.
+- **Journals** — one per day, slug `YYYY-MM-DD`. Five fixed sections, in this order:
+  `## Focus`, `## Key Decisions`, `## Discoveries`, `## Action Items`, `## Session Notes` —
+  laid down **once** by the `journal` template (see `templates-journal`), then appended to
+  *under* the matching section. There is exactly one of each section per day; never create a
+  second copy. Raw and short-lived; distilled into the tree by condensation. The per-section
+  contract and quality bar live in *Writing to memory*.
 
 Two rules keep the tree lean:
 
@@ -85,20 +88,84 @@ Crosslinks are what make this a graph instead of a pile of files. Use them liber
 - `((block-id))` — block reference/embed; use only to quote one specific decision across
   pages, not for ordinary links.
 
+## What long-term memory is for (the signal filter)
+
+Memory is not a mirror of the codebase — it is the layer of context that **cannot be
+reconstructed from the repos themselves**. Every repo already carries its own `CLAUDE.md` /
+`DEVELOPMENT.md` / `README`, its git history, and its source. Duplicating any of that into a
+knowledge leaf is waste: it goes stale, it bloats the graph, and the repo was the source of
+truth anyway. Before writing or distilling anything, apply one test:
+
+> **Could I reconstruct this by opening the repo (code, git log, `CLAUDE.md`)?** If yes,
+> *link to where it lives* instead of copying it. Only store what the repo can't tell you.
+
+**Keep — the durable, cross-cutting, hard-to-reconstruct:**
+
+- **Relationships between repos/systems** — deployment and dependency edges, who builds vs.
+  who deploys, how two projects interact. (E.g. [[project-cloud-native]] builds the images
+  that [[project-selfhosted-helm]] deploys; [[project-claudio-scheduled-tasks]] acts on the
+  cloud-native monorepo baked at `/opt/cloud-native`.) This lives in no single repo.
+- **Where we are in a long-running effort** — which area of which codebase we're working in
+  day by day, the state of a multi-session workstream, what's done and what's next.
+- **Decisions about an overarching plan and their *why*** — architectural direction, the
+  long-term trade-off chosen and the constraint that forced it.
+- **Non-obvious gotchas** that cost real time to rediscover and are written down *nowhere*
+  (not in any `CLAUDE.md` or code comment).
+- **Durable facts about the user** and their working preferences.
+
+**Drop — reconstructable or trivial; do not store in long-term leaves:**
+
+- Anything already in a repo's `CLAUDE.md` / `DEVELOPMENT.md` / `README` — **link to it,
+  never replicate it.**
+- Recent commits / git-log summaries — git history already has these.
+- What an individual function, file, or module does — the code is the source of truth.
+- Any transient mechanic that a glance at the current repo would re-establish.
+
+The contrast in one line: *remembering recent commits is useless (git has them); remembering
+where we are in a long-running project is exactly the point.* Journals may capture more in
+the moment (they're raw and short-lived), but only signal that passes this filter should
+survive **condensation** into a permanent leaf.
+
 ## Writing to memory (continuously)
 
 Append to **today's journal** at natural checkpoints — after a decision is made, something
 non-obvious is discovered, a new durable fact about the user or a project surfaces, or an
 open thread is opened/closed. Don't wait for the end of the session.
 
-- `outl_daily_append` for a quick flat note, or `outl_block_append_tree` (with
-  `page: <today's date>`) to add a `## Section` with children.
-- Put each note under the right section and **link outward** (`[[...]]`).
-- A `PreCompact` hook will remind you to flush anything unsaved before the context is
-  compacted — treat that as a cue to write pending notes to the journal.
+**Scaffold once, then append *under* sections — never restack them.** The daily page has
+five fixed sections in a fixed order (below). The **first** time you write on a new day, lay
+them down with `outl_template_apply name:journal page:<today>`. Every later write **appends
+its item as a child under the matching existing `## Section`** — target that section's block
+id with `outl_block_append` / `outl_block_append_tree`. **Never emit a `## Section` header
+that already exists.** If you catch yourself adding a second `## Focus` (or any other
+section), stop and append under the existing one. This single rule is what stops a day from
+sprouting five `## Focus` and three `## Discoveries` blocks.
 
-Write durable signal, not transcript: decisions and their *why*, discoveries, user
-preferences, project state. Skip anything already recorded in code or git.
+The five sections and what each holds:
+
+- **`## Focus`** — the day's table of contents: **one bullet per distinct work-stream**
+  (not one per checkpoint), each naming its subject as `[[project-...]]` + a short phrase.
+- **`## Key Decisions`** — durable choices. Each bullet leads with the decision, then the
+  *why* (the reasoning or constraint that forced it).
+- **`## Discoveries`** — non-obvious facts learned: gotchas, how something actually works.
+- **`## Action Items`** — checkbox todos, `- [ ]` open / `- [x]` done. Concrete next steps.
+- **`## Session Notes`** — brief free-form catch-all for what doesn't fit above. Not the
+  main channel; keep it short.
+
+**Quality bar — every bullet must:**
+
+- **Name its subject explicitly.** Never write "this repo", "the project", "the branch",
+  "the git log" bare — say *which*: `[[project-cloud-native]]`, `carto-selfhosted-helm`,
+  `feat/report-payload-shipping`. A note that doesn't identify its subject is worthless read
+  cold months later.
+- **Link outward** with `[[project-...]]` / `[[topic]]` so condensation can find and route
+  it.
+- Carry **one durable fact** — a decision + its why, a discovery, a user preference, project
+  state. Write signal, not transcript, and apply *What long-term memory is for* above: if the
+  repo, its git log, or its `CLAUDE.md` already holds it, link to that instead of copying it.
+
+A `PreCompact` hook will remind you to flush anything unsaved before the context is
+compacted — treat that as a cue to write pending notes to the journal.
 
 ## Condensation (daily → knowledge rollup)
 
@@ -116,7 +183,9 @@ For each flagged journal date:
 
 1. `outl_daily_get <date>` — read the raw journal.
 2. Cluster its items by the `[[linked page]]` / topic they concern.
-3. For each cluster with lasting value, descend the tree to the target leaf document (an
+3. For each cluster with lasting value — judged by *What long-term memory is for* (keep
+   cross-repo relationships, plan state, decisions + why; drop anything the repo/git/`CLAUDE.md`
+   already holds) — descend the tree to the target leaf document (an
    existing one, or create a new leaf under the right TOC — splitting or adding a TOC level
    if a parent is getting crowded). Merge the **distilled** points in — synthesize, don't
    copy verbatim. Set/refresh `updated::` and `summary::`; ensure `project:: [[...]]`,
@@ -161,6 +230,32 @@ Scale: a fresh leaf (seed 30) survives ~30 idle days; each use adds ~5 days; a
 heavily-used leaf rides at the 60-day cap. Deletion here is intentional and unrecoverable,
 exactly like journal burning.
 
+## Research references (external live docs)
+
+Research the user commissions is written as markdown to `~/Code/research/*.md` — **outside**
+the graph. Those files are the source of truth and must never be copied into or symlinked
+under `pages/` (a raw file has no `.outl` sidecar and no frontmatter, so it isn't a real
+node, and the pruning sweep — `outl_page_delete` — could destroy it). Link them via a
+**reference stub**: a third node kind alongside `moc` and `knowledge`.
+
+- **Kind.** `type:: reference`, slug `research-<topic>`. Props: `source:: <absolute path to
+  the ~/Code/research/*.md file>`, `status:: active | complete`, `parent:: [[research]]`,
+  `summary::`, `updated::`. **No `frecency::` / `seen::` pair** — like a TOC, it is exempt
+  from the daily frecency sweep by construction (the sweep only decays `type:: knowledge`
+  leaves). Its lifecycle is governed by `status::`, not by access frequency.
+- **Pointer, not copy.** The stub stores the *path*, never the content, so it is always
+  current — to read the research, open `source::` directly. Body = one-line hook + `[[...]]`
+  links to the projects/topics it concerns + a "Live file: `<source>`" pointer line.
+- **Linking.** Hang stubs under a top-level `[[research]]` TOC (`type:: moc`, linked from
+  `index`); **create that TOC lazily** the first time a research subject is linked, not
+  before. Journal items that touch a research subject link `[[research-<topic>]]`, exactly
+  like any other outward journal link.
+- **On completion** (`status:: complete`): **delete the stub** — `outl_page_delete
+  research-<topic> confirm:true`, remove its link from the `[[research]]` TOC, and delete
+  the now-empty TOC (and its `index` link) if that was its last child. The `~/Code/research`
+  file is left untouched; it is its own archive. Nothing is condensed into a `knowledge`
+  leaf.
+
 ## Maintenance invariants
 
 - **Every node is reachable from `index` by following links** — no orphans. Each TOC links
@@ -168,7 +263,9 @@ exactly like journal burning.
   `## Recent journals` list reflects the retention window.
 - Every TOC carries `type:: moc`; every leaf carries `type:: knowledge`, `project::`,
   `parent::`, `updated::`, `summary::`, and the frecency pair `frecency::` / `seen::`
-  (foundational leaves add `pin:: true`).
+  (foundational leaves add `pin:: true`). Reference stubs carry `type:: reference` +
+  `source::` + `status::` and deliberately omit the frecency pair (see *Research
+  references*).
 - **Keep every page small.** If a leaf pushes ~150 lines, split it into a TOC + child
   leaves (see *The graph model*). A page that would eat a big slice of context on read is a
   bug — traversing tiny pages is the whole point.

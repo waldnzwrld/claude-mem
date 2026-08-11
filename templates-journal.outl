@@ -1,0 +1,49 @@
+{
+  "version": 2,
+  "page_id": "1Y7EHRBYKGA71WGWK3ZW5R98NX",
+  "last_synced_hash": "sha256:e4935e121890cea2f134a9da576ac1390a406b0af6fb9c8ff0634f5c97925e08",
+  "last_synced_at": "2026-08-10T23:12:08.650699+02:00",
+  "blocks": [
+    {
+      "id": "01KZPR9AFWX4FWSH9ENDK0R8AX",
+      "line": 1,
+      "indent": 0,
+      "content_hash": "sha256:1d0d345c6517ba409eff6ab4ea585aaa43b6744d4913d728e2709c9bdaa6b96f",
+      "ref_handle": "blk-k0r8ax",
+      "text": "## Focus"
+    },
+    {
+      "id": "01KZPR9BA0B1H1K8GHH525F90H",
+      "line": 2,
+      "indent": 0,
+      "content_hash": "sha256:aa3634cb7ab19b388484c39d832e16c320aaff4ec35feb12cfa1b197e581e3cb",
+      "ref_handle": "blk-25f90h",
+      "text": "## Key Decisions"
+    },
+    {
+      "id": "01KZPR9BYPPQEPEGQJ7FYCFFS5",
+      "line": 3,
+      "indent": 0,
+      "content_hash": "sha256:2a630b89cc6f4e361bab448c3c8f941356bfc8d1015cd39005d519ee4c0e3251",
+      "ref_handle": "blk-ycffs5",
+      "text": "## Discoveries"
+    },
+    {
+      "id": "01KZPR9CT9C97WJR840R5BX3MA",
+      "line": 4,
+      "indent": 0,
+      "content_hash": "sha256:eb5812a01bd7fe2d626cdffd0322dc199ff23fd2dde577094d9b37071d68343a",
+      "ref_handle": "blk-5bx3ma",
+      "text": "## Action Items"
+    },
+    {
+      "id": "01KZPR9CVPQ9ACG9Y5538E4H7W",
+      "line": 5,
+      "indent": 0,
+      "content_hash": "sha256:e7af33b1a02048d2a347a2827265996adb09d037cc59e236aabeeeba2e40c37c",
+      "ref_handle": "blk-8e4h7w",
+      "text": "## Session Notes"
+    }
+  ],
+  "pipeline_version": 4
+}
