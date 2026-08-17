@@ -13,6 +13,22 @@
   tree. If you have not just checked, do not assert; check first, or say you
   need to check.
 
+## LSP tooling — always use the nvim MCP
+
+Whenever LSP is involved — diagnostics, hover, go-to-definition, symbols,
+references, or any "what does the language server say" question — use the **nvim
+MCP** LSP tools against the user's live Neovim session:
+
+- `mcp__nvim__vim_lsp_diagnostics`
+- `mcp__nvim__vim_lsp_hover`
+- `mcp__nvim__vim_lsp_symbols`
+
+**Never** use Claude Code's built-in/internal LSP tool or any VS Code LSP
+integration. The user has **no** language servers installed for Claude and does
+**not** use VS Code; the only working LSP is the one running inside their Neovim
+instance, reachable through the nvim MCP. If the nvim MCP LSP is unavailable,
+say so — do not silently fall back to an internal LSP tool.
+
 ## Persistent memory
 
 You have persistent, cross-session memory in an **outl** graph at `~/.claude/memory`,
