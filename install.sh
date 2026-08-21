@@ -125,7 +125,7 @@ fi
 cat <<EOF
 
 Done. Files are in place. Remaining steps (you said you'd handle these):
-  1. brew install outl (avelino/outl tap) if not already installed
+  1. brew install outl (outlmd/outl tap) if not already installed
   2. outl init ~/.claude/memory
   3. claude mcp add outl --scope user -- outl --workspace ~/.claude/memory mcp serve
   4. build the retrieval index (safe to re-run any time; the SessionStart hook
