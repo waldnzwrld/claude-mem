@@ -38,6 +38,33 @@ Example: "how does projectx handle payments?" → `index` → `[[project-x]]` (h
 frontend) → `[[project-x-frontend]]` → `[[project-x-frontend-payments]]` → the answer. Five
 small reads, the whole graph never loaded.
 
+## Retrieval regime auto-scales to graph size (the index)
+
+The TOC-descent above is the retrieval mechanism for a **small** graph — cheap when there
+are tens of nodes. Past a threshold (default **150 nodes**) descent stops being free: you
+don't know which `[[link]]` name holds the answer, and `outl_search` is keyword-only, so it
+misses paraphrase (a query for "money stuff" never finds `[[payments-hands-off]]`). At that
+scale a **derived retrieval index** — the `memory-index` sidecar — front-runs the descent.
+You never choose the regime; it's gated on node count.
+
+- **`memory-index` is a rebuildable derivative, never a source of truth.** It's a single
+  SQLite file (FTS5 keyword index + a `[[link]]` edge table) at `.outl/index.sqlite`, built
+  with the Python standard library only — no third-party packages, no venv, no build step,
+  so it just works on any machine that has Python. Delete it and `memory-index rebuild`
+  reconstructs it from the markdown. The markdown graph remains the only authority.
+- **The SessionStart hook injects whether the index is ACTIVE.** When it is, retrieve like
+  this: run **`memory-index search "<query terms>"`** *first* to land directly on the narrow
+  relevant band — keyword (FTS5/bm25) ranking that returns `slug › heading` pointers plus one
+  graph hop of `[[link]]` neighbors — **then** `outl_page_get` the one or two slugs it names
+  to read full detail. Search replaces steps 1–4's blind descent; you still expand via the
+  graph. (Matching is keyword, not semantic: prefer the subject's own terms, and fall back to
+  TOC descent when a paraphrase misses.)
+- **When the index is inactive** (small graph, or the hook says so), use the TOC-descent
+  above unchanged. It is also the **universal fallback** whenever the index is stale or
+  `memory-index` is unavailable — the system always works without it.
+- Writing is unchanged: you still author markdown/journals normally. The hook keeps the
+  index fresh (`memory-index refresh`, incremental by page hash) with no action from you.
+
 ## The graph model — a tree of TOCs
 
 Memory is a **tree of nested TOCs (MOCs) with real documents at the leaves**. Every node is
@@ -169,17 +196,40 @@ compacted — treat that as a cue to write pending notes to the journal.
 
 ## Condensation (daily → knowledge rollup)
 
-**Retention window = today + the previous 4 days** (5 raw journals). Journals older than
-that are distilled into permanent knowledge pages, then deleted — the distilled version
-lives on.
+**Retention = the 5 most recent journal files** (by date). High-resolution recent memory
+holds exactly these 5 and never more; the count is what governs, not the calendar, so gaps
+in dates are irrelevant. The instant a 6th journal appears, the oldest surplus journal is
+distilled into permanent knowledge pages and then deleted — the distilled version lives on —
+bringing the count back to 5. The count is never reduced below 5 except transiently while a
+new journal is being added.
 
-**Trigger:** the SessionStart hook flags `⚠ Consolidation due (first session of a new day)
-for: <dates>` on the first session of a new day, listing each journal that has aged out of
-the window (date ≤ D‑5). Deletion is unconditional — there is no `consolidated::` guard and
-no safety net; the raw journal is burned once distilled. When you see the flag, run the
-rollup before other work:
+**Trigger — mechanized, and it does not depend on you remembering.** The SessionStart hook
+runs `memory-index consolidate --reap` on **every** session (not just the first of a day, so
+a missed reminder is caught the next session, never lost until tomorrow). It splits every
+aged journal (every journal older than the 5 most recent) two ways and acts accordingly:
 
-For each flagged journal date:
+- **reapable** = aged **and** already carries `consolidated:: <date>` → the hook **deletes it
+  automatically** (`outl page delete --confirm`). You never delete a journal by hand.
+- **pending** = aged and **not** yet `consolidated::` → distillation is synthesis, so it needs
+  an LLM — but it is **not left to whatever interactive session happens to notice a directive**.
+  The hook launches **`memory-consolidate`**, a detached, headless `claude -p` agent, in the
+  background: it distills every pending journal per this section, marks each `consolidated::
+  <today>`, and reaps — automatically, with no prompting, on every install that has the
+  `claude` CLI. Your interactive session is only *told* it is running (so you don't do it by
+  hand). The **`⚠ CONSOLIDATION REQUIRED`** directive is now only a **fallback**, injected when
+  the `claude` CLI or `memory-consolidate` is unavailable; when you see it, do the steps below
+  *this session, before the user's request*.
+
+**The `consolidated::` + `distilled-into::` guard is what makes the automatic deletion safe:**
+the reap only ever deletes a journal that is both marked `consolidated::` **and** mechanically
+verified — every knowledge page named in its `distilled-into::` evidence property exists and
+carries `updated:: >= <consolidated date>` (proof the distiller actually wrote there), or the
+explicit `distilled-into:: none` sentinel. A journal marked `consolidated::` without written
+targets fails verification and is **re-queued for distillation**, never burned. (This closes
+the earlier trust gap where a bare self-reported mark could delete a journal whose content
+never reached the tree.)
+
+When you see the `⚠ CONSOLIDATION REQUIRED` directive, for each pending journal date:
 
 1. `outl_daily_get <date>` — read the raw journal.
 2. Cluster its items by the `[[linked page]]` / topic they concern.
@@ -194,8 +244,15 @@ For each flagged journal date:
    `seen:: <today>`.
 4. If you created a new leaf or TOC, add its one-line `[[link]]` + hook to the parent TOC
    (and the parent to `index` if it's a new top-level project/topic).
-5. `outl_page_delete <date> confirm:true` — burn the raw journal now that it's distilled.
-   (If a journal held nothing worth keeping, delete it without creating a page.)
+5. **Record evidence, then mark done — as the LAST actions, and never delete by hand.**
+   First `outl_page_prop_set <date> distilled-into="[[slug-a]] [[slug-b]] …"` naming every
+   leaf you actually merged this journal into (set each of those leaves' `updated:: <today>`
+   in step 3); if the journal held nothing durable, `outl_page_prop_set <date>
+   distilled-into=none` instead. Then `outl_page_prop_set <date> consolidated=<today>`. Reap
+   VERIFIES each named leaf exists with `updated:: >= <today>` before deleting the journal, so
+   a mark without written targets is re-queued, not burned. The hook then reaps the verified
+   journal (this session's reap already ran, so it's deleted at the *next* session start — or
+   run `memory-index consolidate --reap` yourself to burn it now).
 
 Then run the **frecency sweep** (see below) over all leaf documents.
 
@@ -216,11 +273,16 @@ real-but-occasional knowledge survives, short enough that stale detail clears ou
 - **On material use** — whenever you open a leaf to *use* its content, or merge into it
   during condensation (not a passing glance) — bump `frecency` by **+5** (cap 60) and set
   `seen:: <today>`.
-- **Daily sweep** (part of the consolidation pass, once per new day): every non-pinned leaf
-  whose `seen::` is not today gets `frecency − 1`; set its `seen:: <today>` so it decays at
-  most once per day. Any leaf reaching `0` is pruned: `outl_page_delete <slug> confirm:true`,
-  remove its link from the parent TOC, and delete the parent TOC too if that was its last
-  child.
+- **Daily sweep — now mechanized by the hook.** On the first session of a new day the
+  SessionStart hook runs `memory-index maintain`, which decays every non-pinned
+  `type:: knowledge` leaf whose `seen::` is not today by `frecency − 1` and sets
+  `seen:: <today>` (writes go through `outl page prop set`, so the `.outl` sidecar stays in
+  sync — the decay arithmetic is no longer yours to do by hand). **Pruning stays yours:**
+  the sweep does not delete anything; it surfaces any leaf that reached `0` as a *prune
+  candidate* in the injected context. For each candidate, decide whether to
+  `outl_page_delete <slug> confirm:true` (then remove its link from the parent TOC, and the
+  parent TOC too if that was its last child) or bump it if it's still relevant. Deletion
+  needs the link cleanup, which is why it is a reviewed action, not automatic.
 - `pin:: true` exempts a foundational leaf (project-critical or identity knowledge) from
   decay and pruning entirely.
 - Optional: order each TOC's link list by `frecency` (high → low) so the most-used

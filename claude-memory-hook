@@ -12,6 +12,11 @@
 # See ~/.claude/memory/AGENTS.md for the protocol this supports.
 
 OUTL="${OUTL_BIN:-/opt/homebrew/bin/outl}"
+MEMIDX="${MEMORY_INDEX_BIN:-$HOME/.local/bin/memory-index}"
+CONS="${MEMORY_CONSOLIDATE_BIN:-$HOME/.local/bin/memory-consolidate}"
+CLAUDE="${CLAUDE_BIN:-claude}"
+# Hooks can run with a minimal PATH; fall back to the usual install location.
+command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE="$HOME/.local/bin/claude"
 WS="$HOME/.claude/memory"
 MARKER="$WS/.last-session-date"
 TODAY="$(date +%F)"
@@ -43,35 +48,109 @@ toc="$("$OUTL" export md index -w "$WS" 2>/dev/null)"
 [ -z "$toc" ] && [ -f "$WS/pages/index.md" ] && toc="$(cat "$WS/pages/index.md" 2>/dev/null)"
 [ -n "$toc" ] && ctx+="## Memory index (TOC)"$'\n\n'"$toc"$'\n\n'
 
-# Recent journals: today + yesterday.
-for d in "$TODAY" "$(date -v-1d +%F)"; do
-  f="$WS/journals/$d.md"
-  [ -f "$f" ] && ctx+="## Journal $d"$'\n\n'"$(cat "$f" 2>/dev/null)"$'\n\n'
-done
+# Recent workflow window (statically loaded, so it's cached and cheap — not re-fetched
+# via tool calls mid-session): today's journal IN FULL, plus the `## Focus` digest of the
+# previous up-to-4 dated journals. That is the recent-5 high-res window in bounded form —
+# each prior day contributes only its day's-work TOC; pull a full prior journal on demand
+# with outl_daily_get when a digest line points somewhere you need to read.
+tf="$WS/journals/$TODAY.md"
+[ -f "$tf" ] && ctx+="## Journal $TODAY"$'\n\n'"$(cat "$tf" 2>/dev/null)"$'\n\n'
+prev="$(ls "$WS"/journals/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null \
+        | grep -v "/$TODAY\.md$" | sort -r | head -4)"
+digest=""
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  d="$(basename "$f" .md)"
+  # Extract the `## Focus` section: from its bullet-heading to the next `## ` section.
+  focus="$(awk '/^[[:space:]]*-[[:space:]]+## Focus/{p=1;print;next} /^[[:space:]]*-[[:space:]]+## /{p=0} p' "$f" 2>/dev/null)"
+  [ -n "$focus" ] && digest+="### $d"$'\n'"$focus"$'\n\n'
+done <<< "$prev"
+[ -n "$digest" ] && ctx+="## Recent journal focus (prior days — full text via outl_daily_get <date>)"$'\n\n'"$digest"
 
-# Consolidation flag: only on the first session of a new day.
+# Retrieval index (memory-index): keep it fresh, then tell the agent whether the
+# graph is large enough that the index is ACTIVE (search-first) or not (TOC descent).
+# Best-effort and non-fatal: if the tool or its deps are missing, memory just works
+# via TOC traversal, exactly as before.
+if [ -x "$MEMIDX" ]; then
+  "$MEMIDX" -w "$WS" refresh >/dev/null 2>&1 || true
+  stats="$("$MEMIDX" -w "$WS" stats --json 2>/dev/null)"
+  active="$(printf '%s' "$stats" | python3 -c 'import sys, json
+try:
+    print("1" if json.load(sys.stdin).get("active") else "0")
+except Exception:
+    print("")' 2>/dev/null)"
+  if [ "$active" = "1" ]; then
+    ctx+="Retrieval: the memory-index is ACTIVE for this graph. To recall, run \`memory-index search \"<query terms>\"\` FIRST (keyword/FTS5 + one graph hop of [[link]] neighbors), then \`outl_page_get\` the slugs it names — per the 'Retrieval regime auto-scales' section of AGENTS.md. Fall back to TOC descent if it returns nothing."$'\n\n'
+  fi
+
+  # Consolidation — EVERY session (not marker-gated), so a missed reminder is caught
+  # the next session, not lost until tomorrow. Two halves:
+  #   * reap (mechanical): delete aged journals the agent already marked consolidated::
+  #     — guarded, so an undistilled journal is never deleted.
+  #   * distill (LLM): if any aged journal is still un-distilled, run it AUTOMATICALLY
+  #     in a detached, headless `claude -p` agent (memory-consolidate) so it happens
+  #     with no prompting, on any machine. The interactive MANDATORY directive is now
+  #     only the fallback for when the claude CLI or the script is unavailable.
+  # Cheap pure-bash pre-check first: retention is by COUNT — keep the 5 most recent
+  # dated journals, age out anything older. In steady state there are exactly 5 on disk,
+  # so we skip the subprocess entirely — the common session pays nothing. We only spin up
+  # the tool when a 6th (or more) journal exists.
+  jcount=0
+  for f in "$WS"/journals/*.md; do
+    [ -e "$f" ] || continue
+    b="$(basename "$f" .md)"
+    case "$b" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) jcount=$((jcount + 1)) ;; esac
+  done
+  aged_exists=0
+  [ "$jcount" -gt 5 ] && aged_exists=1
+  pend=""
+  if [ "$aged_exists" = 1 ]; then
+    con="$("$MEMIDX" -w "$WS" consolidate --reap --json 2>/dev/null)"
+    pend="$(printf '%s' "$con" | python3 -c 'import sys, json
+try:
+    print(" ".join(json.load(sys.stdin).get("pending", [])))
+except Exception:
+    print("")' 2>/dev/null)"
+  fi
+  # Skip entirely inside the headless consolidation agent's own session (it has its
+  # own -p prompt); only act for real interactive sessions.
+  if [ -n "$pend" ] && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ]; then
+    if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1; then
+      # Automatic path: distill + reap in a detached background agent. SessionStart
+      # returns immediately; the backlog clears with zero prompting, every install.
+      nohup "$CONS" >/dev/null 2>&1 &
+      disown 2>/dev/null || true
+      ctx+="Memory consolidation is running automatically in a background agent for aged journals ($pend) — it will distill them into the knowledge tree and reap them. Do NOT consolidate or delete journals yourself."$'\n\n'
+    else
+      # Fallback only (no claude CLI / no memory-consolidate installed): the
+      # interactive MANDATORY directive, exactly as before.
+      ctx+="⚠ CONSOLIDATION REQUIRED before other work this session — these journals are older than the 5 most recent and are NOT yet distilled (verified): $pend. For EACH date, per the Condensation section of AGENTS.md: cluster its items by the [[page]] they concern, merge the distilled points into the right knowledge leaf (create/split as needed; set each such leaf's \`updated:: $TODAY\` plus summary::/frecency). Then, as the LAST actions for that date: (1) record evidence — \`outl_page_prop_set <date> distilled-into='[[slug-a]] [[slug-b]]'\` listing every leaf you wrote to, or \`distilled-into=none\` if nothing was durable; (2) \`outl_page_prop_set <date> consolidated=$TODAY\`. Reap VERIFIES each named leaf exists with \`updated:: >= $TODAY\` before deleting the journal — a journal marked without written targets is NOT reaped, it is re-queued. Do NOT delete journals yourself. Do this now, then address the user's request."$'\n\n'
+    fi
+  fi
+fi
+
+# Once-per-new-day work (frecency sweep). The consolidation backlog is handled every
+# session above, not here, so a missed reminder is never lost until the next day.
 last=""
 [ -f "$MARKER" ] && last="$(cat "$MARKER" 2>/dev/null)"
 if [ "$last" != "$TODAY" ]; then
-  keep="$(date -v-4d +%F)"   # retention window = today .. today-4; anything older has aged out
-  aged=""
-  if [ -d "$WS/journals" ]; then
-    for f in "$WS/journals"/*.md; do
-      [ -e "$f" ] || continue
-      b="$(basename "$f" .md)"
-      case "$b" in
-        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
-        *) continue ;;
-      esac
-      if [[ "$b" < "$keep" ]]; then
-        aged="$aged $b"
-      fi
-    done
+  # Mechanized frecency sweep (once per new day): decay non-pinned `type:: knowledge`
+  # leaves by 1 (seed 30) via `outl page prop set` — sidecar-safe, never raw edits —
+  # and surface any leaf that reached 0 as a prune candidate for review. Deletion is
+  # NOT automatic (it needs parent-TOC link cleanup), so it stays an agent decision.
+  if [ -x "$MEMIDX" ]; then
+    sweep="$("$MEMIDX" -w "$WS" maintain --json 2>/dev/null)"
+    "$MEMIDX" -w "$WS" refresh >/dev/null 2>&1 || true   # re-index the decayed frontmatter
+    cands="$(printf '%s' "$sweep" | python3 -c 'import sys, json
+try:
+    print(" ".join(json.load(sys.stdin).get("prune_candidates", [])))
+except Exception:
+    print("")' 2>/dev/null)"
+    if [ -n "$cands" ]; then
+      ctx+="⚠ Frecency prune candidates (reached 0 in today's sweep): $cands — per the Frecency & pruning section of AGENTS.md, decide for each whether to delete it (outl_page_delete, then remove its parent-TOC link) or bump its frecency if it's still relevant."$'\n\n'
+    fi
   fi
-  aged="$(printf '%s' "$aged" | xargs 2>/dev/null)"
-  if [ -n "$aged" ]; then
-    ctx+="⚠ Consolidation due (first session of a new day) for: $aged — each journal has aged out of the today+4 window; distill it into knowledge pages, prune low-frecency knowledge, then delete the raw journal, per the Condensation section of AGENTS.md."$'\n\n'
-  fi
+
   printf '%s' "$TODAY" > "$MARKER" 2>/dev/null || true
 fi
 
