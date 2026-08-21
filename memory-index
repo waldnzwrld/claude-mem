@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+"""
+memory-index — a rebuildable retrieval sidecar over the outl memory graph.
+
+The outl markdown graph at ~/.claude/memory is the sole source of truth. This tool
+builds a DERIVED, disposable SQLite index over it (FTS5 keyword + a link/edge table)
+so recall can land on the narrow relevant band in one shot, then expand along
+[[links]]. The index is never authoritative: delete it and `rebuild` reconstructs it
+from the markdown on any machine.
+
+Commands:
+  memory-index rebuild        Full reindex from markdown (idempotent).
+  memory-index refresh        Incremental: reindex only pages whose hash changed.
+  memory-index search "q"     Keyword (FTS5/bm25) + one graph hop of [[link]] neighbors.
+  memory-index stats          Node/chunk counts, index freshness, active/inactive.
+
+Design notes:
+  * STDLIB ONLY — no third-party packages, no venv, no build step. It relies only on
+    Python 3.9+ and the sqlite3/FTS5 that ship with CPython, so it is a single file
+    that just works on any machine. The whole index is one SQLite file (.outl/index.sqlite).
+  * Auto-scale gate: below --threshold nodes the graph is small enough that agentic
+    TOC-traversal beats an index; `stats` reports inactive and callers skip it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+WS_DEFAULT = os.path.expanduser("~/.claude/memory")
+SCHEMA_VERSION = 1
+DEFAULT_THRESHOLD = 150  # node count at/above which the index is considered "active"
+
+FRECENCY_SEED = 30  # per AGENTS.md: a fresh leaf seeds at 30
+RETENTION_COUNT = 5  # keep the 5 most recent journal files; anything older is aged out
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+FM_RE = re.compile(r"^([A-Za-z_][\w-]*)::\s?(.*)$")
+LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
+SECTION_RE = re.compile(r"^\s*-\s+(#{1,6})\s+(.*)$")  # a bullet whose text is a heading
+
+
+# --------------------------------------------------------------------------- db
+def db_path(ws: str) -> str:
+    return os.path.join(ws, ".outl", "index.sqlite")
+
+
+def connect(ws: str):
+    import sqlite3
+
+    path = db_path(ws)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA journal_mode=WAL")
+    return con
+
+
+def init_schema(con):
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS pages (
+            slug        TEXT PRIMARY KEY,
+            kind        TEXT NOT NULL,          -- 'page' | 'journal'
+            path        TEXT NOT NULL,
+            page_hash   TEXT,                   -- sha256 of the .md, for incremental refresh
+            title       TEXT,
+            summary     TEXT,
+            updated     TEXT,
+            frecency    INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS chunks (
+            id          INTEGER PRIMARY KEY,
+            slug        TEXT NOT NULL,
+            heading     TEXT,                   -- e.g. "## Decisions" or "(top)"
+            anchor      TEXT,                   -- best-effort blk-ref handle, or ''
+            text        TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS chunks_slug ON chunks(slug);
+        CREATE TABLE IF NOT EXISTS edges (
+            src   TEXT NOT NULL,
+            dst   TEXT NOT NULL,
+            UNIQUE(src, dst)
+        );
+        CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
+            USING fts5(text, content='chunks', content_rowid='id');
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+        """
+    )
+    set_meta(con, "schema_version", str(SCHEMA_VERSION))
+    con.commit()
+
+
+def set_meta(con, k: str, v: str):
+    con.execute(
+        "INSERT INTO meta(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (k, v),
+    )
+
+
+def get_meta(con, k: str, default=None):
+    row = con.execute("SELECT value FROM meta WHERE key=?", (k,)).fetchone()
+    return row[0] if row else default
+
+
+def _has_meta(con) -> bool:
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+    ).fetchone() is not None
+
+
+# ---------------------------------------------------------------- markdown parse
+def parse_md(path: str):
+    """Return (frontmatter dict, body_lines list) from a rendered outl .md file."""
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    lines = raw.splitlines()
+    fm = {}
+    i = 0
+    # Frontmatter = leading `key:: value` lines, up to the first bullet/blank break.
+    while i < len(lines):
+        ln = lines[i]
+        if ln.strip() == "":
+            i += 1
+            continue
+        if ln.lstrip().startswith("-"):
+            break
+        m = FM_RE.match(ln)
+        if m:
+            fm[m.group(1)] = m.group(2).strip()
+            i += 1
+        else:
+            break
+    body = lines[i:]
+    return fm, body, raw
+
+
+def chunk_body(fm: dict, body: list[str]):
+    """Split a page body into section-sized chunks: one per `## heading` bullet
+    (with its descendants), plus a synthetic title+summary chunk. Coherent units
+    for keyword indexing, and clean `slug › heading` pointers."""
+    chunks = []  # (heading, text)
+    title = fm.get("title") or ""
+    summary = fm.get("summary") or ""
+    if title or summary:
+        chunks.append(("(summary)", f"{title}. {summary}".strip(". ").strip()))
+
+    cur_head = "(top)"
+    cur_lines: list[str] = []
+
+    def flush():
+        text = "\n".join(l for l in cur_lines).strip()
+        if text:
+            chunks.append((cur_head, text))
+
+    for ln in body:
+        m = SECTION_RE.match(ln)
+        if m:
+            flush()
+            cur_head = m.group(2).strip()
+            cur_lines = [m.group(2).strip()]
+        else:
+            cur_lines.append(ln.strip())
+    flush()
+    return chunks
+
+
+def links_in(body: list[str]) -> set[str]:
+    out = set()
+    for ln in body:
+        for m in LINK_RE.finditer(ln):
+            target = m.group(1).split("|")[0].split("#")[0].strip()
+            if target:
+                out.add(target)
+    return out
+
+
+def sha256_text(s: str) -> str:
+    return "sha256:" + hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def iter_source_files(ws: str):
+    """Yield (slug, kind, path) for every indexable .md, skipping templates."""
+    for kind, sub in (("page", "pages"), ("journal", "journals")):
+        for path in sorted(glob.glob(os.path.join(ws, sub, "*.md"))):
+            slug = os.path.splitext(os.path.basename(path))[0]
+            if slug.startswith("templates-"):
+                continue
+            yield slug, kind, path
+
+
+# ----------------------------------------------------------------------- verbs
+def cmd_rebuild(ws: str, threshold: int | None, quiet: bool = False):
+    con = connect(ws)
+    # Preserve an existing threshold across a rebuild unless one is passed explicitly.
+    prior = get_meta(con, "threshold") if _has_meta(con) else None
+    resolved = threshold if threshold is not None else (
+        int(prior) if prior is not None else DEFAULT_THRESHOLD
+    )
+    con.execute("DROP TABLE IF EXISTS chunks_fts")
+    con.execute("DROP TABLE IF EXISTS vectors")  # legacy: drop if a prior version made it
+    for t in ("pages", "chunks", "edges"):
+        con.execute(f"DROP TABLE IF EXISTS {t}")
+    init_schema(con)
+    set_meta(con, "threshold", str(resolved))
+    _index_files(con, ws, list(iter_source_files(ws)), full=True)
+    con.commit()
+    if not quiet:
+        _print_stats(con, ws)
+    con.close()
+
+
+def cmd_refresh(ws: str, threshold: int | None, quiet: bool = False):
+    con = connect(ws)
+    init_schema(con)
+    if get_meta(con, "threshold") is None:
+        set_meta(con, "threshold", str(threshold if threshold is not None else DEFAULT_THRESHOLD))
+    known = dict(con.execute("SELECT slug, page_hash FROM pages").fetchall())
+    files = list(iter_source_files(ws))
+    live = {slug for slug, _, _ in files}
+    # Drop pages that no longer exist.
+    for slug in list(known):
+        if slug not in live:
+            _delete_slug(con, slug)
+    # Reindex only changed/new pages.
+    changed = []
+    for slug, kind, path in files:
+        with open(path, "r", encoding="utf-8") as f:
+            h = sha256_text(f.read())
+        if known.get(slug) != h:
+            changed.append((slug, kind, path))
+    _index_files(con, ws, changed, full=False)
+    con.commit()
+    if not quiet:
+        print(f"refreshed {len(changed)} page(s); {len(known)} known before")
+    con.close()
+
+
+def _delete_slug(con, slug: str):
+    ids = [r[0] for r in con.execute("SELECT id FROM chunks WHERE slug=?", (slug,))]
+    for cid in ids:
+        con.execute("INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', ?, '')", (cid,))
+    con.execute("DELETE FROM chunks WHERE slug=?", (slug,))
+    con.execute("DELETE FROM edges WHERE src=?", (slug,))
+    con.execute("DELETE FROM pages WHERE slug=?", (slug,))
+
+
+def _index_files(con, ws: str, files, full: bool):
+    for slug, kind, path in files:
+        if not full:
+            _delete_slug(con, slug)
+        fm, body, raw = parse_md(path)
+        con.execute(
+            "INSERT INTO pages(slug,kind,path,page_hash,title,summary,updated,frecency) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                slug,
+                kind,
+                path,
+                sha256_text(raw),
+                fm.get("title"),
+                fm.get("summary"),
+                fm.get("updated"),
+                _int_or_none(fm.get("frecency")),
+            ),
+        )
+        for heading, text in chunk_body(fm, body):
+            cur = con.execute(
+                "INSERT INTO chunks(slug,heading,anchor,text) VALUES(?,?,?,?)",
+                (slug, heading, "", text),
+            )
+            con.execute(
+                "INSERT INTO chunks_fts(rowid, text) VALUES(?, ?)", (cur.lastrowid, text)
+            )
+        for dst in links_in(body):
+            con.execute("INSERT OR IGNORE INTO edges(src,dst) VALUES(?,?)", (slug, dst))
+    set_meta(con, "indexed_at", str(int(time.time())))
+
+
+def _int_or_none(s):
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def cmd_search(ws: str, query: str, k: int, no_graph: bool):
+    con = connect(ws)
+    init_schema(con)
+    # --- keyword (FTS5 / bm25) — the sole ranker; lower bm25 == better match ---
+    results = []
+    seeds = []
+    try:
+        rows = con.execute(
+            "SELECT c.slug, c.heading, c.text, bm25(chunks_fts) AS r "
+            "FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid "
+            "WHERE chunks_fts MATCH ? ORDER BY r LIMIT ?",
+            (_fts_query(query), k),
+        ).fetchall()
+    except Exception:
+        rows = []
+    for slug, heading, text, r in rows:
+        results.append(("hit", slug, heading, text, r))
+        if slug not in seeds:
+            seeds.append(slug)
+
+    # --- one graph hop: neighbors of the seed slugs, via [[links]] both ways ---
+    if not no_graph and seeds:
+        seen = set(seeds)
+        neigh = []
+        qmarks = ",".join("?" * len(seeds))
+        for src, dst in con.execute(
+            f"SELECT src, dst FROM edges WHERE src IN ({qmarks}) OR dst IN ({qmarks})",
+            seeds + seeds,
+        ):
+            for cand, origin in ((dst, src), (src, dst)):
+                if cand not in seen and origin in seeds:
+                    seen.add(cand)
+                    neigh.append((cand, origin))
+        for cand, origin in neigh[:k]:
+            row = con.execute(
+                "SELECT summary FROM pages WHERE slug=?", (cand,)
+            ).fetchone()
+            summary = (row[0] if row and row[0] else "(no summary)")
+            results.append(("link", cand, f"(via {origin})", summary, 0.0))
+
+    _render_results(query, results)
+    con.close()
+
+
+def _fts_query(q: str) -> str:
+    # OR the terms so paraphrase-ish keyword queries still match; quote to be safe.
+    terms = re.findall(r"[A-Za-z0-9_]+", q)
+    return " OR ".join(f'"{t}"' for t in terms) if terms else '""'
+
+
+def _render_results(query: str, results):
+    if not results:
+        print(f'No matches for "{query}" [keyword].')
+        return
+    print(f'Results for "{query}" [keyword]:\n')
+    for kind, slug, heading, text, score in results:
+        snippet = " ".join(text.split())[:200]
+        if kind == "hit":
+            print(f"● {slug} › {heading}   (score {score:.4f})")
+            print(f"    {snippet}")
+            print(f"    → expand: outl_page_get {slug}\n")
+        else:
+            print(f"↳ {slug}  {heading}")
+            print(f"    {snippet}")
+            print(f"    → expand: outl_page_get {slug}\n")
+
+
+def cmd_stats(ws: str, threshold_arg: int, as_json: bool):
+    con = connect(ws)
+    init_schema(con)
+    _print_stats(con, ws, threshold_arg, as_json)
+    con.close()
+
+
+def _print_stats(con, ws: str, threshold_arg: int | None = None, as_json: bool = False):
+    npages = con.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+    nchunks = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    nedges = con.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+    threshold = threshold_arg if threshold_arg is not None else int(
+        get_meta(con, "threshold", str(DEFAULT_THRESHOLD))
+    )
+    active = npages >= threshold
+    indexed_at = get_meta(con, "indexed_at")
+    data = {
+        "pages": npages,
+        "chunks": nchunks,
+        "edges": nedges,
+        "threshold": threshold,
+        "active": active,
+        "indexed_at": int(indexed_at) if indexed_at else None,
+    }
+    if as_json:
+        print(json.dumps(data))
+        return
+    age = "never"
+    if indexed_at:
+        age = f"{int((time.time() - int(indexed_at)) / 60)} min ago"
+    print(f"workspace : {ws}")
+    print(f"pages     : {npages}   chunks: {nchunks}   edges: {nedges}")
+    print(f"indexed   : {age}")
+    print(f"threshold : {threshold}  →  index {'ACTIVE' if active else 'inactive (small graph — use TOC traversal)'}")
+
+
+# -------------------------------------------------- maintenance (frecency decay)
+def _outl_bin() -> str | None:
+    cand = os.environ.get("OUTL_BIN") or shutil.which("outl") or "/opt/homebrew/bin/outl"
+    return cand if os.path.exists(cand) else shutil.which("outl")
+
+
+def _truthy(v) -> bool:
+    return str(v).strip().lower() in ("true", "1", "yes")
+
+
+def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
+    """Daily frecency sweep, per AGENTS.md. For each non-pinned `type:: knowledge`
+    leaf not already decayed today: frecency -= 1 (seed 30 if unset), set seen=today.
+    Writes go through `outl page prop set` so the .outl sidecar stays in sync — never
+    raw .md edits. Leaves reaching 0 are REPORTED as prune candidates, not deleted:
+    deletion needs parent-TOC link cleanup, which stays a reviewed agent action."""
+    outl = _outl_bin()
+    if outl is None and not dry_run:
+        print("memory-index maintain: outl binary not found; cannot write props", file=sys.stderr)
+        return 3
+
+    decayed, candidates, skipped = [], [], 0
+    for slug, kind, path in iter_source_files(ws):
+        if kind != "page":
+            continue
+        fm, _body, _raw = parse_md(path)
+        if (fm.get("type") or "").strip() != "knowledge":
+            continue
+        if _truthy(fm.get("pin")):
+            skipped += 1
+            continue
+        if (fm.get("seen") or "") == today:
+            skipped += 1
+            continue
+        old = _int_or_none(fm.get("frecency"))
+        old = FRECENCY_SEED if old is None else old
+        new = old - 1
+        if not dry_run:
+            _outl_prop(outl, ws, slug, "frecency", str(new))
+            _outl_prop(outl, ws, slug, "seen", today)
+        decayed.append({"slug": slug, "from": old, "to": new})
+        if new <= 0:
+            candidates.append(slug)
+
+    result = {
+        "date": today,
+        "dry_run": dry_run,
+        "decayed": decayed,
+        "prune_candidates": candidates,
+        "skipped": skipped,
+    }
+    if as_json:
+        print(json.dumps(result))
+    else:
+        tag = " (dry-run)" if dry_run else ""
+        print(f"frecency sweep{tag}: decayed {len(decayed)} leaf/leaves, skipped {skipped}")
+        for d in decayed:
+            print(f"  {d['slug']}: {d['from']} → {d['to']}")
+        if candidates:
+            print(f"prune candidates (frecency ≤ 0, review per AGENTS.md): {', '.join(candidates)}")
+    return 0
+
+
+def _outl_prop(outl: str, ws: str, slug: str, key: str, value: str):
+    try:
+        subprocess.run(
+            [outl, "-w", ws, "page", "prop", "set", slug, f"{key}={value}"],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except Exception as e:  # never let one page fail the whole sweep
+        print(f"memory-index maintain: prop set failed for {slug} {key}: {e}", file=sys.stderr)
+
+
+# ------------------------------------------------ consolidation (journal rollup)
+def _aged_journals(ws: str, today: str):
+    """Journals beyond the RETENTION_COUNT most recent, by date. The newest 5 dated
+    journal files stay in high-resolution memory; every older one is aged out for
+    consolidation. `today` is unused (retention is by count, not calendar date)."""
+    journals = []
+    for path in sorted(glob.glob(os.path.join(ws, "journals", "*.md"))):
+        slug = os.path.splitext(os.path.basename(path))[0]
+        if DATE_RE.match(slug):
+            journals.append((slug, path))
+    if len(journals) <= RETENTION_COUNT:
+        return []
+    return journals[:-RETENTION_COUNT]  # sorted ascending; drop the newest 5
+
+
+def _distill_targets(fm: dict):
+    """Parse the `distilled-into::` evidence property the distiller records. Returns
+    (targets: list[str], is_none: bool). The sentinel `none` (journal held nothing
+    durable — a legitimate distill-to-nothing) verifies trivially. Accepts either
+    `[[slug]]` links or bare space/comma-separated slugs; a hyphen or underscore in
+    the key name is tolerated."""
+    raw = (fm.get("distilled-into") or fm.get("distilled_into") or "").strip()
+    if not raw or raw.lower().strip("()") in ("none", "-", ""):
+        return [], True
+    targets = [t.split("|")[0].split("#")[0].strip() for t in LINK_RE.findall(raw)]
+    if not targets:
+        targets = [t.strip() for t in re.split(r"[\s,]+", raw) if t.strip()]
+    return targets, False
+
+
+def _page_updated_on_or_after(ws: str, slug: str, date: str) -> bool:
+    """True iff pages/<slug>.md exists and carries `updated:: >= date` (ISO dates
+    compare correctly as strings). Proof the distiller actually wrote to the page."""
+    path = os.path.join(ws, "pages", slug + ".md")
+    if not os.path.isfile(path):
+        return False
+    fm, _b, _r = parse_md(path)
+    up = (fm.get("updated") or "").strip()
+    return bool(DATE_RE.match(up)) and up >= date
+
+
+def _distill_verified(ws: str, fm: dict) -> bool:
+    """Mechanically verify a journal marked `consolidated:: <D>` was actually
+    distilled — not just marked. It must record `distilled-into::`, and EVERY named
+    target page must exist and carry `updated:: >= D` (written on/after the
+    consolidation date). The explicit `none` sentinel verifies trivially. A journal
+    marked consolidated but lacking evidence, or naming a page that was never
+    touched, fails — and so is NOT reaped."""
+    cons = (fm.get("consolidated") or "").strip()
+    if not DATE_RE.match(cons):
+        return False
+    targets, is_none = _distill_targets(fm)
+    if is_none:
+        return not (fm.get("distilled-into") is None and fm.get("distilled_into") is None)
+    return bool(targets) and all(_page_updated_on_or_after(ws, t, cons) for t in targets)
+
+
+def cmd_consolidate(ws: str, today: str, reap: bool, as_json: bool):
+    """Report the consolidation backlog and (optionally) mechanically reap.
+
+    An aged journal is bucketed by whether it has been distilled, VERIFIED
+    mechanically — not merely by a self-reported `consolidated::` mark:
+      * reapable   — consolidated:: AND `_distill_verified` passes (every
+                     `distilled-into::` target page exists and was updated on/after
+                     the consolidation date, or the explicit `none` sentinel) →
+                     safe to delete; `--reap` does so via `outl page delete`.
+      * unverified — consolidated:: present but verification FAILS (no evidence, or
+                     a named target was never actually written). NOT reaped; folded
+                     back into the distill worklist so it is re-distilled.
+      * pending    — no consolidated:: yet → still to distill.
+    `pending` in the output is the full distill worklist (unmarked + unverified);
+    `unverified` is broken out for diagnostics. Distillation itself is LLM work and
+    is NOT done here — this only tracks the backlog and reaps what is verified done."""
+    aged = _aged_journals(ws, today)
+    pending, reapable, unverified = [], [], []
+    for slug, path in aged:
+        fm, _body, _raw = parse_md(path)
+        if not fm.get("consolidated"):
+            pending.append(slug)
+        elif _distill_verified(ws, fm):
+            reapable.append(slug)
+        else:
+            unverified.append(slug)
+            pending.append(slug)  # marked but unproven → must be re-distilled
+
+    reaped = []
+    if reap and reapable:
+        outl = _outl_bin()
+        if outl is None:
+            print("memory-index consolidate: outl binary not found; cannot reap", file=sys.stderr)
+        else:
+            for slug in reapable:
+                try:
+                    subprocess.run(
+                        [outl, "-w", ws, "page", "delete", slug, "--confirm"],
+                        check=True, capture_output=True, timeout=30,
+                    )
+                    reaped.append(slug)
+                except Exception as e:
+                    print(f"memory-index consolidate: delete failed for {slug}: {e}", file=sys.stderr)
+            if reaped:
+                cmd_refresh(ws, None, quiet=True)  # drop the deleted journals from the index
+
+    result = {
+        "date": today,
+        "aged": [s for s, _ in aged],
+        "pending": pending,
+        "unverified": unverified,
+        "reapable": [s for s in reapable if s not in reaped],
+        "reaped": reaped,
+    }
+    if as_json:
+        print(json.dumps(result))
+    else:
+        print(f"consolidation backlog on {today}:")
+        print(f"  pending (need distilling): {', '.join(pending) or '(none)'}")
+        if unverified:
+            print(f"  unverified (marked but distillation unproven — will re-distill): {', '.join(unverified)}")
+        print(f"  reapable (distilled+verified, aged): {', '.join(result['reapable']) or '(none)'}")
+        if reaped:
+            print(f"  reaped now: {', '.join(reaped)}")
+    return 0
+
+
+# ------------------------------------------------------------------------ main
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="memory-index", description=__doc__)
+    ap.add_argument("-w", "--workspace", default=os.environ.get("MEMORY_WS", WS_DEFAULT))
+    ap.add_argument(
+        "--threshold",
+        type=int,
+        default=None,
+        help=f"node count at/above which the index is active "
+        f"(default: stored value, or {DEFAULT_THRESHOLD})",
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("rebuild")
+    sub.add_parser("refresh")
+    sp = sub.add_parser("search")
+    sp.add_argument("query")
+    sp.add_argument("-k", type=int, default=6)
+    sp.add_argument("--no-graph", action="store_true")
+    ss = sub.add_parser("stats")
+    ss.add_argument("--json", action="store_true")
+    sm = sub.add_parser("maintain")
+    sm.add_argument("--dry-run", action="store_true", help="compute the sweep but write nothing")
+    sm.add_argument("--today", default=None, help="override the date (default: today)")
+    sm.add_argument("--json", action="store_true")
+    sc = sub.add_parser("consolidate")
+    sc.add_argument("--reap", action="store_true", help="delete aged journals already marked consolidated::")
+    sc.add_argument("--today", default=None, help="override the date (default: today)")
+    sc.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+
+    ws = os.path.expanduser(args.workspace)
+    if not os.path.isdir(ws):
+        print(f"memory-index: workspace not found: {ws}", file=sys.stderr)
+        return 2
+
+    if args.cmd == "rebuild":
+        cmd_rebuild(ws, args.threshold)
+    elif args.cmd == "refresh":
+        cmd_refresh(ws, args.threshold)
+    elif args.cmd == "search":
+        cmd_search(ws, args.query, args.k, args.no_graph)
+    elif args.cmd == "stats":
+        cmd_stats(ws, args.threshold, args.json)
+    elif args.cmd == "maintain":
+        today = args.today or datetime.date.today().isoformat()
+        return cmd_maintain(ws, today, args.dry_run, args.json) or 0
+    elif args.cmd == "consolidate":
+        today = args.today or datetime.date.today().isoformat()
+        return cmd_consolidate(ws, today, args.reap, args.json) or 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

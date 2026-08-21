@@ -26,6 +26,8 @@ BIN_DIR="$HOME/.local/bin"
 SETTINGS="$CLAUDE_DIR/settings.json"
 CLAUDEMD="$CLAUDE_DIR/CLAUDE.md"
 HOOK="$BIN_DIR/claude-memory-hook"
+MEMIDX="$BIN_DIR/memory-index"
+CONS="$BIN_DIR/memory-consolidate"
 
 mkdir -p "$MEM_DIR" "$BIN_DIR"
 
@@ -45,12 +47,23 @@ mv "$tmp" "$HOOK"
 chmod 755 "$HOOK"
 echo "✔ claude-memory-hook -> $HOOK  (outl: $OUTL_PATH)"
 
+# ---- 2b. memory-index retrieval sidecar -------------------------------------
+cp "$SRC/memory-index" "$MEMIDX"
+chmod 755 "$MEMIDX"
+echo "✔ memory-index   -> $MEMIDX"
+
+# ---- 2c. memory-consolidate: automatic headless distillation of aged journals
+cp "$SRC/memory-consolidate" "$CONS"
+chmod 755 "$CONS"
+echo "✔ memory-consolidate -> $CONS"
+
 # ---- 3. CLAUDE.md (append the memory section if it isn't already there) ------
 if [ -f "$CLAUDEMD" ] && grep -q '^## Persistent memory' "$CLAUDEMD"; then
   echo "• CLAUDE.md already has the memory section; left as-is"
 else
-  # Rewrite the hardcoded @import path in the shipped file to THIS user's home.
-  rewritten="$(sed "s#@/Users/[^/]*/\.claude/memory/AGENTS\.md#@$HOME/.claude/memory/AGENTS.md#" "$SRC/CLAUDE.md")"
+  # Shipped sections reference the protocol docs by ~ path (user-agnostic, read
+  # on demand — no @import), so no path rewrite is needed.
+  rewritten="$(cat "$SRC/CLAUDE.md")"
   if [ -f "$CLAUDEMD" ]; then
     # Append only the "## Persistent memory" section onto the existing file.
     section="$(printf '%s\n' "$rewritten" | awk '/^## Persistent memory/{p=1} p')"
@@ -115,6 +128,15 @@ Done. Files are in place. Remaining steps (you said you'd handle these):
   1. brew install outl (avelino/outl tap) if not already installed
   2. outl init ~/.claude/memory
   3. claude mcp add outl --scope user -- outl --workspace ~/.claude/memory mcp serve
+  4. build the retrieval index (safe to re-run any time; the SessionStart hook
+     keeps it fresh afterward):  $MEMIDX rebuild
 
 Then start a NEW Claude Code session to load the memory system.
 EOF
+
+# Build the index now if the workspace already exists, so it's ready immediately.
+if [ -d "$MEM_DIR/pages" ]; then
+  "$MEMIDX" -w "$MEM_DIR" rebuild >/dev/null 2>&1 \
+    && echo "✔ memory-index   -> built initial index at $MEM_DIR/.outl/index.sqlite" \
+    || echo "• memory-index   -> run '$MEMIDX rebuild' after 'outl init' to build the index"
+fi

@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+#
+# memory-consolidate — automatic, headless distillation of aged journals.
+#
+# Consolidation has two halves. Reaping (deleting aged journals already marked
+# `consolidated::`) is mechanical — `memory-index consolidate --reap` does it.
+# Distillation — synthesising a journal's items into knowledge leaves — needs an
+# LLM. This script is that LLM step, run WITHOUT any interactive prompting: it
+# spawns a detached, headless `claude -p` agent that distills every aged,
+# un-distilled journal per ~/.claude/memory/AGENTS.md and marks each
+# `consolidated:: <today>`, then reaps. The SessionStart hook backgrounds this
+# whenever an aged journal exists, so the backlog clears on its own, on any
+# machine this repo is installed on — no one has to remember to run it.
+#
+# Safe to run any time and repeatedly: it no-ops when nothing is pending,
+# single-instances via a lock, and refuses to recurse into the agent it spawns.
+
+set -u
+
+MEMIDX="${MEMORY_INDEX_BIN:-$HOME/.local/bin/memory-index}"
+CLAUDE="${CLAUDE_BIN:-claude}"
+# Hooks can run with a minimal PATH; fall back to the usual install location.
+command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE="$HOME/.local/bin/claude"
+WS="$HOME/.claude/memory"
+LOCKDIR="$WS/.consolidate.lock.d"
+LOG="$WS/.consolidate.log"
+TODAY="$(date +%F)"
+
+# Never recurse: the headless agent we spawn starts its own Claude session (and
+# fires the SessionStart hook); that must not launch us again. The hook guards on
+# this too — belt and braces.
+[ -n "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] && exit 0
+
+[ -x "$MEMIDX" ] || exit 0
+
+# Single instance (portable, no flock — macOS has none). mkdir is atomic; clear a
+# stale lock left by a crashed run (>60 min old) before trying.
+if [ -d "$LOCKDIR" ] && [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
+  rmdir "$LOCKDIR" 2>/dev/null || true
+fi
+mkdir "$LOCKDIR" 2>/dev/null || exit 0
+trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
+
+pending() {
+  "$MEMIDX" -w "$WS" consolidate --json 2>/dev/null | python3 -c 'import sys, json
+try:
+    print(" ".join(json.load(sys.stdin).get("pending", [])))
+except Exception:
+    print("")' 2>/dev/null
+}
+
+pend="$(pending)"
+
+# Nothing to distill — still reap anything already marked, then done.
+if [ -z "$pend" ]; then
+  "$MEMIDX" -w "$WS" consolidate --reap >/dev/null 2>&1 || true
+  exit 0
+fi
+
+# Distillation needs the CLI. If it's absent, leave the journals for the hook's
+# interactive fallback directive rather than losing them.
+command -v "$CLAUDE" >/dev/null 2>&1 || exit 0
+
+prompt="You are running headless as the memory-system consolidation agent. Do ONLY the task below, then stop — ignore everything else.
+
+Distill these aged journals, which are older than the 5 most recent journals and are not yet consolidated: $pend
+
+Follow the Condensation section of ~/.claude/memory/AGENTS.md exactly. For EACH date:
+  1. outl_daily_get <date> and read the raw journal.
+  2. Cluster its items by the [[page]]/topic they concern.
+  3. For each cluster with lasting value — apply 'What long-term memory is for': KEEP cross-repo relationships, long-running plan state, decisions + their why, non-obvious gotchas, durable user facts; DROP anything the repo, its git log, or its CLAUDE.md already holds — descend the TOC tree to the right knowledge leaf (create a new leaf, or split a crowded TOC, as needed) and merge the DISTILLED points in (synthesise, do not copy verbatim). Refresh updated:: and summary::; ensure project:: [[...]], parent:: [[<toc>]] and back-links; touch frecency (new leaf seeds frecency:: 30; merging is a use, +5 capped at 60) and set seen:: $TODAY.
+  4. If you created a leaf or TOC, add its one-line [[link]] + hook to the parent TOC (and to index if it is a new top-level project/topic).
+  5. Record the evidence, then mark done — BOTH properties, and only as the LAST actions for that date, after steps 1-4 are truly written:
+     a. outl_page_prop_set <date> distilled-into=\"[[slug-a]] [[slug-b]] ...\" — every knowledge page you actually merged this journal's content into (space-separated [[links]]). If the journal held nothing durable and you distilled it to nothing, set distilled-into=none instead.
+     b. outl_page_prop_set <date> consolidated=$TODAY.
+     The reap step VERIFIES mechanically that every page you name in distilled-into exists and carries updated:: >= $TODAY before it will delete the journal. A journal you mark consolidated:: without actually writing its named targets (fresh updated::) will NOT be reaped — it is re-queued for distillation next session. So make sure each target page's updated:: is set to $TODAY as part of step 3.
+Finally, refresh index: bump updated:: and trim the Recent journals list to the retention window.
+
+Do NOT delete any journal — reaping is automatic once you mark consolidated::. Do NOT touch code, git, or anything outside the memory graph."
+
+MEMORY_CONSOLIDATE_ACTIVE=1 "$CLAUDE" -p "$prompt" \
+  --dangerously-skip-permissions \
+  >>"$LOG" 2>&1 || true
+
+# The agent has marked the distilled journals consolidated:: — now reap them.
+"$MEMIDX" -w "$WS" consolidate --reap >>"$LOG" 2>&1 || true
+exit 0
