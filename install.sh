@@ -10,7 +10,7 @@
 # SessionStart/PreCompact hooks into settings.json. It does NOT initialize the
 # outl workspace or register the outl MCP server — do those two yourself:
 #
-#     brew tap avelino/outl https://github.com/outlmd/outl
+#     brew tap outlmd/outl https://github.com/outlmd/outl
 #     brew trust outlmd/outl
 #     brew install outl-beta
 #     outl init ~/.claude/memory
