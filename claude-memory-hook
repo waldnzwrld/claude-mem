@@ -19,6 +19,8 @@ CLAUDE="${CLAUDE_BIN:-claude}"
 command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE="$HOME/.local/bin/claude"
 WS="$HOME/.claude/memory"
 MARKER="$WS/.last-session-date"
+ATTEMPTS="$WS/.consolidate-attempts"    # per-journal count of consecutive auto-consolidation attempts
+MAX_CONSOLIDATE_ATTEMPTS=2              # auto-retry a stuck journal this many times, then surface it
 TODAY="$(date +%F)"
 
 input="$(cat)"
@@ -115,17 +117,45 @@ except Exception:
   # Skip entirely inside the headless consolidation agent's own session (it has its
   # own -p prompt); only act for real interactive sessions.
   if [ -n "$pend" ] && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ]; then
-    if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1; then
+    # A journal still pending at THIS session start means any prior background run did
+    # NOT clear it (the reap above already ran). Count consecutive automatic attempts
+    # per journal so a silently-failing agent can't loop forever — unseen, and
+    # re-billing a `claude -p` every morning. Once a journal has been auto-attempted
+    # MAX_CONSOLIDATE_ATTEMPTS times without clearing, we stop launching and surface
+    # the interactive fallback so the stuck backlog becomes visible.
+    maxtries=0
+    newstate=""
+    for j in $pend; do
+      prior="$(awk -v s="$j" '$1==s{print $2; exit}' "$ATTEMPTS" 2>/dev/null)"
+      case "$prior" in ''|*[!0-9]*) prior=0 ;; esac
+      tries=$((prior + 1))
+      [ "$tries" -gt "$maxtries" ] && maxtries=$tries
+      newstate+="$j $tries"$'\n'
+    done
+    # Rewrite with only the still-pending journals, so a cleared one drops its counter.
+    printf '%s' "$newstate" > "$ATTEMPTS" 2>/dev/null || true
+
+    if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1 \
+       && [ "$maxtries" -le "$MAX_CONSOLIDATE_ATTEMPTS" ]; then
       # Automatic path: distill + reap in a detached background agent. SessionStart
       # returns immediately; the backlog clears with zero prompting, every install.
       nohup "$CONS" >/dev/null 2>&1 &
       disown 2>/dev/null || true
       ctx+="Memory consolidation is running automatically in a background agent for aged journals ($pend) — it will distill them into the knowledge tree and reap them. Do NOT consolidate or delete journals yourself."$'\n\n'
     else
-      # Fallback only (no claude CLI / no memory-consolidate installed): the
-      # interactive MANDATORY directive, exactly as before.
+      # Fallback: either the tooling is missing (no claude CLI / no memory-consolidate),
+      # OR the background agent has failed to clear these journals MAX_CONSOLIDATE_ATTEMPTS
+      # times — in which case we pause the silent, re-billing retry loop and have THIS
+      # interactive session do the distillation instead.
+      if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1; then
+        ctx+="⚠ Automatic background consolidation has not cleared these journals after $MAX_CONSOLIDATE_ATTEMPTS attempt(s) ($pend); auto-retry is paused to avoid a silent, re-billing loop. Do the consolidation in THIS session instead, as below."$'\n\n'
+      fi
       ctx+="⚠ CONSOLIDATION REQUIRED before other work this session — these journals are older than the 5 most recent and are NOT yet distilled (verified): $pend. For EACH date, per the Condensation section of AGENTS.md: cluster its items by the [[page]] they concern, merge the distilled points into the right knowledge leaf (create/split as needed; set each such leaf's \`updated:: $TODAY\` plus summary::/frecency). Then, as the LAST actions for that date: (1) record evidence — \`outl_page_prop_set <date> distilled-into='[[slug-a]] [[slug-b]]'\` listing every leaf you wrote to, or \`distilled-into=none\` if nothing was durable; (2) \`outl_page_prop_set <date> consolidated=$TODAY\`. Reap VERIFIES each named leaf exists with \`updated:: >= $TODAY\` before deleting the journal — a journal marked without written targets is NOT reaped, it is re-queued. Do NOT delete journals yourself. Do this now, then address the user's request."$'\n\n'
     fi
+  else
+    # No backlog (or we're the headless agent). Clear stale counters only when the
+    # backlog is genuinely empty, so a future backlog starts its count fresh.
+    [ -z "$pend" ] && rm -f "$ATTEMPTS" 2>/dev/null || true
   fi
 fi
 
