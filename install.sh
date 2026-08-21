@@ -63,7 +63,7 @@ if [ -f "$CLAUDEMD" ] && grep -q '^## Persistent memory' "$CLAUDEMD"; then
 else
   # Shipped sections reference the protocol docs by ~ path (user-agnostic, read
   # on demand — no @import), so no path rewrite is needed.
-  rewritten="$(cat "$SRC/CLAUDE.md")"
+  rewritten="$(cat "$SRC/CLAUDE_TEMPLATE.md")"
   if [ -f "$CLAUDEMD" ]; then
     # Append only the "## Persistent memory" section onto the existing file.
     section="$(printf '%s\n' "$rewritten" | awk '/^## Persistent memory/{p=1} p')"
