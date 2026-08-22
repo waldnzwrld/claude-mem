@@ -2,7 +2,8 @@
 
 This repo is the installer + source for the outl-backed persistent memory system.
 `install.sh` deploys into `~/.claude`: `claude-memory-hook` (SessionStart/PreCompact),
-`memory-index` (stdlib-only SQLite retrieval sidecar), `memory-consolidate` (headless
+`memory-index` (stdlib-only SQLite retrieval sidecar: FTS5 keyword + a typed/weighted
+`[[link]]` edge table with a recursive multi-hop `search` whose depth follows graph size), `memory-consolidate` (headless
 distillation agent), and `AGENTS.md` → `~/.claude/memory/`.
 
 Global hard rules live in `~/.claude/CLAUDE.md` and are
