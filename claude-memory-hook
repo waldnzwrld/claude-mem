@@ -82,7 +82,7 @@ try:
 except Exception:
     print("")' 2>/dev/null)"
   if [ "$active" = "1" ]; then
-    ctx+="Retrieval: the memory-index is ACTIVE for this graph. To recall, run \`memory-index search \"<query terms>\"\` FIRST (keyword/FTS5 + one graph hop of [[link]] neighbors), then \`outl_page_get\` the slugs it names — per the 'Retrieval regime auto-scales' section of AGENTS.md. Fall back to TOC descent if it returns nothing."$'\n\n'
+    ctx+="Retrieval: the memory-index is ACTIVE for this graph. To recall, run \`memory-index search \"<query terms>\"\` FIRST (keyword/FTS5, then a walk of the typed [[link]] graph out from the hits — labelled via·type·hops·weight), then \`outl_page_get\` the slugs it names. Hop depth is set by graph size. Per the 'Retrieval regime auto-scales' section of AGENTS.md. Fall back to TOC descent if it returns nothing."$'\n\n'
   fi
 
   # Consolidation — EVERY session (not marker-gated), so a missed reminder is caught

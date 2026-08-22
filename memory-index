@@ -3,16 +3,21 @@
 memory-index — a rebuildable retrieval sidecar over the outl memory graph.
 
 The outl markdown graph at ~/.claude/memory is the sole source of truth. This tool
-builds a DERIVED, disposable SQLite index over it (FTS5 keyword + a link/edge table)
-so recall can land on the narrow relevant band in one shot, then expand along
-[[links]]. The index is never authoritative: delete it and `rebuild` reconstructs it
-from the markdown on any machine.
+builds a DERIVED, disposable SQLite index over it (FTS5 keyword + a typed/weighted
+link/edge table) so recall can land on the narrow relevant band in one shot, then walk
+outward along [[links]] via a recursive graph traversal. The index is never
+authoritative: delete it and `rebuild` reconstructs it from the markdown on any machine.
+Edges are a pure projection of the files — type is inferred from link wording, never
+annotated in the markdown — so the source stays clean and there is only one source of truth.
 
 Commands:
-  memory-index rebuild        Full reindex from markdown (idempotent).
-  memory-index refresh        Incremental: reindex only pages whose hash changed.
-  memory-index search "q"     Keyword (FTS5/bm25) + one graph hop of [[link]] neighbors.
-  memory-index stats          Node/chunk counts, index freshness, active/inactive.
+  memory-index rebuild            Full reindex from markdown (idempotent).
+  memory-index refresh            Incremental: reindex only pages whose hash changed.
+  memory-index search "q"         Keyword (FTS5/bm25) hits, then a walk of the typed
+                                  [[link]] graph out from those hits. Hop depth is a
+                                  function of graph size: 1, 2 at 3×threshold, 3 at 10×.
+  memory-index stats              Node/chunk/edge counts (with edge-type breakdown),
+                                  index freshness, active/inactive.
 
 Design notes:
   * STDLIB ONLY — no third-party packages, no venv, no build step. It relies only on
@@ -37,7 +42,7 @@ import sys
 import time
 
 WS_DEFAULT = os.path.expanduser("~/.claude/memory")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_THRESHOLD = 150  # node count at/above which the index is considered "active"
 
 FRECENCY_SEED = 30  # per AGENTS.md: a fresh leaf seeds at 30
@@ -86,9 +91,11 @@ def init_schema(con):
         );
         CREATE INDEX IF NOT EXISTS chunks_slug ON chunks(slug);
         CREATE TABLE IF NOT EXISTS edges (
-            src   TEXT NOT NULL,
-            dst   TEXT NOT NULL,
-            UNIQUE(src, dst)
+            src    TEXT NOT NULL,
+            dst    TEXT NOT NULL,
+            type   TEXT NOT NULL DEFAULT 'refs',   -- refs | supersedes | contradicts | part-of
+            weight INTEGER NOT NULL DEFAULT 1,      -- link multiplicity: how strongly src cites dst
+            UNIQUE(src, dst, type)
         );
         CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
@@ -117,6 +124,31 @@ def _has_meta(con) -> bool:
     return con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
     ).fetchone() is not None
+
+
+def _schema_ok(con) -> bool:
+    """True iff the on-disk index matches the current SCHEMA_VERSION. A version bump
+    makes the DERIVED index stale; since it's disposable we rebuild from markdown rather
+    than migrate in place. A brand-new (tableless) db is 'ok' — init_schema will create
+    it fresh at the current version."""
+    if not _has_meta(con):
+        pages_exists = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pages'"
+        ).fetchone() is not None
+        return not pages_exists  # no pages yet => empty db, fine; pages but no meta => stale
+    v = get_meta(con, "schema_version")
+    return v is not None and int(v) == SCHEMA_VERSION
+
+
+def _open_current(ws: str):
+    """connect() to the index, transparently rebuilding it first if the on-disk schema
+    is stale. Read/refresh commands go through here so a schema bump self-heals."""
+    con = connect(ws)
+    if not _schema_ok(con):
+        con.close()
+        cmd_rebuild(ws, None, quiet=True)
+        con = connect(ws)
+    return con
 
 
 # ---------------------------------------------------------------- markdown parse
@@ -175,13 +207,36 @@ def chunk_body(fm: dict, body: list[str]):
     return chunks
 
 
-def links_in(body: list[str]) -> set[str]:
-    out = set()
+# Edge-type inference: the markdown is NEVER annotated with a link type — files stay
+# clean, source-of-truth intact — so the type is derived from the wording of the line
+# the [[link]] sits on. First keyword group to match wins; otherwise a plain 'refs'.
+EDGE_TYPES = (
+    ("supersedes",  ("supersede", "replaces", "replace", "obsoletes", "deprecates")),
+    ("contradicts", ("contradict", "conflicts", "conflict", "disagrees", "refutes")),
+    ("part-of",     ("part of", "parent", "belongs to", "under ", "child of", "subpage")),
+)
+
+
+def _edge_type(line: str) -> str:
+    low = line.lower()
+    for etype, kws in EDGE_TYPES:
+        if any(kw in low for kw in kws):
+            return etype
+    return "refs"
+
+
+def links_in(body: list[str]) -> dict[tuple[str, str], int]:
+    """Map every [[link]] to a typed, weighted edge. Type is INFERRED from the line's
+    wording (see EDGE_TYPES; else 'refs'); weight is the link's multiplicity within the
+    page. Returns {(target, type): weight}."""
+    out: dict[tuple[str, str], int] = {}
     for ln in body:
+        etype = _edge_type(ln)
         for m in LINK_RE.finditer(ln):
             target = m.group(1).split("|")[0].split("#")[0].strip()
             if target:
-                out.add(target)
+                key = (target, etype)
+                out[key] = out.get(key, 0) + 1
     return out
 
 
@@ -221,7 +276,7 @@ def cmd_rebuild(ws: str, threshold: int | None, quiet: bool = False):
 
 
 def cmd_refresh(ws: str, threshold: int | None, quiet: bool = False):
-    con = connect(ws)
+    con = _open_current(ws)
     init_schema(con)
     if get_meta(con, "threshold") is None:
         set_meta(con, "threshold", str(threshold if threshold is not None else DEFAULT_THRESHOLD))
@@ -282,8 +337,11 @@ def _index_files(con, ws: str, files, full: bool):
             con.execute(
                 "INSERT INTO chunks_fts(rowid, text) VALUES(?, ?)", (cur.lastrowid, text)
             )
-        for dst in links_in(body):
-            con.execute("INSERT OR IGNORE INTO edges(src,dst) VALUES(?,?)", (slug, dst))
+        for (dst, etype), weight in links_in(body).items():
+            con.execute(
+                "INSERT OR IGNORE INTO edges(src,dst,type,weight) VALUES(?,?,?,?)",
+                (slug, dst, etype, weight),
+            )
     set_meta(con, "indexed_at", str(int(time.time())))
 
 
@@ -294,9 +352,64 @@ def _int_or_none(s):
         return None
 
 
+def _graph_expand(con, seeds, depth: int, limit: int):
+    """N-hop neighbourhood of the seed slugs over the (undirected) [[link]] graph, via
+    a single recursive CTE. Walks up to `depth` hops, terminating on the depth bound (so
+    cycles are safe), then keeps for each reached node its NEAREST/strongest arrival
+    (min depth, then max edge weight). Returns [(slug, depth, weight, type, via)] ordered
+    nearest- and strongest-first, seeds themselves excluded."""
+    if not seeds or depth < 1:
+        return []
+    seed_vals = ",".join("(?)" for _ in seeds)
+    sql = f"""
+        WITH RECURSIVE
+          seed(slug) AS (VALUES {seed_vals}),
+          undirected(a, b, type, weight) AS (
+              SELECT src, dst, type, weight FROM edges
+              UNION ALL
+              SELECT dst, src, type, weight FROM edges
+          ),
+          walk(slug, depth, weight, type, via) AS (
+              SELECT slug, 0, 0, '', slug FROM seed
+            UNION
+              SELECT u.b, w.depth + 1, u.weight, u.type, w.slug
+              FROM walk w
+              JOIN undirected u ON u.a = w.slug
+              WHERE w.depth < ?
+          ),
+          ranked AS (
+              SELECT slug, depth, weight, type, via,
+                     ROW_NUMBER() OVER (
+                         PARTITION BY slug ORDER BY depth ASC, weight DESC
+                     ) AS rn
+              FROM walk
+              WHERE depth > 0
+          )
+        SELECT slug, depth, weight, type, via
+        FROM ranked
+        WHERE rn = 1 AND slug NOT IN (SELECT slug FROM seed)
+        ORDER BY depth ASC, weight DESC
+        LIMIT ?
+    """
+    return con.execute(sql, list(seeds) + [depth, limit]).fetchall()
+
+
+def _auto_depth(con) -> int:
+    """Hop depth as a function of graph size, relative to the active threshold t:
+    1 hop below 3t, 2 at 3t, 3 at 10t."""
+    n = con.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+    t = int(get_meta(con, "threshold", str(DEFAULT_THRESHOLD)))
+    if n >= 10 * t:
+        return 3
+    if n >= 3 * t:
+        return 2
+    return 1
+
+
 def cmd_search(ws: str, query: str, k: int, no_graph: bool):
-    con = connect(ws)
+    con = _open_current(ws)
     init_schema(con)
+    depth = _auto_depth(con)
     # --- keyword (FTS5 / bm25) — the sole ranker; lower bm25 == better match ---
     results = []
     seeds = []
@@ -314,25 +427,15 @@ def cmd_search(ws: str, query: str, k: int, no_graph: bool):
         if slug not in seeds:
             seeds.append(slug)
 
-    # --- one graph hop: neighbors of the seed slugs, via [[links]] both ways ---
+    # --- graph expansion: up to `depth` hops out from the seeds over typed [[links]] ---
     if not no_graph and seeds:
-        seen = set(seeds)
-        neigh = []
-        qmarks = ",".join("?" * len(seeds))
-        for src, dst in con.execute(
-            f"SELECT src, dst FROM edges WHERE src IN ({qmarks}) OR dst IN ({qmarks})",
-            seeds + seeds,
-        ):
-            for cand, origin in ((dst, src), (src, dst)):
-                if cand not in seen and origin in seeds:
-                    seen.add(cand)
-                    neigh.append((cand, origin))
-        for cand, origin in neigh[:k]:
+        for cand, d, weight, etype, via in _graph_expand(con, seeds, depth, k):
             row = con.execute(
                 "SELECT summary FROM pages WHERE slug=?", (cand,)
             ).fetchone()
             summary = (row[0] if row and row[0] else "(no summary)")
-            results.append(("link", cand, f"(via {origin})", summary, 0.0))
+            label = f"(via {via} · {etype} · {d}h ·w{weight})"
+            results.append(("link", cand, label, summary, 0.0))
 
     _render_results(query, results)
     con.close()
@@ -362,7 +465,7 @@ def _render_results(query: str, results):
 
 
 def cmd_stats(ws: str, threshold_arg: int, as_json: bool):
-    con = connect(ws)
+    con = _open_current(ws)
     init_schema(con)
     _print_stats(con, ws, threshold_arg, as_json)
     con.close()
@@ -377,10 +480,14 @@ def _print_stats(con, ws: str, threshold_arg: int | None = None, as_json: bool =
     )
     active = npages >= threshold
     indexed_at = get_meta(con, "indexed_at")
+    edge_types = dict(
+        con.execute("SELECT type, COUNT(*) FROM edges GROUP BY type").fetchall()
+    )
     data = {
         "pages": npages,
         "chunks": nchunks,
         "edges": nedges,
+        "edge_types": edge_types,
         "threshold": threshold,
         "active": active,
         "indexed_at": int(indexed_at) if indexed_at else None,
@@ -391,8 +498,13 @@ def _print_stats(con, ws: str, threshold_arg: int | None = None, as_json: bool =
     age = "never"
     if indexed_at:
         age = f"{int((time.time() - int(indexed_at)) / 60)} min ago"
+    by_type = con.execute(
+        "SELECT type, COUNT(*) FROM edges GROUP BY type ORDER BY COUNT(*) DESC"
+    ).fetchall()
+    edge_breakdown = ", ".join(f"{t}:{n}" for t, n in by_type) or "(none)"
     print(f"workspace : {ws}")
     print(f"pages     : {npages}   chunks: {nchunks}   edges: {nedges}")
+    print(f"edge types: {edge_breakdown}")
     print(f"indexed   : {age}")
     print(f"threshold : {threshold}  →  index {'ACTIVE' if active else 'inactive (small graph — use TOC traversal)'}")
 
