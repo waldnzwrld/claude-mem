@@ -38,6 +38,15 @@ Example: "how does projectx handle payments?" → `index` → `[[project-x]]` (h
 frontend) → `[[project-x-frontend]]` → `[[project-x-frontend-payments]]` → the answer. Five
 small reads, the whole graph never loaded.
 
+**Retrieved bodies are disposable — keep the conclusion + the slug, not the page.** A page
+you `outl_page_get` is a re-fetchable projection of the graph, not something to hold onto.
+Once you have used it, carry forward only (a) the conclusion you drew and (b) its `[[slug]]`,
+and let the raw body fall out of context. Compaction summarizes tool results away wholesale —
+there is no selective tool-result retention in the harness — so a lingering page body is pure
+cost with no payoff: if you need the detail again, re-fetch by slug (the FTS/graph walk costs
+zero model tokens — see [[memory-retrieval-index]]). The durable residue of any retrieval is
+tiny, which is exactly what keeps an MCP-heavy session from bloating.
+
 ## Retrieval regime auto-scales to graph size (the index)
 
 The TOC-descent above is the retrieval mechanism for a **small** graph — cheap when there
@@ -162,7 +171,9 @@ truth anyway. Before writing or distilling anything, apply one test:
 The contrast in one line: *remembering recent commits is useless (git has them); remembering
 where we are in a long-running project is exactly the point.* Journals may capture more in
 the moment (they're raw and short-lived), but only signal that passes this filter should
-survive **condensation** into a permanent leaf.
+reach a permanent leaf — whether **written through** at decision time (impactful facts) or
+distilled at **condensation** (everything else). See *Two-tier writes* for which path a fact
+takes.
 
 ## Writing to memory (continuously)
 
@@ -205,6 +216,41 @@ The five sections and what each holds:
 A `PreCompact` hook will remind you to flush anything unsaved before the context is
 compacted — treat that as a cue to write pending notes to the journal.
 
+## Two-tier writes: write-through vs. condense-later
+
+Not every fact should wait for condensation to reach deep memory. Deep memory (knowledge
+leaves) is written at **two** times: **write-through** at decision time for impactful facts,
+and **condensation** for everything else. Tier every durable fact as you write it:
+
+- **Impactful → write-through NOW, to both the journal *and* the deep leaf.** A fact that
+  either (a) makes a current knowledge page inaccurate or incomplete, (b) reverses or
+  supersedes a prior durable decision, or (c) introduces a new architectural component,
+  cross-project relationship, or durable user fact.
+- **Small → journal now; promote or refine at condensation.** Incremental progress, or a
+  refinement that doesn't contradict any existing page.
+- **Ephemeral → journal now; dropped at condensation.** Transient git/branch/working-tree
+  state, "currently doing X", session-local status/action-items. Never becomes a leaf.
+- **Borderline → journal now; evaluated at age-out.** Durability genuinely uncertain — the
+  distiller applies the signal filter then and promotes-or-drops.
+
+**Write-through procedure (impactful only):**
+
+1. Append the fact to today's journal under the right section (a breadcrumb, with evidence).
+2. Descend the TOC to the target leaf (create it under the right TOC — splitting a crowded
+   TOC — if none fits). Merge the **distilled** fact; synthesize, never paste, and never
+   duplicate a point the leaf already states.
+3. Refresh the leaf: `updated:: <today>`; `summary::` if it changed; ensure `parent::`,
+   `project::`, and back-links; bump `frecency` +5 (cap 60), or seed `frecency:: 30` for a new
+   leaf; set `seen:: <today>`. A new leaf/TOC also needs its one-line `[[link]]` + hook added
+   to the parent TOC (and the parent to `index` if it is a new top-level topic).
+4. **Mark the journal breadcrumb `#in-deep [[target-leaf]]`.** This tells condensation the
+   item is already in deep memory (so it is verified, not re-merged — see *Condensation*) and
+   doubles as the routing link.
+
+Edit-merge, never clobber: read the leaf first and add to it. This applies to the headless
+on-close journaler too — `claude-memory-dump` write-through's impactful items on these same
+rules; an autonomous agent that pastes instead of merging duplicates pages.
+
 ## Condensation (daily → knowledge rollup)
 
 **Retention = the 5 most recent journal files** (by date). High-resolution recent memory
@@ -243,13 +289,23 @@ never reached the tree.)
 When you see the `⚠ CONSOLIDATION REQUIRED` directive, for each pending journal date:
 
 1. `outl_daily_get <date>` — read the raw journal.
-2. Cluster its items by the `[[linked page]]` / topic they concern.
-3. For each cluster with lasting value — judged by *What long-term memory is for* (keep
-   cross-repo relationships, plan state, decisions + why; drop anything the repo/git/`CLAUDE.md`
-   already holds) — descend the tree to the target leaf document (an
-   existing one, or create a new leaf under the right TOC — splitting or adding a TOC level
-   if a parent is getting crowded). Merge the **distilled** points in — synthesize, don't
-   copy verbatim. Set/refresh `updated::` and `summary::`; ensure `project:: [[...]]`,
+2. Cluster its items by the `[[linked page]]` / topic they concern. **Items already marked
+   `#in-deep [[leaf]]` were written through to deep memory when authored (see *Two-tier
+   writes*) — do NOT re-merge them. Verify the named leaf still carries the fact, and list
+   that leaf in this journal's `distilled-into::` evidence so the reap check passes; that is
+   all they need.**
+3. Tier every remaining cluster before writing anything. **DROP ephemeral items outright** —
+   transient git/branch/working-tree state, "currently doing X", session-local status (e.g.
+   "branch X has uncommitted changes" never becomes a leaf). For **borderline** items whose
+   durability is genuinely uncertain (e.g. a "retrieval cost pattern" musing), apply *What
+   long-term memory is for* and promote-or-drop **deliberately** — do not reflexively keep.
+   For each cluster that clears the bar (keep cross-repo relationships, plan state, decisions
+   + why; drop anything the repo/git/`CLAUDE.md` already holds) — descend the tree to the
+   target leaf document (an existing one, or create a new leaf under the right TOC — splitting
+   or adding a TOC level if a parent is getting crowded). Merge the **distilled** points in —
+   synthesize, don't copy verbatim, and never duplicate a point the leaf already states
+   (semantic dedup, on top of the `#in-deep` skip above). Set/refresh `updated::` and
+   `summary::`; ensure `project:: [[...]]`,
    `parent:: [[<toc>]]`, and back-links are present. Touch its frecency (a new leaf seeds
    `frecency:: 30`; merging into an existing one is a use → `+5`, cap 60); set
    `seen:: <today>`.
@@ -345,6 +401,10 @@ node, and the pruning sweep — `outl_page_delete` — could destroy it). Link t
 - Prefer editing an existing leaf over creating a near-duplicate; descend the tree or
   `outl_search` first. Editing an existing leaf also refreshes its frecency — another
   reason to merge rather than fork.
+- **Any change to a page body bumps its `updated::`** to that day. The reap's distillation
+  check (`updated:: >= <consolidated date>`) and the routing/staleness signals all rely on
+  `updated::` tracking the body; a body edited without bumping `updated::` is the classic
+  staleness bug (a MOC whose contents moved on while its date froze).
 - The workspace holds only outl's own dirs — `pages/`, `journals/`, `ops/`, `assets/`,
   `.outl/`. Never create parallel `knowledge/`, `daily/`, or `templates/` dirs; every TOC,
   leaf, and the journal template all live as pages in `pages/`.
