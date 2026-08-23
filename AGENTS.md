@@ -48,17 +48,28 @@ scale a **derived retrieval index** — the `memory-index` sidecar — front-run
 You never choose the regime; it's gated on node count.
 
 - **`memory-index` is a rebuildable derivative, never a source of truth.** It's a single
-  SQLite file (FTS5 keyword index + a `[[link]]` edge table) at `.outl/index.sqlite`, built
-  with the Python standard library only — no third-party packages, no venv, no build step,
-  so it just works on any machine that has Python. Delete it and `memory-index rebuild`
-  reconstructs it from the markdown. The markdown graph remains the only authority.
+  SQLite file at `.outl/index.sqlite` — an FTS5 keyword index plus a **typed, weighted
+  `[[link]]` edge table** (nodes = pages, edges = links) — built with the Python standard
+  library only: no third-party packages, no venv, no build step, so it just works on any
+  machine that has Python. Delete it and `memory-index rebuild` reconstructs it from the
+  markdown. The markdown graph remains the only authority.
+- **Edges carry meaning, and it's derived — the markdown is never annotated.** Each edge has
+  a `type` (`refs` by default, or `supersedes` / `contradicts` / `part-of`) inferred from the
+  wording of the line the link sits on, and a `weight` = how many times src links dst. You do
+  nothing to produce this; keep authoring plain `[[links]]`, one relation per bullet (line-
+  granular inference tags every link on a line alike). A schema bump self-heals: a stale index
+  is rebuilt automatically on the next read.
 - **The SessionStart hook injects whether the index is ACTIVE.** When it is, retrieve like
   this: run **`memory-index search "<query terms>"`** *first* to land directly on the narrow
-  relevant band — keyword (FTS5/bm25) ranking that returns `slug › heading` pointers plus one
-  graph hop of `[[link]]` neighbors — **then** `outl_page_get` the one or two slugs it names
-  to read full detail. Search replaces steps 1–4's blind descent; you still expand via the
-  graph. (Matching is keyword, not semantic: prefer the subject's own terms, and fall back to
-  TOC descent when a paraphrase misses.)
+  relevant band — keyword (FTS5/bm25) ranking that returns `slug › heading` pointers, **then**
+  a graph walk out from those hits along the typed edges (nearest- and strongest-first,
+  labelled `via <node> · <type> · <N>h ·w<weight>`) — **then** `outl_page_get` the one or two
+  slugs it names to read full detail. Search replaces steps 1–4's blind descent; you still
+  expand via the graph. (Matching is keyword, not semantic: prefer the subject's own terms,
+  and fall back to TOC descent when a paraphrase misses.)
+- **Hop depth is a function of graph size**, gated on node count like the ACTIVE/inactive
+  regime: the recursive traversal walks 1 hop below 3× the active threshold, 2 at 3×, 3 at 10×.
+  `memory-index stats` shows the edge-type breakdown for the current graph.
 - **When the index is inactive** (small graph, or the hook says so), use the TOC-descent
   above unchanged. It is also the **universal fallback** whenever the index is stale or
   `memory-index` is unavailable — the system always works without it.
