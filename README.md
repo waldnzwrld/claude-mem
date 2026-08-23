@@ -167,3 +167,11 @@ removed); the change takes effect in a new session.
   session.
 - **Self-maintaining.** Journal consolidation and frecency decay run automatically from the
   SessionStart hook, with a headless agent doing the LLM distillation in the background.
+
+## License
+
+`claude-mem` is released under the [MIT License](LICENSE).
+
+It depends on external tools it does not bundle or redistribute — notably
+[outl](https://github.com/outlmd/outl) (MIT), which you install yourself. See
+[THIRD_PARTY.md](THIRD_PARTY.md) for the dependency and licensing notes.
