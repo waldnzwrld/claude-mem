@@ -3,8 +3,9 @@
 memory-index — a rebuildable retrieval sidecar over the outl memory graph.
 
 The outl markdown graph at ~/.claude/memory is the sole source of truth. This tool
-builds a DERIVED, disposable SQLite index over it (FTS5 keyword + a typed/weighted
-link/edge table) so recall can land on the narrow relevant band in one shot, then walk
+builds a DERIVED, disposable SQLite index over it (Porter-stemmed, field-weighted FTS5
+keyword + a typed/weighted link/edge table) so recall can land on the narrow relevant
+band in one shot, then walk
 outward along [[links]] via a recursive graph traversal. The index is never
 authoritative: delete it and `rebuild` reconstructs it from the markdown on any machine.
 Edges are a pure projection of the files — type is inferred from link wording, never
@@ -13,9 +14,9 @@ annotated in the markdown — so the source stays clean and there is only one so
 Commands:
   memory-index rebuild            Full reindex from markdown (idempotent).
   memory-index refresh            Incremental: reindex only pages whose hash changed.
-  memory-index search "q"         Keyword (FTS5/bm25) hits, then a walk of the typed
-                                  [[link]] graph out from those hits. Hop depth is a
-                                  function of graph size: 1, 2 at 3×threshold, 3 at 10×.
+  memory-index search "q"         Field-weighted bm25 keyword hits, then a walk of the
+                                  typed [[link]] graph out from those hits. Hop depth is
+                                  a function of graph size: 1, 2 at 3×threshold, 3 at 10×.
   memory-index stats              Node/chunk/edge counts (with edge-type breakdown),
                                   index freshness, active/inactive.
 
@@ -25,6 +26,9 @@ Design notes:
     that just works on any machine. The whole index is one SQLite file (.outl/index.sqlite).
   * Auto-scale gate: below --threshold nodes the graph is small enough that agentic
     TOC-traversal beats an index; `stats` reports inactive and callers skip it.
+  * Lexical recall is Porter-stemmed (consolidate≈consolidation), diacritic-folded, and
+    prefix-matched (consol* → consolidation), over three field-weighted FTS columns
+    (title ≫ heading ≫ body via BM25_WEIGHTS) — all pure SQLite/FTS5, no model.
 """
 
 from __future__ import annotations
@@ -42,8 +46,12 @@ import sys
 import time
 
 WS_DEFAULT = os.path.expanduser("~/.claude/memory")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3  # stemmed/field-weighted FTS (title/heading/body columns)
 DEFAULT_THRESHOLD = 150  # node count at/above which the index is considered "active"
+
+# Field weights for bm25 over the (title, heading, text) FTS columns. A hit in the page
+# title outranks a section-heading hit, which outranks an incidental body mention.
+BM25_WEIGHTS = (10.0, 4.0, 1.0)
 
 FRECENCY_SEED = 30  # per AGENTS.md: a fresh leaf seeds at 30
 RETENTION_COUNT = 5  # keep the 5 most recent journal files; anything older is aged out
@@ -85,6 +93,7 @@ def init_schema(con):
         CREATE TABLE IF NOT EXISTS chunks (
             id          INTEGER PRIMARY KEY,
             slug        TEXT NOT NULL,
+            title       TEXT,                   -- page title, denormalized for field-weighting
             heading     TEXT,                   -- e.g. "## Decisions" or "(top)"
             anchor      TEXT,                   -- best-effort blk-ref handle, or ''
             text        TEXT NOT NULL
@@ -98,8 +107,11 @@ def init_schema(con):
             UNIQUE(src, dst, type)
         );
         CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
+        -- Stemmed (Porter) + diacritic-folded FTS with three weighted columns. External
+        -- content over `chunks`, so column names MUST match chunks(title,heading,text).
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
-            USING fts5(text, content='chunks', content_rowid='id');
+            USING fts5(title, heading, text, content='chunks', content_rowid='id',
+                       tokenize='porter unicode61 remove_diacritics 2');
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
         """
     )
@@ -302,9 +314,17 @@ def cmd_refresh(ws: str, threshold: int | None, quiet: bool = False):
 
 
 def _delete_slug(con, slug: str):
-    ids = [r[0] for r in con.execute("SELECT id FROM chunks WHERE slug=?", (slug,))]
-    for cid in ids:
-        con.execute("INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', ?, '')", (cid,))
+    # External-content FTS5 deletes must replay the ORIGINAL column values so the exact
+    # tokens are removed; passing '' (as an earlier version did) leaks stale terms.
+    rows = con.execute(
+        "SELECT id, title, heading, text FROM chunks WHERE slug=?", (slug,)
+    ).fetchall()
+    for cid, title, heading, text in rows:
+        con.execute(
+            "INSERT INTO chunks_fts(chunks_fts, rowid, title, heading, text) "
+            "VALUES('delete', ?, ?, ?, ?)",
+            (cid, title or "", heading or "", text or ""),
+        )
     con.execute("DELETE FROM chunks WHERE slug=?", (slug,))
     con.execute("DELETE FROM edges WHERE src=?", (slug,))
     con.execute("DELETE FROM pages WHERE slug=?", (slug,))
@@ -329,13 +349,20 @@ def _index_files(con, ws: str, files, full: bool):
                 _int_or_none(fm.get("frecency")),
             ),
         )
+        page_title = fm.get("title") or ""
         for heading, text in chunk_body(fm, body):
+            # Put the page title in the weighted `title` column ONLY on the synthetic
+            # summary chunk (the page's headline representation). Denormalizing it onto
+            # every chunk would make the title term appear corpus-wide, crushing its IDF
+            # and destroying the very discrimination the weight is meant to add.
+            fts_title = page_title if heading == "(summary)" else ""
             cur = con.execute(
-                "INSERT INTO chunks(slug,heading,anchor,text) VALUES(?,?,?,?)",
-                (slug, heading, "", text),
+                "INSERT INTO chunks(slug,title,heading,anchor,text) VALUES(?,?,?,?,?)",
+                (slug, fts_title, heading, "", text),
             )
             con.execute(
-                "INSERT INTO chunks_fts(rowid, text) VALUES(?, ?)", (cur.lastrowid, text)
+                "INSERT INTO chunks_fts(rowid, title, heading, text) VALUES(?,?,?,?)",
+                (cur.lastrowid, fts_title, heading, text),
             )
         for (dst, etype), weight in links_in(body).items():
             con.execute(
@@ -406,23 +433,30 @@ def _auto_depth(con) -> int:
     return 1
 
 
-def cmd_search(ws: str, query: str, k: int, no_graph: bool):
-    con = _open_current(ws)
-    init_schema(con)
-    depth = _auto_depth(con)
-    # --- keyword (FTS5 / bm25) — the sole ranker; lower bm25 == better match ---
-    results = []
-    seeds = []
+def _keyword_hits(con, query: str, k: int):
+    """Field-weighted bm25 chunk hits, best-first. Weights (title,heading,text) so a
+    page-title match outranks a heading match outranks a body mention. Returns
+    [(slug, heading, text, bm25)] (lower bm25 == better)."""
+    w = ", ".join(str(x) for x in BM25_WEIGHTS)
     try:
-        rows = con.execute(
-            "SELECT c.slug, c.heading, c.text, bm25(chunks_fts) AS r "
+        return con.execute(
+            f"SELECT c.slug, c.heading, c.text, bm25(chunks_fts, {w}) AS r "
             "FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid "
             "WHERE chunks_fts MATCH ? ORDER BY r LIMIT ?",
             (_fts_query(query), k),
         ).fetchall()
     except Exception:
-        rows = []
-    for slug, heading, text, r in rows:
+        return []
+
+
+def cmd_search(ws: str, query: str, k: int, no_graph: bool):
+    con = _open_current(ws)
+    init_schema(con)
+    depth = _auto_depth(con)
+    # --- field-weighted bm25 (title ≫ heading ≫ body); lower bm25 == better match ---
+    results = []
+    seeds = []
+    for slug, heading, text, r in _keyword_hits(con, query, k):
         results.append(("hit", slug, heading, text, r))
         if slug not in seeds:
             seeds.append(slug)
@@ -442,9 +476,12 @@ def cmd_search(ws: str, query: str, k: int, no_graph: bool):
 
 
 def _fts_query(q: str) -> str:
-    # OR the terms so paraphrase-ish keyword queries still match; quote to be safe.
+    # OR the terms so paraphrase-ish queries still match; each is a PREFIX token ("term"*)
+    # so "consol" reaches "consolidation". The Porter tokenizer additionally stems both
+    # sides, so morphological variants collapse before prefixing. Quote to stay safe
+    # against FTS5 operator characters in the raw query.
     terms = re.findall(r"[A-Za-z0-9_]+", q)
-    return " OR ".join(f'"{t}"' for t in terms) if terms else '""'
+    return " OR ".join(f'"{t}"*' for t in terms) if terms else '""'
 
 
 def _render_results(query: str, results):
