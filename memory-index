@@ -57,6 +57,14 @@ FRECENCY_SEED = 30  # per AGENTS.md: a fresh leaf seeds at 30
 RETENTION_COUNT = 5  # keep the 5 most recent journal files; anything older is aged out
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# Retrieval-graph heals (see cmd_medic). Each prunes pathological edges from the DERIVED
+# edge table only — the markdown source is never touched. `dangling` + `selfloop` are
+# unambiguously performance/precision-positive and are the medic default; `caphubs` and
+# `superseded` are more aggressive and opt-in. The active set is stored in meta so every
+# rebuild/refresh (incl. the SessionStart hook's) re-applies it and the graph stays healthy.
+HEAL_DEFAULT = "dangling,selfloop"
+FRECENCY_RISK = 5  # a knowledge leaf at/below this frecency is nearing prune (seed is 30)
+
 FM_RE = re.compile(r"^([A-Za-z_][\w-]*)::\s?(.*)$")
 LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 SECTION_RE = re.compile(r"^\s*-\s+(#{1,6})\s+(.*)$")  # a bullet whose text is a heading
@@ -369,6 +377,7 @@ def _index_files(con, ws: str, files, full: bool):
                 "INSERT OR IGNORE INTO edges(src,dst,type,weight) VALUES(?,?,?,?)",
                 (slug, dst, etype, weight),
             )
+    _apply_heals(con)  # re-prune the edge table per the stored heal policy (no-op if unset)
     set_meta(con, "indexed_at", str(int(time.time())))
 
 
@@ -501,6 +510,258 @@ def _render_results(query: str, results):
             print(f"    → expand: outl_page_get {slug}\n")
 
 
+# ------------------------------------------------ link-graph health (doctor/medic)
+def _parse_policy(s: str):
+    """A heal policy is a comma list of ops, each optionally `name:param` (e.g.
+    'dangling,selfloop,caphubs:12'). Returns [(name, param_or_None), ...]."""
+    ops = []
+    for tok in (s or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        name, sep, param = tok.partition(":")
+        ops.append((name.strip(), param.strip() if sep else None))
+    return ops
+
+
+def _heal_count(con, name: str, param) -> int:
+    """How many edges the given heal WOULD remove from the current edge table."""
+    if name == "dangling":  # edge → a slug that is not a real page (can't yield a hop)
+        return con.execute(
+            "SELECT COUNT(*) FROM edges WHERE dst NOT IN (SELECT slug FROM pages)"
+        ).fetchone()[0]
+    if name == "selfloop":
+        return con.execute("SELECT COUNT(*) FROM edges WHERE src = dst").fetchone()[0]
+    if name == "superseded":  # plain refs INTO a page something supersedes (stale target)
+        return con.execute(
+            "SELECT COUNT(*) FROM edges WHERE type='refs' "
+            "AND dst IN (SELECT dst FROM edges WHERE type='supersedes')"
+        ).fetchone()[0]
+    if name == "caphubs":  # per-source out-edges beyond the top-N by weight
+        n = int(param or 12)
+        return con.execute(
+            "SELECT COUNT(*) FROM (SELECT ROW_NUMBER() OVER "
+            "(PARTITION BY src ORDER BY weight DESC, dst) AS rn FROM edges) WHERE rn > ?",
+            (n,),
+        ).fetchone()[0]
+    return 0
+
+
+def _heal_delete(con, name: str, param) -> int:
+    if name == "dangling":
+        cur = con.execute("DELETE FROM edges WHERE dst NOT IN (SELECT slug FROM pages)")
+    elif name == "selfloop":
+        cur = con.execute("DELETE FROM edges WHERE src = dst")
+    elif name == "superseded":
+        cur = con.execute(
+            "DELETE FROM edges WHERE type='refs' "
+            "AND dst IN (SELECT dst FROM edges WHERE type='supersedes')"
+        )
+    elif name == "caphubs":
+        n = int(param or 12)
+        cur = con.execute(
+            "DELETE FROM edges WHERE rowid IN (SELECT rowid FROM (SELECT rowid, "
+            "ROW_NUMBER() OVER (PARTITION BY src ORDER BY weight DESC, dst) AS rn "
+            "FROM edges) WHERE rn > ?)",
+            (n,),
+        )
+    else:
+        return 0
+    return cur.rowcount
+
+
+def _heal_plan(con, ops):
+    """{label: count} the desired ops WOULD remove from the CURRENT edge table. Counts
+    are computed independently, so overlapping ops (e.g. an edge both dangling and a
+    self-loop) may be double-counted — it's a preview, not an exact sum."""
+    return {(n if not p else f"{n}:{p}"): _heal_count(con, n, p) for n, p in ops}
+
+
+def _apply_heals(con):
+    """Apply the stored heal policy to the edge table. Called at the end of every
+    (re)index, so the graph stays healthy across the hook's refreshes. Records the last
+    run in meta and returns {label: removed}. No-op (and no record) when no policy is set."""
+    ops = _parse_policy(get_meta(con, "heal_policy", "") or "")
+    if not ops:
+        return {}
+    before = con.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+    removed = {(n if not p else f"{n}:{p}"): _heal_delete(con, n, p) for n, p in ops}
+    after = con.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+    set_meta(con, "heal_last", json.dumps(
+        {"ts": int(time.time()), "policy": get_meta(con, "heal_policy"),
+         "removed": removed, "before": before, "after": after}))
+    return removed
+
+
+def _graph_health(con) -> dict:
+    """Structural health of the derived [[link]] graph: reach (orphans, components),
+    waste (dangling, self-loops), noise risk (hubs, superseded targets), decay (low
+    frecency). All read-only — computed from the index, source untouched."""
+    allslugs = {r[0] for r in con.execute("SELECT slug FROM pages")}
+    npages = con.execute("SELECT COUNT(*) FROM pages WHERE kind='page'").fetchone()[0]
+    njournals = con.execute("SELECT COUNT(*) FROM pages WHERE kind='journal'").fetchone()[0]
+    edges = con.execute("SELECT src, dst, type, weight FROM edges").fetchall()
+    nedges = len(edges)
+    by_type = dict(con.execute("SELECT type, COUNT(*) FROM edges GROUP BY type").fetchall())
+
+    dangling = sorted({d for _s, d, _t, _w in edges if d not in allslugs})
+    selfloops = sorted({s for s, d, _t, _w in edges if s == d})
+
+    deg, outdeg = {}, {}
+    for s, d, _t, _w in edges:
+        deg[s] = deg.get(s, 0) + 1
+        deg[d] = deg.get(d, 0) + 1
+        outdeg[s] = outdeg.get(s, 0) + 1
+    orphans = sorted(s for s in allslugs if s not in deg)
+    hub_slug, hub_deg = (max(outdeg.items(), key=lambda kv: kv[1]) if outdeg else (None, 0))
+
+    # Connected components over undirected edges among REAL nodes (union-find).
+    parent = {n: n for n in allslugs}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for s, d, _t, _w in edges:
+        if s in parent and d in parent:
+            ra, rb = find(s), find(d)
+            if ra != rb:
+                parent[ra] = rb
+    comp_sizes = {}
+    for n in allslugs:
+        r = find(n)
+        comp_sizes[r] = comp_sizes.get(r, 0) + 1
+    ncomp = len(comp_sizes)
+    largest = max(comp_sizes.values()) if comp_sizes else 0
+
+    superseded = sorted({r[0] for r in
+                         con.execute("SELECT DISTINCT dst FROM edges WHERE type='supersedes'")})
+    frisk = con.execute(
+        "SELECT slug, frecency FROM pages WHERE frecency IS NOT NULL AND frecency <= ? "
+        "ORDER BY frecency, slug", (FRECENCY_RISK,)
+    ).fetchall()
+
+    return {
+        "pages": npages, "journals": njournals, "nodes": len(allslugs), "edges": nedges,
+        "edge_types": by_type,
+        "avg_degree": round(2 * nedges / len(allslugs), 2) if allslugs else 0.0,
+        "hub": {"slug": hub_slug, "out_degree": hub_deg},
+        "orphans": orphans,
+        "dangling_targets": dangling,
+        "self_loops": selfloops,
+        "components": ncomp, "largest_component": largest,
+        "superseded_targets": superseded,
+        "frecency_risk": [{"slug": s, "frecency": f} for s, f in frisk],
+        "heal_policy": get_meta(con, "heal_policy"),
+    }
+
+
+def _cap(items, n=8):
+    items = list(items)
+    if len(items) <= n:
+        return ", ".join(map(str, items)) or "(none)"
+    return ", ".join(map(str, items[:n])) + f"  (+{len(items) - n} more)"
+
+
+def cmd_doctor(ws: str, as_json: bool):
+    con = _open_current(ws)
+    init_schema(con)
+    h = _graph_health(con)
+    con.close()
+    if as_json:
+        print(json.dumps(h))
+        return
+    et = ", ".join(f"{t}:{n}" for t, n in sorted(h["edge_types"].items())) or "(none)"
+    print(f"workspace : {ws}")
+    print(f"nodes     : {h['nodes']}  (pages {h['pages']}, journals {h['journals']})")
+    print(f"edges     : {h['edges']}   types: {et}")
+    print(f"avg degree: {h['avg_degree']}   hub: "
+          f"{h['hub']['slug']} (out {h['hub']['out_degree']})")
+    print(f"reach     : {h['components']} component(s), largest {h['largest_component']}"
+          f"/{h['nodes']} node(s)")
+    print(f"orphans   : {len(h['orphans'])}  {_cap(h['orphans'])}")
+    print(f"dangling  : {len(h['dangling_targets'])} target(s)  {_cap(h['dangling_targets'])}")
+    print(f"self-loops: {len(h['self_loops'])}  {_cap(h['self_loops'])}")
+    print(f"superseded: {len(h['superseded_targets'])} target(s)  {_cap(h['superseded_targets'])}")
+    fr = [f"{d['slug']}({d['frecency']})" for d in h["frecency_risk"]]
+    print(f"decay-risk: {len(fr)} leaf/leaves ≤{FRECENCY_RISK}  {_cap(fr)}")
+    print(f"heals     : {h['heal_policy'] or '(none active — run `memory-index medic`)'}")
+    # Verdict: name the actionable pathologies, performance-first.
+    flags = []
+    if h["dangling_targets"]:
+        flags.append(f"{len(h['dangling_targets'])} dangling target(s) waste traversal")
+    if h["self_loops"]:
+        flags.append(f"{len(h['self_loops'])} self-loop(s)")
+    if h["components"] > 1:
+        flags.append(f"graph fragmented into {h['components']} islands (assoc. recall can't cross them)")
+    if h["orphans"]:
+        flags.append(f"{len(h['orphans'])} orphan(s) unreachable by graph walk")
+    print("\nverdict   : " + ("healthy — nothing to prune" if not flags
+                              else "; ".join(flags) + "  →  `memory-index medic`"))
+
+
+def cmd_medic(ws: str, dry_run: bool, cap_hubs, prune_superseded: bool,
+              off: bool, as_json: bool):
+    # Assemble the desired policy from flags. Default = the safe, perf-positive pair.
+    if off:
+        desired = ""
+    else:
+        ops = list(HEAL_DEFAULT.split(","))
+        if prune_superseded:
+            ops.append("superseded")
+        if cap_hubs:
+            ops.append(f"caphubs:{cap_hubs}")
+        desired = ",".join(ops)
+
+    if dry_run:
+        con = _open_current(ws)
+        init_schema(con)
+        plan = _heal_plan(con, _parse_policy(desired))
+        cur = get_meta(con, "heal_policy")
+        con.close()
+        if as_json:
+            print(json.dumps({"dry_run": True, "desired": desired,
+                              "current_policy": cur, "would_remove": plan}))
+            return
+        print(f"medic --dry-run  (desired policy: {desired or '(none)'})")
+        print(f"  current policy : {cur or '(none)'}")
+        print("  would remove from the CURRENT edge table:")
+        for label, n in plan.items():
+            print(f"    {label:<14} {n}")
+        print("  (counts are independent; overlapping edges may be double-counted)")
+        return
+
+    # Apply: persist the policy, then rebuild so edges are re-derived from markdown and
+    # re-healed. Rebuild handles both enabling (prune) and --off (restore) uniformly.
+    con = connect(ws)
+    init_schema(con)
+    set_meta(con, "heal_policy", desired)
+    con.commit()
+    con.close()
+    cmd_rebuild(ws, None, quiet=True)
+
+    con = connect(ws)
+    last = get_meta(con, "heal_last")
+    total = con.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+    con.close()
+    info = json.loads(last) if last else {}
+    if as_json:
+        print(json.dumps({"applied": desired or None, "edges_after": total, "last": info}))
+        return
+    if not desired:
+        print(f"medic: heals DISABLED — edge table restored from markdown ({total} edges).")
+        return
+    removed = info.get("removed", {})
+    print(f"medic: applied heal policy '{desired}'")
+    print(f"  edges {info.get('before', '?')} → {info.get('after', total)}")
+    for label, n in removed.items():
+        print(f"    -{n:<4} {label}")
+    print("  policy persisted; the SessionStart hook's refresh will keep it applied.")
+    print("  (markdown source untouched — dead [[links]] remain as placeholders)")
+
+
 def cmd_stats(ws: str, threshold_arg: int, as_json: bool):
     con = _open_current(ws)
     init_schema(con)
@@ -543,6 +804,9 @@ def _print_stats(con, ws: str, threshold_arg: int | None = None, as_json: bool =
     print(f"pages     : {npages}   chunks: {nchunks}   edges: {nedges}")
     print(f"edge types: {edge_breakdown}")
     print(f"indexed   : {age}")
+    heal = get_meta(con, "heal_policy")
+    if heal:
+        print(f"heals     : {heal}  (run `memory-index doctor` for graph health)")
     print(f"threshold : {threshold}  →  index {'ACTIVE' if active else 'inactive (small graph — use TOC traversal)'}")
 
 
@@ -773,6 +1037,16 @@ def main(argv=None):
     sc.add_argument("--reap", action="store_true", help="delete aged journals already marked consolidated::")
     sc.add_argument("--today", default=None, help="override the date (default: today)")
     sc.add_argument("--json", action="store_true")
+    sd = sub.add_parser("doctor", help="read-only link-graph health report")
+    sd.add_argument("--json", action="store_true")
+    smd = sub.add_parser("medic", help="prune pathological edges from the retrieval graph (source untouched)")
+    smd.add_argument("--dry-run", action="store_true", help="report what would be pruned; change nothing")
+    smd.add_argument("--cap-hubs", type=int, default=None, metavar="N",
+                     help="also cap each node's out-edges to the top-N by weight (aggressive)")
+    smd.add_argument("--prune-superseded", action="store_true",
+                     help="also drop plain refs into superseded pages (aggressive)")
+    smd.add_argument("--off", action="store_true", help="disable heals and restore edges from markdown")
+    smd.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
     ws = os.path.expanduser(args.workspace)
@@ -794,6 +1068,10 @@ def main(argv=None):
     elif args.cmd == "consolidate":
         today = args.today or datetime.date.today().isoformat()
         return cmd_consolidate(ws, today, args.reap, args.json) or 0
+    elif args.cmd == "doctor":
+        cmd_doctor(ws, args.json)
+    elif args.cmd == "medic":
+        cmd_medic(ws, args.dry_run, args.cap_hubs, args.prune_superseded, args.off, args.json)
     return 0
 
 
