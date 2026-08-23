@@ -70,15 +70,19 @@ diacritic-folded, and prefix-matched (`consol*` → `consolidation`), ranked by
 title hit outranks an incidental body mention.
 
 **Graph expansion** walks the typed, weighted `[[link]]` edge table outward from the
-keyword hits via a recursive query. Edge *type* (`refs` / `supersedes` / `contradicts` /
-`part-of`) is inferred from the wording around each link — the markdown is never annotated,
-so the source stays clean. Hop depth scales with graph size (1 → 2 → 3).
+keyword hits via a recursive query — seeded by the keyword hits, it reaches associatively
+related nodes the query never matched lexically (spreading-activation style recall). Edge
+*type* (`refs` / `supersedes` / `contradicts` / `part-of`) is inferred from the wording
+around each link — the markdown is never annotated, so the source stays clean. Hop depth
+scales with graph size (1 → 2 → 3).
 
 ```
 memory-index rebuild        # full reindex from markdown (idempotent)
 memory-index refresh        # incremental: reindex only pages whose content changed
 memory-index search "q"     # field-weighted bm25 hits + typed [[link]] graph walk
 memory-index stats          # node/chunk/edge counts, freshness, active/inactive
+memory-index doctor         # read-only link-graph health report (--json)
+memory-index medic          # prune pathological edges from the index (--dry-run, --off)
 memory-index maintain       # daily frecency decay sweep (reports prune candidates)
 memory-index consolidate    # report the journal-consolidation backlog; --reap deletes
                             #   aged journals verified as already distilled
@@ -86,6 +90,23 @@ memory-index consolidate    # report the journal-consolidation backlog; --reap d
 
 `search` flags: `-k N` (result count), `--no-graph` (keyword only).
 Workspace is `-w <dir>` (default `~/.claude/memory`, or `$MEMORY_WS`).
+
+### Graph health: `doctor` and `medic`
+
+Associative recall is only as good as the link graph, so two commands keep it honest —
+both operate on the **derived index only and never edit your markdown**:
+
+- **`doctor`** — a read-only health report: orphans, dangling links (`[[links]]` to
+  non-existent pages), connected components (fragmentation), the hub node, superseded
+  targets, and frecency decay-risk, with a performance-first verdict. `--json` for scripts.
+- **`medic`** — prunes pathological edges from the index for performance/precision:
+  **dangling links** and **self-loops** by default, with opt-in `--cap-hubs N` (cap a
+  node's out-edges to the top-N by weight) and `--prune-superseded`. The heal set is
+  persisted as a policy, so every `refresh` (including the SessionStart hook's) keeps the
+  graph healthy. `--dry-run` previews; `--off` disables and restores edges from markdown.
+
+A dead `[[link]]` is often an intentional placeholder for a page yet to be written, so the
+medic leaves it in the source and merely stops the graph walk from wasting hops on it.
 
 ## Installation
 
@@ -111,6 +132,23 @@ the `## Persistent memory` section to `~/.claude/CLAUDE.md` (idempotently), and 
 initial index if the workspace exists.
 
 Start a **new** Claude Code session to load the memory system.
+
+## Uninstalling
+
+```bash
+./uninstall.sh
+```
+
+Reverses `install.sh`'s three coupling actions: removes the SessionStart + PreCompact hooks
+from `~/.claude/settings.json` (leaving any other hooks intact), deletes the deployed
+binaries from `~/.local/bin`, and strips the `## Persistent memory` section from
+`~/.claude/CLAUDE.md`.
+
+It **deliberately leaves `~/.claude/memory` and everything in it untouched** — your
+`pages/`, `journals/`, `AGENTS.md`, and the derived index all remain. This decouples the
+agent from the memory system without deleting any memory, so a later `./install.sh`
+re-couples everything with nothing lost. Safe to re-run (it no-ops on anything already
+removed); the change takes effect in a new session.
 
 ## Requirements
 
