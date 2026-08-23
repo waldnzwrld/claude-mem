@@ -49,12 +49,6 @@ and can be rebuilt from the markdown on any machine.
 - **Retrieval auto-scales.** Below a node threshold the graph is small enough to read by
   descending the TOC; at/above it, `memory-index search` becomes the search-first entry
   point. The hook tells the agent which regime is active.
-- **Recall is delegated to keep context low.** Reading memory inline dumps full page bodies
-  into the live chat — pure cost once the conclusion is drawn. So for any broad or multi-page
-  recall the main agent spawns the **`memory-retriever`** subagent, which does the searching
-  and page reads in *its own* context and hands back only the distilled answer plus the
-  `[[slugs]]` it used. The main conversation never sees the raw bodies; single known-slug
-  re-fetches still happen inline, where an agent round-trip would be overkill.
 
 ## Components
 
@@ -67,7 +61,6 @@ Everything is deployed by `install.sh`:
 | `memory-index` | `~/.local/bin/` | Stdlib-only SQLite retrieval sidecar (see below). |
 | `memory-consolidate` | `~/.local/bin/` | Headless agent that distills aged journals into knowledge pages, then reaps them. Runs on **Sonnet 5** (override with `MEMORY_MODEL`). Single-instanced, safe to re-run. |
 | `claude-memory-dump` | `~/.local/bin/` | On-close journaler fired by the SessionEnd hook: a detached headless agent reads the session transcript and appends only the durable facts to today's journal, deduping against existing entries. Runs on **Sonnet 5**; never edits anything but the journal. |
-| `memory-retriever.md` | `~/.claude/agents/` | The **recall subagent**. For broad/multi-page recall the main agent delegates here; it does the search + `outl_page_get` reads in *its own* context and returns only the distilled answer + `[[slugs]]`, so page bodies never enter the main chat. Read-only; inherits the caller's model. |
 | `CLAUDE_TEMPLATE.md` | appended to `~/.claude/CLAUDE.md` | The `## Persistent memory` section that points the agent at the protocol. |
 
 ## `memory-index` — the retrieval sidecar
@@ -143,14 +136,8 @@ claude mcp add outl --scope user -- outl --workspace ~/.claude/memory mcp serve
 
 `install.sh` copies the files into place, patches the hook's `outl` path for this machine's
 Homebrew, wires the SessionStart + PreCompact + SessionEnd hooks into
-`~/.claude/settings.json`, deploys the `memory-retriever` recall subagent to
-`~/.claude/agents/`, appends the `## Persistent memory` section to `~/.claude/CLAUDE.md` if it
-isn't already present, and builds the initial index if the workspace exists.
-
-> **Updating an existing `CLAUDE.md`:** `install.sh` never rewrites a `## Persistent memory`
-> section it already finds (it may hold your own edits). When it detects one, it prints a note
-> reminding you to refresh that block manually from `CLAUDE_TEMPLATE.md` so protocol changes
-> (like the memory-retriever routing rule) aren't missed.
+`~/.claude/settings.json`, appends the `## Persistent memory` section to
+`~/.claude/CLAUDE.md` (idempotently), and builds the initial index if the workspace exists.
 
 Start a **new** Claude Code session to load the memory system.
 

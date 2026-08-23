@@ -22,7 +22,6 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CLAUDE_DIR="$HOME/.claude"
 MEM_DIR="$CLAUDE_DIR/memory"
-AGENTS_DIR="$CLAUDE_DIR/agents"
 BIN_DIR="$HOME/.local/bin"
 SETTINGS="$CLAUDE_DIR/settings.json"
 CLAUDEMD="$CLAUDE_DIR/CLAUDE.md"
@@ -30,9 +29,8 @@ HOOK="$BIN_DIR/claude-memory-hook"
 MEMIDX="$BIN_DIR/memory-index"
 CONS="$BIN_DIR/memory-consolidate"
 DUMP="$BIN_DIR/claude-memory-dump"
-RETRIEVER="$AGENTS_DIR/memory-retriever.md"
 
-mkdir -p "$MEM_DIR" "$BIN_DIR" "$AGENTS_DIR"
+mkdir -p "$MEM_DIR" "$BIN_DIR"
 
 # ---- 1. protocol doc --------------------------------------------------------
 cp "$SRC/AGENTS.md" "$MEM_DIR/AGENTS.md"
@@ -65,22 +63,9 @@ cp "$SRC/claude-memory-dump" "$DUMP"
 chmod 755 "$DUMP"
 echo "✔ claude-memory-dump -> $DUMP"
 
-# ---- 2e. memory-retriever: the recall subagent (keeps page bodies out of the
-#          caller's context — see the routing note in AGENTS.md/CLAUDE.md) ------
-cp "$SRC/memory-retriever.md" "$RETRIEVER"
-echo "✔ memory-retriever -> $RETRIEVER"
-
 # ---- 3. CLAUDE.md (append the memory section if it isn't already there) ------
-# First-run only. If the section already exists we do NOT touch it — the file may
-# carry the user's own edits — so protocol updates are NOT auto-applied. Instead we
-# print a note telling the user to manually refresh the block from CLAUDE_TEMPLATE.md
-# so changes like the memory-retriever routing rule aren't silently missed.
 if [ -f "$CLAUDEMD" ] && grep -q '^## Persistent memory' "$CLAUDEMD"; then
-  echo "• CLAUDE.md already has a '## Persistent memory' section; left as-is."
-  echo "  ↳ NOTE: install.sh will not modify an existing section, so protocol updates"
-  echo "    are not applied automatically. To pick up changes (e.g. the memory-retriever"
-  echo "    routing rule), replace that section in $CLAUDEMD with the current one from:"
-  echo "        $SRC/CLAUDE_TEMPLATE.md"
+  echo "• CLAUDE.md already has the memory section; left as-is"
 else
   # Shipped sections reference the protocol docs by ~ path (user-agnostic, read
   # on demand — no @import), so no path rewrite is needed.

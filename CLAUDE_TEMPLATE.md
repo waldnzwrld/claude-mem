@@ -19,13 +19,9 @@ the **recent journal window** each session, so recent context is already in fron
 
 Work from the injected index; retrieve deeper detail on demand with `outl_page_get <slug>`
 (never brute-force the graph); append durable decisions/discoveries to today's journal as you
-go. For **broad or multi-page recall** ("what do I know about X", "how did we decide Y"),
-delegate to the **`memory-retriever`** subagent — it reads the pages in its own context and
-returns only the distilled answer + slugs, keeping page bodies out of this chat; do a single
-known-slug re-fetch inline instead. Retention is the **5 most recent journals**; distilling
-older ones into the knowledge tree is **automatic** (hook + background agent) — never
-consolidate or delete journals by hand unless a `⚠ CONSOLIDATION REQUIRED` fallback directive
-appears, then follow it.
+go. Retention is the **5 most recent journals**; distilling older ones into the knowledge tree
+is **automatic** (hook + background agent) — never consolidate or delete journals by hand
+unless a `⚠ CONSOLIDATION REQUIRED` fallback directive appears, then follow it.
 
 Full protocol — graph model, crosslinking, writing, retrieval, condensation, frecency — is in
 `~/.claude/memory/AGENTS.md`; read it **only when doing memory maintenance**, not every session.
