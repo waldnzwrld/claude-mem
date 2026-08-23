@@ -5,7 +5,8 @@
 # Reverses install.sh's three coupling actions:
 #   1. removes the SessionStart + PreCompact + SessionEnd hooks from settings.json
 #   2. deletes the deployed binaries (claude-memory-hook, memory-index,
-#      memory-consolidate, claude-memory-dump) from ~/.local/bin
+#      memory-consolidate, claude-memory-dump) from ~/.local/bin, and the
+#      memory-retriever subagent from ~/.claude/agents
 #   3. strips the "## Persistent memory" section from ~/.claude/CLAUDE.md
 #
 # It DELIBERATELY does NOT touch the memory workspace at ~/.claude/memory — your
@@ -28,6 +29,7 @@ HOOK="$BIN_DIR/claude-memory-hook"
 MEMIDX="$BIN_DIR/memory-index"
 CONS="$BIN_DIR/memory-consolidate"
 DUMP="$BIN_DIR/claude-memory-dump"
+RETRIEVER="$CLAUDE_DIR/agents/memory-retriever.md"
 
 # ---- 1. remove the SessionStart + PreCompact hooks from settings.json -------
 if [ -f "$SETTINGS" ] && command -v python3 >/dev/null 2>&1; then
@@ -96,8 +98,9 @@ else
   echo "• settings.json  -> not found or python3 missing; skipped hook removal"
 fi
 
-# ---- 2. remove the deployed binaries ---------------------------------------
-for f in "$HOOK" "$MEMIDX" "$CONS" "$DUMP"; do
+# ---- 2. remove the deployed binaries + the recall subagent ------------------
+# (leaves ~/.claude/agents/ itself in place — the user may keep other agents there.)
+for f in "$HOOK" "$MEMIDX" "$CONS" "$DUMP" "$RETRIEVER"; do
   if [ -e "$f" ]; then
     rm -f "$f" && echo "✔ removed        $f"
   else

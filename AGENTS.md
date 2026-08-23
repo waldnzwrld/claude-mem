@@ -47,6 +47,24 @@ cost with no payoff: if you need the detail again, re-fetch by slug (the FTS/gra
 zero model tokens — see [[memory-retrieval-index]]). The durable residue of any retrieval is
 tiny, which is exactly what keeps an MCP-heavy session from bloating.
 
+### Delegate broad recall to the `memory-retriever` subagent
+
+The residue discipline above can be **mechanized**: for any recall that would touch more than
+one page, spawn the **`memory-retriever`** subagent (via the Agent tool) instead of walking the
+graph yourself. It does the searching and the `outl_page_get` reads in *its own* context and
+returns only the distilled answer + the `[[slugs]]` it drew from — so the raw page bodies never
+enter this conversation at all. That is strictly better than reading inline and hoping
+compaction spares the conclusion.
+
+- **Delegate** when the question is broad, multi-hop, or open-ended ("what do I know about X",
+  "how did we decide Y", "catch me up on project Z"), or when you don't yet know which slug
+  holds the answer. Hand it the question in natural language; carry forward the answer + the
+  `Sources:` slugs it returns.
+- **Don't delegate** a single re-fetch of a slug you already know — `outl_page_get <slug>`
+  inline is cheaper than an agent round-trip. The subagent is for breadth, not for one page.
+- The subagent is **read-only** (no write tools). Writing to memory — journals, condensation,
+  frecency — always stays with you, on the main thread.
+
 ## Retrieval regime auto-scales to graph size (the index)
 
 The TOC-descent above is the retrieval mechanism for a **small** graph — cheap when there
