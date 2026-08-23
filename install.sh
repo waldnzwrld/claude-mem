@@ -7,7 +7,7 @@
 #     ./install.sh
 #
 # It copies the repo's files to where Claude Code expects them and wires the
-# SessionStart/PreCompact hooks into settings.json. It does NOT initialize the
+# SessionStart/PreCompact/SessionEnd hooks into settings.json. It does NOT initialize the
 # outl workspace or register the outl MCP server — do those two yourself:
 #
 #     brew tap outlmd/outl https://github.com/outlmd/outl
@@ -28,6 +28,7 @@ CLAUDEMD="$CLAUDE_DIR/CLAUDE.md"
 HOOK="$BIN_DIR/claude-memory-hook"
 MEMIDX="$BIN_DIR/memory-index"
 CONS="$BIN_DIR/memory-consolidate"
+DUMP="$BIN_DIR/claude-memory-dump"
 
 mkdir -p "$MEM_DIR" "$BIN_DIR"
 
@@ -56,6 +57,11 @@ echo "✔ memory-index   -> $MEMIDX"
 cp "$SRC/memory-consolidate" "$CONS"
 chmod 755 "$CONS"
 echo "✔ memory-consolidate -> $CONS"
+
+# ---- 2d. claude-memory-dump: on-close journaler (fired by SessionEnd) --------
+cp "$SRC/claude-memory-dump" "$DUMP"
+chmod 755 "$DUMP"
+echo "✔ claude-memory-dump -> $DUMP"
 
 # ---- 3. CLAUDE.md (append the memory section if it isn't already there) ------
 if [ -f "$CLAUDEMD" ] && grep -q '^## Persistent memory' "$CLAUDEMD"; then
@@ -102,14 +108,14 @@ def ensure(event):
     groups.append({'hooks': [{'type': 'command', 'command': cmd}]})
     return True
 
-changed = ensure('SessionStart') | ensure('PreCompact')
+changed = ensure('SessionStart') | ensure('PreCompact') | ensure('SessionEnd')
 
 if changed:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
         f.write('\n')
-    print(f"✔ settings.json  -> wired SessionStart + PreCompact hooks")
+    print(f"✔ settings.json  -> wired SessionStart + PreCompact + SessionEnd hooks")
 else:
     print("• settings.json already has the hooks; left as-is")
 PY
@@ -118,7 +124,8 @@ else
 ! python3 not found — add these to the "hooks" object in $SETTINGS yourself:
 
   "SessionStart": [ { "hooks": [ { "type": "command", "command": "$HOOK" } ] } ],
-  "PreCompact":   [ { "hooks": [ { "type": "command", "command": "$HOOK" } ] } ]
+  "PreCompact":   [ { "hooks": [ { "type": "command", "command": "$HOOK" } ] } ],
+  "SessionEnd":   [ { "hooks": [ { "type": "command", "command": "$HOOK" } ] } ]
 EOF
 fi
 

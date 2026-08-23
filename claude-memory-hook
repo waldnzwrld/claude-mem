@@ -14,6 +14,7 @@
 OUTL="${OUTL_BIN:-/opt/homebrew/bin/outl}"
 MEMIDX="${MEMORY_INDEX_BIN:-$HOME/.local/bin/memory-index}"
 CONS="${MEMORY_CONSOLIDATE_BIN:-$HOME/.local/bin/memory-consolidate}"
+DUMP="${MEMORY_DUMP_BIN:-$HOME/.local/bin/claude-memory-dump}"
 CLAUDE="${CLAUDE_BIN:-claude}"
 # Hooks can run with a minimal PATH; fall back to the usual install location.
 command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE="$HOME/.local/bin/claude"
@@ -31,14 +32,42 @@ except Exception:
     print("")' 2>/dev/null)"
 
 # emit <hookEventName>  (context text taken from $CTX)
+# additionalContext is the supported channel for SessionStart; use it there only.
 emit() {
   python3 -c 'import json, os, sys
 print(json.dumps({"hookSpecificOutput": {"hookEventName": sys.argv[1], "additionalContext": os.environ.get("CTX", "")}}))' "$1"
 }
 
+# emit_msg <text>  — surface a message to the model via the top-level systemMessage
+# field. PreCompact does NOT honour additionalContext, so its reminder must go
+# through systemMessage or it is silently dropped.
+emit_msg() {
+  python3 -c 'import json, sys
+print(json.dumps({"systemMessage": sys.argv[1]}))' "$1"
+}
+
 if [ "$event" = "PreCompact" ]; then
-  CTX="Before this context is compacted: append any unsaved decisions, discoveries, or new durable facts from this session to today's journal ($TODAY) using the outl tools, per ~/.claude/memory/AGENTS.md." \
-    emit "PreCompact"
+  emit_msg "Before this context is compacted, flush anything unsaved to today's journal ($TODAY) via the outl tools, per ~/.claude/memory/AGENTS.md. In particular: (1) the slugs you retrieved this session plus the conclusion you drew from each, so you can re-fetch precisely after compaction discards the page bodies; and (2) any unsaved decisions, discoveries, or durable facts. Write IMPACTFUL facts through to their deep-memory leaf now (see the Two-tier writes section)."
+  exit 0
+fi
+
+# ---- SessionEnd: flush the session's durable facts to today's journal -------
+# Journaling on close does not depend on a compaction ever happening. Spawn the
+# detached headless journaler (Sonnet 5) with the transcript path — unless we're
+# already inside a spawned agent (its own SessionEnd must not re-trigger us).
+if [ "$event" = "SessionEnd" ]; then
+  if [ -z "${MEMORY_DUMP_ACTIVE:-}" ] && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] \
+     && [ -x "$DUMP" ] && command -v "$CLAUDE" >/dev/null 2>&1; then
+    tpath="$(printf '%s' "$input" | python3 -c 'import sys, json
+try:
+    print(json.load(sys.stdin).get("transcript_path", ""))
+except Exception:
+    print("")' 2>/dev/null)"
+    if [ -n "$tpath" ]; then
+      MEMORY_DUMP_TRANSCRIPT="$tpath" nohup "$DUMP" >/dev/null 2>&1 &
+      disown 2>/dev/null || true
+    fi
+  fi
   exit 0
 fi
 

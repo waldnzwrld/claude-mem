@@ -3,9 +3,9 @@
 # uninstall.sh — cleanly decouple the Claude persistent-memory integration.
 #
 # Reverses install.sh's three coupling actions:
-#   1. removes the SessionStart + PreCompact hooks from ~/.claude/settings.json
+#   1. removes the SessionStart + PreCompact + SessionEnd hooks from settings.json
 #   2. deletes the deployed binaries (claude-memory-hook, memory-index,
-#      memory-consolidate) from ~/.local/bin
+#      memory-consolidate, claude-memory-dump) from ~/.local/bin
 #   3. strips the "## Persistent memory" section from ~/.claude/CLAUDE.md
 #
 # It DELIBERATELY does NOT touch the memory workspace at ~/.claude/memory — your
@@ -27,6 +27,7 @@ CLAUDEMD="$CLAUDE_DIR/CLAUDE.md"
 HOOK="$BIN_DIR/claude-memory-hook"
 MEMIDX="$BIN_DIR/memory-index"
 CONS="$BIN_DIR/memory-consolidate"
+DUMP="$BIN_DIR/claude-memory-dump"
 
 # ---- 1. remove the SessionStart + PreCompact hooks from settings.json -------
 if [ -f "$SETTINGS" ] && command -v python3 >/dev/null 2>&1; then
@@ -59,7 +60,7 @@ def is_ours(h):
     return c == cmd or c.rstrip('/').endswith('/claude-memory-hook') or c == 'claude-memory-hook'
 
 changed = False
-for event in ('SessionStart', 'PreCompact'):
+for event in ('SessionStart', 'PreCompact', 'SessionEnd'):
     groups = hooks.get(event)
     if not isinstance(groups, list):
         continue
@@ -96,7 +97,7 @@ else
 fi
 
 # ---- 2. remove the deployed binaries ---------------------------------------
-for f in "$HOOK" "$MEMIDX" "$CONS"; do
+for f in "$HOOK" "$MEMIDX" "$CONS" "$DUMP"; do
   if [ -e "$f" ]; then
     rm -f "$f" && echo "✔ removed        $f"
   else

@@ -13,29 +13,36 @@ and can be rebuilt from the markdown on any machine.
 ## How it works
 
 ```
-                ┌─────────────────────────────────────────────┐
-   session      │  claude-memory-hook  (SessionStart / PreCompact)
-   starts  ───► │   • injects the index TOC + recent journals   │
-                │   • refreshes the retrieval index             │
-                │   • runs daily frecency + consolidation chores│
-                └───────────────┬─────────────────────────────┘
-                                │  reads / writes
-                     ┌──────────▼───────────┐        ┌────────────────────┐
-                     │  outl graph           │◄──────►│  memory-index       │
-                     │  ~/.claude/memory     │ derives│  (SQLite sidecar,   │
-                     │   pages/  journals/   │        │   FTS5 + [[link]]   │
-                     │   (source of truth)   │        │   graph walk)       │
-                     └───────────────────────┘        └────────────────────┘
-                                ▲
-                                │ distills aged journals (headless `claude -p`)
+                ┌───────────────────────────────────────────────────┐
+  session ───► │  claude-memory-hook   (SessionStart / PreCompact /   │
+  start/end    │                        SessionEnd)                   │
+                │   start: inject index TOC + recent journals,        │
+                │          refresh the index, run daily chores        │
+                │   end:   flush the session's durable facts to today │
+                └───────────────┬───────────────────────┬────────────┘
+                                │  reads / writes        │ on close
+                     ┌──────────▼───────────┐   ┌────────▼───────────┐
+                     │  outl graph           │   │ claude-memory-dump │
+                     │  ~/.claude/memory     │   │ (headless Sonnet →  │
+                     │   pages/  journals/   │◄──┤  today's journal)   │
+                     │   (source of truth)   │   └────────────────────┘
+                     └───────┬──────────▲────┘   ┌────────────────────┐
+                     derives │          │◄──────►│  memory-index       │
+                             ▼          │        │  (SQLite sidecar,   │
+                     (SQLite index) ────┘        │   FTS5 + [[link]])  │
+                                ▲                 └────────────────────┘
+                                │ distills aged journals (headless Sonnet)
                         ┌───────┴──────────┐
                         │ memory-consolidate│
                         └──────────────────┘
 ```
 
 - **Journals** (`journals/YYYY-MM-DD.md`) capture the working narrative day by day. The
-  **5 most recent** are kept in high resolution; anything older is **distilled** into the
-  knowledge tree and reaped — automatically.
+  agent appends durable facts as it works; on session close the **SessionEnd** hook runs a
+  cheap headless agent (`claude-memory-dump`) that flushes anything still uncaptured — so
+  journaling never depends on a context compaction happening. The **5 most recent** journals
+  are kept in high resolution; anything older is **distilled** into the knowledge tree and
+  reaped — automatically.
 - **Knowledge pages** (`pages/*.md`) are the durable, deduplicated memory: a tree of
   tables-of-contents linked by typed `[[wikilinks]]`, with `frecency` decay so stale
   leaves surface as prune candidates.
@@ -50,9 +57,10 @@ Everything is deployed by `install.sh`:
 | File | Installed to | Role |
 |------|--------------|------|
 | `AGENTS.md` | `~/.claude/memory/AGENTS.md` | The full protocol the agent follows (graph model, crosslinking, writing, condensation, frecency, retrieval). |
-| `claude-memory-hook` | `~/.local/bin/` | SessionStart: inject TOC + recent-journal window, refresh the index, run daily chores. PreCompact: remind the agent to flush notes before compaction. Designed to never fail a session. |
+| `claude-memory-hook` | `~/.local/bin/` | SessionStart: inject TOC + recent-journal window, refresh the index, run daily chores. PreCompact: remind the agent to flush notes before compaction. SessionEnd: fire the on-close journaler. Designed to never fail a session. |
 | `memory-index` | `~/.local/bin/` | Stdlib-only SQLite retrieval sidecar (see below). |
-| `memory-consolidate` | `~/.local/bin/` | Headless `claude -p` agent that distills aged journals into knowledge pages, then reaps them. Single-instanced, safe to re-run. |
+| `memory-consolidate` | `~/.local/bin/` | Headless agent that distills aged journals into knowledge pages, then reaps them. Runs on **Sonnet 5** (override with `MEMORY_MODEL`). Single-instanced, safe to re-run. |
+| `claude-memory-dump` | `~/.local/bin/` | On-close journaler fired by the SessionEnd hook: a detached headless agent reads the session transcript and appends only the durable facts to today's journal, deduping against existing entries. Runs on **Sonnet 5**; never edits anything but the journal. |
 | `CLAUDE_TEMPLATE.md` | appended to `~/.claude/CLAUDE.md` | The `## Persistent memory` section that points the agent at the protocol. |
 
 ## `memory-index` — the retrieval sidecar
@@ -127,9 +135,9 @@ claude mcp add outl --scope user -- outl --workspace ~/.claude/memory mcp serve
 ```
 
 `install.sh` copies the files into place, patches the hook's `outl` path for this machine's
-Homebrew, wires the SessionStart + PreCompact hooks into `~/.claude/settings.json`, appends
-the `## Persistent memory` section to `~/.claude/CLAUDE.md` (idempotently), and builds the
-initial index if the workspace exists.
+Homebrew, wires the SessionStart + PreCompact + SessionEnd hooks into
+`~/.claude/settings.json`, appends the `## Persistent memory` section to
+`~/.claude/CLAUDE.md` (idempotently), and builds the initial index if the workspace exists.
 
 Start a **new** Claude Code session to load the memory system.
 
@@ -139,9 +147,9 @@ Start a **new** Claude Code session to load the memory system.
 ./uninstall.sh
 ```
 
-Reverses `install.sh`'s three coupling actions: removes the SessionStart + PreCompact hooks
-from `~/.claude/settings.json` (leaving any other hooks intact), deletes the deployed
-binaries from `~/.local/bin`, and strips the `## Persistent memory` section from
+Reverses `install.sh`'s three coupling actions: removes the SessionStart + PreCompact +
+SessionEnd hooks from `~/.claude/settings.json` (leaving any other hooks intact), deletes the
+deployed binaries from `~/.local/bin`, and strips the `## Persistent memory` section from
 `~/.claude/CLAUDE.md`.
 
 It **deliberately leaves `~/.claude/memory` and everything in it untouched** — your

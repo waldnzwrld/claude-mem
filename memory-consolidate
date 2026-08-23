@@ -21,6 +21,9 @@ MEMIDX="${MEMORY_INDEX_BIN:-$HOME/.local/bin/memory-index}"
 CLAUDE="${CLAUDE_BIN:-claude}"
 # Hooks can run with a minimal PATH; fall back to the usual install location.
 command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE="$HOME/.local/bin/claude"
+# Offline distillation is a comprehension-heavy summarisation task — run it on a
+# capable model so nuance survives condensation. Override with MEMORY_MODEL.
+MODEL="${MEMORY_MODEL:-claude-sonnet-5}"
 WS="$HOME/.claude/memory"
 LOCKDIR="$WS/.consolidate.lock.d"
 LOG="$WS/.consolidate.log"
@@ -67,8 +70,8 @@ Distill these aged journals, which are older than the 5 most recent journals and
 
 Follow the Condensation section of ~/.claude/memory/AGENTS.md exactly. For EACH date:
   1. outl_daily_get <date> and read the raw journal.
-  2. Cluster its items by the [[page]]/topic they concern.
-  3. For each cluster with lasting value — apply 'What long-term memory is for': KEEP cross-repo relationships, long-running plan state, decisions + their why, non-obvious gotchas, durable user facts; DROP anything the repo, its git log, or its CLAUDE.md already holds — descend the TOC tree to the right knowledge leaf (create a new leaf, or split a crowded TOC, as needed) and merge the DISTILLED points in (synthesise, do not copy verbatim). Refresh updated:: and summary::; ensure project:: [[...]], parent:: [[<toc>]] and back-links; touch frecency (new leaf seeds frecency:: 30; merging is a use, +5 capped at 60) and set seen:: $TODAY.
+  2. Cluster its items by the [[page]]/topic they concern. Any item already marked #in-deep [[leaf]] was written through to deep memory when authored — do NOT re-merge it; just verify the named leaf still carries the fact and include that leaf in this journal's distilled-into evidence (step 5).
+  3. Tier every remaining cluster first. DROP ephemeral items outright: transient git/branch/working-tree state, currently-doing status, session-local notes (e.g. \"branch X has uncommitted changes\" never becomes a leaf). For BORDERLINE items whose durability is genuinely uncertain, apply 'What long-term memory is for' and promote-or-drop DELIBERATELY — do not reflexively keep. For each cluster with lasting value — KEEP cross-repo relationships, long-running plan state, decisions + their why, non-obvious gotchas, durable user facts; DROP anything the repo, its git log, or its CLAUDE.md already holds — descend the TOC tree to the right knowledge leaf (create a new leaf, or split a crowded TOC, as needed) and merge the DISTILLED points in (synthesise, do not copy verbatim, and never duplicate a point the leaf already states). Refresh updated:: and summary::; ensure project:: [[...]], parent:: [[<toc>]] and back-links; touch frecency (new leaf seeds frecency:: 30; merging is a use, +5 capped at 60) and set seen:: $TODAY.
   4. If you created a leaf or TOC, add its one-line [[link]] + hook to the parent TOC (and to index if it is a new top-level project/topic).
   5. Record the evidence, then mark done — BOTH properties, and only as the LAST actions for that date, after steps 1-4 are truly written:
      a. outl_page_prop_set <date> distilled-into=\"[[slug-a]] [[slug-b]] ...\" — every knowledge page you actually merged this journal's content into (space-separated [[links]]). If the journal held nothing durable and you distilled it to nothing, set distilled-into=none instead.
@@ -79,6 +82,7 @@ Finally, refresh index: bump updated:: and trim the Recent journals list to the 
 Do NOT delete any journal — reaping is automatic once you mark consolidated::. Do NOT touch code, git, or anything outside the memory graph."
 
 MEMORY_CONSOLIDATE_ACTIVE=1 "$CLAUDE" -p "$prompt" \
+  --model "$MODEL" \
   --dangerously-skip-permissions \
   >>"$LOG" 2>&1 || true
 

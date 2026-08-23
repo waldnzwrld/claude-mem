@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# claude-memory-dump — on session close, record the session's DURABLE facts via a
+# detached, headless agent. Fired by the SessionEnd branch of claude-memory-hook,
+# which passes the transcript path. This makes journaling happen on close
+# regardless of whether a context compaction ever occurred (the PreCompact
+# reminder alone is unreliable — a session may never compact).
+#
+# It follows the two-tier write policy (see ~/.claude/memory/AGENTS.md): every
+# durable fact lands in today's journal, and IMPACTFUL facts (ones that make a
+# knowledge page wrong, reverse a prior decision, or add a new component / cross-
+# project relationship / durable user fact) are additionally WRITTEN THROUGH to the
+# right deep-memory leaf now — merged, never clobbered, and back-marked #in-deep in
+# the journal so condensation verifies rather than duplicates them.
+#
+# The heavy lifting is a comprehension-heavy summarisation task, so it runs on a
+# capable model (Sonnet 5 by default; override with MEMORY_MODEL) — a shallower
+# model misses durable facts and the dump comes back empty. The agent reads the
+# transcript, extracts only what is worth remembering across sessions, and writes
+# it via the outl MCP tools — deduping against what is already there, never
+# rewriting or deleting existing entries.
+#
+# Safe to run any time: it no-ops on a trivial/absent transcript, single-instances
+# via a lock, and refuses to recurse into the agent it spawns.
+
+set -u
+
+CLAUDE="${CLAUDE_BIN:-claude}"
+# Hooks can run with a minimal PATH; fall back to the usual install location.
+command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE="$HOME/.local/bin/claude"
+# Offline summarisation runs on a capable model so nuance survives the dump.
+MODEL="${MEMORY_MODEL:-claude-sonnet-5}"
+WS="$HOME/.claude/memory"
+LOCKDIR="$WS/.dump.lock.d"
+LOG="$WS/.dump.log"
+MIN_LINES="${MEMORY_DUMP_MIN_LINES:-8}"   # skip trivial sessions
+TRANSCRIPT="${MEMORY_DUMP_TRANSCRIPT:-${1:-}}"
+
+# Never recurse: the headless agent we spawn starts its own Claude session (whose
+# SessionEnd would fire this again). The hook guards on this too — belt and braces.
+[ -n "${MEMORY_DUMP_ACTIVE:-}" ] && exit 0
+[ -n "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] && exit 0
+
+# Need a real transcript, a memory workspace, and the CLI.
+[ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ] || exit 0
+[ -d "$WS" ] || exit 0
+command -v "$CLAUDE" >/dev/null 2>&1 || exit 0
+
+# Cheap gate: a transcript with barely any turns isn't worth a summariser. Line
+# count is a schema-agnostic proxy for "did meaningful work happen".
+lines="$(wc -l < "$TRANSCRIPT" 2>/dev/null | tr -d ' ')"
+case "$lines" in ''|*[!0-9]*) lines=0 ;; esac
+[ "$lines" -ge "$MIN_LINES" ] || exit 0
+
+# Single instance (portable, no flock). mkdir is atomic; clear a stale lock from a
+# crashed run (>60 min old) first.
+if [ -d "$LOCKDIR" ] && [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
+  rmdir "$LOCKDIR" 2>/dev/null || true
+fi
+mkdir "$LOCKDIR" 2>/dev/null || exit 0
+trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
+
+prompt="You are running headless as the memory-system session journaler. Do ONLY the task below, then stop — ignore everything else.
+
+A Claude Code session just ended. Its full transcript (JSONL, one message per line) is at:
+  $TRANSCRIPT
+
+Read that transcript, then record the session's DURABLE facts via the outl MCP tools, following the 'Two-tier writes', 'Writing to memory', 'What long-term memory is for', and 'Condensation' sections of ~/.claude/memory/AGENTS.md.
+
+Rules:
+  1. FIRST call outl_daily_today to read today's journal. It may already contain entries the interactive agent wrote at checkpoints — you are ADDING to it, not replacing it.
+  2. Extract ONLY what is worth remembering across sessions: decisions + their why, discoveries/gotchas, long-running plan state, cross-repo relationships, durable user facts. DROP chit-chat, transient tool output, and anything the code / its git log / its CLAUDE.md already records.
+  3. Append each new fact under the right existing section (## Focus / ## Decisions / ## Discoveries / ## Open threads) using outl_daily_append or outl_block_append, and link it outward to the [[project-...]] or [[topic]] it concerns. Be concise — one bullet per fact.
+  4. Do NOT duplicate anything already in today's journal — compare against what you read in step 1 and add only what is missing. Skip any item already marked #in-deep (it is already in deep memory).
+  5. TIER each durable fact and act accordingly:
+     - IMPACTFUL — a fact that (a) makes a current knowledge page inaccurate or incomplete, (b) reverses or supersedes a prior durable decision, or (c) introduces a new architectural component, cross-project relationship, or durable user fact — must be WRITTEN THROUGH to deep memory now, not left in the journal. Procedure: descend from the injected index / TOC to the target knowledge leaf (outl_page_get it; create a new leaf under the right TOC, splitting a crowded one, only if none fits); MERGE the distilled fact by editing or appending to that leaf — synthesise, do not paste, and never duplicate a point it already states; refresh its properties (updated to today; summary if it changed; ensure parent, project, and back-links; frecency +5 capped at 60, or seed 30 for a new leaf; seen to today); if a new leaf or TOC, add its one-line [[link]] + hook to the parent TOC (and the parent to index if it is a new top-level topic). THEN mark the journal breadcrumb for that fact with a trailing  #in-deep [[target-leaf]]  so condensation verifies rather than re-merges it.
+     - EPHEMERAL — transient git/branch/working-tree state, currently-doing status, session-local notes — goes in the journal ONLY. Never write it to a leaf.
+     - Everything else — journal only; condensation promotes or drops it later.
+  6. EDIT-MERGE, NEVER CLOBBER. Always read a page (outl_page_get) before you write to it, and ADD to it. NEVER delete, rewrite, or reword an existing journal entry or existing leaf content. Whenever you change a page body, bump its updated to today. (An autonomous agent that pastes instead of merging duplicates pages — do not.)
+  7. If the session produced nothing durable, do nothing at all.
+  8. Do NOT touch code, git, or anything outside the memory graph."
+
+MEMORY_DUMP_ACTIVE=1 "$CLAUDE" -p "$prompt" \
+  --model "$MODEL" \
+  --dangerously-skip-permissions \
+  >>"$LOG" 2>&1 || true
+
+exit 0
