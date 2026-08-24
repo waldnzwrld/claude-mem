@@ -147,7 +147,7 @@ def _has_meta(con) -> bool:
 
 
 def _schema_ok(con) -> bool:
-    """True iff the on-disk index matches the current SCHEMA_VERSION. A version bump
+    """True if the on-disk index matches the current SCHEMA_VERSION. A version bump
     makes the DERIVED index stale; since it's disposable we rebuild from markdown rather
     than migrate in place. A brand-new (tableless) db is 'ok' — init_schema will create
     it fresh at the current version."""
