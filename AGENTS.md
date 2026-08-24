@@ -277,14 +277,17 @@ aged journal (every journal older than the 5 most recent) two ways and acts acco
   the `claude` CLI or `memory-consolidate` is unavailable; when you see it, do the steps below
   *this session, before the user's request*.
 
-**The `consolidated::` + `distilled-into::` guard is what makes the automatic deletion safe:**
-the reap only ever deletes a journal that is both marked `consolidated::` **and** mechanically
-verified — every knowledge page named in its `distilled-into::` evidence property exists and
-carries `updated:: >= <consolidated date>` (proof the distiller actually wrote there), or the
-explicit `distilled-into:: none` sentinel. A journal marked `consolidated::` without written
-targets fails verification and is **re-queued for distillation**, never burned. (This closes
-the earlier trust gap where a bare self-reported mark could delete a journal whose content
-never reached the tree.)
+**Retention is by count and deletion is driven by the `consolidated::` mark:** the 5 most
+recent journals are vivid memory and stay; the reap deletes any *aged* journal (older than
+those 5) that carries a `consolidated::` mark. The `distilled-into::` property is still
+recorded as provenance — which leaves each journal fed — but it is **not** a reap gate. An
+earlier design re-verified that every named leaf existed and carried `updated:: >= <consolidated
+date>` before deleting; that gate was removed because it looped: a correctly-distilled journal
+whose leaf stored `updated::` as a bullet rather than hoisted frontmatter, or whose leaf already
+held the fact and wasn't re-stamped, failed verification and was re-distilled (and re-billed)
+every session while lingering past the 5-journal window. The distiller therefore sets
+`consolidated::` **only as its genuine last action, after the leaves are truly written** —
+that mark is the commitment that the content reached the tree.
 
 When you see the `⚠ CONSOLIDATION REQUIRED` directive, for each pending journal date:
 
@@ -313,13 +316,13 @@ When you see the `⚠ CONSOLIDATION REQUIRED` directive, for each pending journa
    (and the parent to `index` if it's a new top-level project/topic).
 5. **Record evidence, then mark done — as the LAST actions, and never delete by hand.**
    First `outl_page_prop_set <date> distilled-into="[[slug-a]] [[slug-b]] …"` naming every
-   leaf you actually merged this journal into (set each of those leaves' `updated:: <today>`
-   in step 3); if the journal held nothing durable, `outl_page_prop_set <date>
-   distilled-into=none` instead. Then `outl_page_prop_set <date> consolidated=<today>`. Reap
-   VERIFIES each named leaf exists with `updated:: >= <today>` before deleting the journal, so
-   a mark without written targets is re-queued, not burned. The hook then reaps the verified
-   journal (this session's reap already ran, so it's deleted at the *next* session start — or
-   run `memory-index consolidate --reap` yourself to burn it now).
+   leaf you actually merged this journal into (as provenance; set each of those leaves'
+   `updated:: <today>` in step 3); if the journal held nothing durable, `outl_page_prop_set
+   <date> distilled-into=none` instead. Then `outl_page_prop_set <date> consolidated=<today>` —
+   set this ONLY once the leaves are truly written, because the reap deletes any aged journal
+   carrying a `consolidated::` mark (there is no separate per-leaf re-verification). The hook
+   reaps at the *next* session start — or run `memory-index consolidate --reap` yourself to
+   burn it now.
 
 Then run the **frecency sweep** (see below) over all leaf documents.
 
@@ -401,10 +404,9 @@ node, and the pruning sweep — `outl_page_delete` — could destroy it). Link t
 - Prefer editing an existing leaf over creating a near-duplicate; descend the tree or
   `outl_search` first. Editing an existing leaf also refreshes its frecency — another
   reason to merge rather than fork.
-- **Any change to a page body bumps its `updated::`** to that day. The reap's distillation
-  check (`updated:: >= <consolidated date>`) and the routing/staleness signals all rely on
-  `updated::` tracking the body; a body edited without bumping `updated::` is the classic
-  staleness bug (a MOC whose contents moved on while its date froze).
+- **Any change to a page body bumps its `updated::`** to that day. The routing/staleness
+  signals all rely on `updated::` tracking the body; a body edited without bumping `updated::`
+  is the classic staleness bug (a MOC whose contents moved on while its date froze).
 - The workspace holds only outl's own dirs — `pages/`, `journals/`, `ops/`, `assets/`,
   `.outl/`. Never create parallel `knowledge/`, `daily/`, or `templates/` dirs; every TOC,
   leaf, and the journal template all live as pages in `pages/`.

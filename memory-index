@@ -900,75 +900,35 @@ def _aged_journals(ws: str, today: str):
     return journals[:-RETENTION_COUNT]  # sorted ascending; drop the newest 5
 
 
-def _distill_targets(fm: dict):
-    """Parse the `distilled-into::` evidence property the distiller records. Returns
-    (targets: list[str], is_none: bool). The sentinel `none` (journal held nothing
-    durable — a legitimate distill-to-nothing) verifies trivially. Accepts either
-    `[[slug]]` links or bare space/comma-separated slugs; a hyphen or underscore in
-    the key name is tolerated."""
-    raw = (fm.get("distilled-into") or fm.get("distilled_into") or "").strip()
-    if not raw or raw.lower().strip("()") in ("none", "-", ""):
-        return [], True
-    targets = [t.split("|")[0].split("#")[0].strip() for t in LINK_RE.findall(raw)]
-    if not targets:
-        targets = [t.strip() for t in re.split(r"[\s,]+", raw) if t.strip()]
-    return targets, False
-
-
-def _page_updated_on_or_after(ws: str, slug: str, date: str) -> bool:
-    """True iff pages/<slug>.md exists and carries `updated:: >= date` (ISO dates
-    compare correctly as strings). Proof the distiller actually wrote to the page."""
-    path = os.path.join(ws, "pages", slug + ".md")
-    if not os.path.isfile(path):
-        return False
-    fm, _b, _r = parse_md(path)
-    up = (fm.get("updated") or "").strip()
-    return bool(DATE_RE.match(up)) and up >= date
-
-
-def _distill_verified(ws: str, fm: dict) -> bool:
-    """Mechanically verify a journal marked `consolidated:: <D>` was actually
-    distilled — not just marked. It must record `distilled-into::`, and EVERY named
-    target page must exist and carry `updated:: >= D` (written on/after the
-    consolidation date). The explicit `none` sentinel verifies trivially. A journal
-    marked consolidated but lacking evidence, or naming a page that was never
-    touched, fails — and so is NOT reaped."""
-    cons = (fm.get("consolidated") or "").strip()
-    if not DATE_RE.match(cons):
-        return False
-    targets, is_none = _distill_targets(fm)
-    if is_none:
-        return not (fm.get("distilled-into") is None and fm.get("distilled_into") is None)
-    return bool(targets) and all(_page_updated_on_or_after(ws, t, cons) for t in targets)
-
-
 def cmd_consolidate(ws: str, today: str, reap: bool, as_json: bool):
     """Report the consolidation backlog and (optionally) mechanically reap.
 
-    An aged journal is bucketed by whether it has been distilled, VERIFIED
-    mechanically — not merely by a self-reported `consolidated::` mark:
-      * reapable   — consolidated:: AND `_distill_verified` passes (every
-                     `distilled-into::` target page exists and was updated on/after
-                     the consolidation date, or the explicit `none` sentinel) →
-                     safe to delete; `--reap` does so via `outl page delete`.
-      * unverified — consolidated:: present but verification FAILS (no evidence, or
-                     a named target was never actually written). NOT reaped; folded
-                     back into the distill worklist so it is re-distilled.
-      * pending    — no consolidated:: yet → still to distill.
-    `pending` in the output is the full distill worklist (unmarked + unverified);
-    `unverified` is broken out for diagnostics. Distillation itself is LLM work and
-    is NOT done here — this only tracks the backlog and reaps what is verified done."""
+    Retention is dead simple and by COUNT: the 5 most recent journals are vivid
+    memory and stay; every older ("aged") journal is deleted once it has been
+    distilled. An aged journal is bucketed solely by whether the distiller has
+    marked it done:
+      * reapable   — carries a valid `consolidated:: <date>` mark → the distiller
+                     ran, so it is safe to delete; `--reap` does so via
+                     `outl page delete`.
+      * pending    — no `consolidated::` yet → still to distill.
+
+    NOTE: this deliberately does NOT re-verify that every `distilled-into::` target
+    leaf exists and was freshly bumped. That per-leaf `updated:: >= consolidated`
+    gate (removed) was the source of a re-queue loop: a correctly-distilled journal
+    whose leaf stored `updated::` as a bullet instead of hoisted frontmatter, or a
+    leaf that already held the fact and wasn't re-stamped, failed verification —
+    so the journal was never deleted, was re-distilled every session, and lingered
+    past the 5-journal window. Presence of `consolidated::` (the distiller's last
+    action) is the evidence; aged + marked → gone."""
     aged = _aged_journals(ws, today)
     pending, reapable, unverified = [], [], []
     for slug, path in aged:
         fm, _body, _raw = parse_md(path)
-        if not fm.get("consolidated"):
-            pending.append(slug)
-        elif _distill_verified(ws, fm):
+        cons = (fm.get("consolidated") or "").strip()
+        if DATE_RE.match(cons):
             reapable.append(slug)
         else:
-            unverified.append(slug)
-            pending.append(slug)  # marked but unproven → must be re-distilled
+            pending.append(slug)
 
     reaped = []
     if reap and reapable:
