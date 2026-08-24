@@ -86,6 +86,12 @@ toc="$("$OUTL" export md index -w "$WS" 2>/dev/null)"
 # with outl_daily_get when a digest line points somewhere you need to read.
 tf="$WS/journals/$TODAY.md"
 [ -f "$tf" ] && ctx+="## Journal $TODAY"$'\n\n'"$(cat "$tf" 2>/dev/null)"$'\n\n'
+
+# Append discipline — injected every session because the mechanical rule lives in
+# AGENTS.md, which sessions are told NOT to read routinely. Without this reminder in
+# front of them, sessions reach for the flat outl_daily_append with a "## Header\n- ..."
+# blob and sprout duplicate ## Focus / ## Discoveries blocks (see AGENTS.md 'Scaffold once').
+ctx+="Writing to the journal: it has five fixed sections — ## Focus / ## Key Decisions / ## Discoveries / ## Action Items / ## Session Notes, laid down ONCE by the journal template. Append each item as a CHILD under the matching EXISTING section: read the journal outline (outl_daily_today / outl_daily_get) to get that section's block id, then outl_block_append under it with NO '## ' header in the text. NEVER use outl_daily_append for section content (it appends a flat top-level block and cannot nest), and NEVER emit a '## Section' that already exists — that is exactly what sprouts duplicate ## Focus / ## Discoveries blocks. Full protocol in AGENTS.md."$'\n\n'
 prev="$(ls "$WS"/journals/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null \
         | grep -v "/$TODAY\.md$" | sort -r | head -4)"
 digest=""
