@@ -76,7 +76,7 @@ Follow the Condensation section of ~/.claude/memory/AGENTS.md exactly. For EACH 
   5. Record the evidence, then mark done — BOTH properties, and only as the LAST actions for that date, after steps 1-4 are truly written:
      a. outl_page_prop_set <date> distilled-into=\"[[slug-a]] [[slug-b]] ...\" — every knowledge page you actually merged this journal's content into (space-separated [[links]]). If the journal held nothing durable and you distilled it to nothing, set distilled-into=none instead.
      b. outl_page_prop_set <date> consolidated=$TODAY.
-     The reap step VERIFIES mechanically that every page you name in distilled-into exists and carries updated:: >= $TODAY before it will delete the journal. A journal you mark consolidated:: without actually writing its named targets (fresh updated::) will NOT be reaped — it is re-queued for distillation next session. So make sure each target page's updated:: is set to $TODAY as part of step 3.
+     The reap deletes any aged journal carrying a consolidated:: mark, so setting it is what removes the journal — set it ONLY after steps 1-4 are genuinely written, since there is no separate per-leaf re-verification to catch a premature mark. The distilled-into evidence is recorded for provenance/auditing, not as a reap gate.
 Finally, refresh index: bump updated:: and trim the Recent journals list to the retention window.
 
 Do NOT delete any journal — reaping is automatic once you mark consolidated::. Do NOT touch code, git, or anything outside the memory graph."
