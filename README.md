@@ -93,7 +93,7 @@ memory-index doctor         # read-only link-graph health report (--json)
 memory-index medic          # prune pathological edges from the index (--dry-run, --off)
 memory-index maintain       # daily frecency decay sweep (reports prune candidates)
 memory-index consolidate    # report the journal-consolidation backlog; --reap deletes
-                            #   aged journals verified as already distilled
+                            #   aged journals the distiller marked `consolidated::`
 ```
 
 `search` flags: `-k N` (result count), `--no-graph` (keyword only).
