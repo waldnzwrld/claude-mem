@@ -82,6 +82,14 @@ You never choose the regime; it's gated on node count.
 - **When the index is inactive** (small graph, or the hook says so), use the TOC-descent
   above unchanged. It is also the **universal fallback** whenever the index is stale or
   `memory-index` is unavailable — the system always works without it.
+- **Push-retrieval — memory relevant to a prompt is surfaced for you.** A
+  `UserPromptSubmit` hook runs the index against the user's prompt *before* you see it and
+  injects a **"Relevant memory (auto-surfaced …)"** block of `slug › heading` pointers when
+  a hit is strong (conservative bm25 gate, ≤3 pointers, once per slug per session; a
+  trivial/off-topic prompt surfaces nothing). Treat those lines as **pointers, not
+  content** — `outl_page_get` a slug before relying on it (that fetch also credits its
+  frecency). This complements, and never replaces, your own `memory-index search`: absence
+  of a surfaced block does not mean memory is empty — search or descend when the task needs it.
 - Writing is unchanged: you still author markdown/journals normally. The hook keeps the
   index fresh (`memory-index refresh`, incremental by page hash) with no action from you.
 
@@ -340,9 +348,13 @@ real-but-occasional knowledge survives, short enough that stale detail clears ou
   decayed** — they live while they hold ≥1 live child (see *The graph model*).
 - Each leaf carries `frecency::` (integer, seed **30**, cap **60**) and `seen::` (last date
   the score changed).
-- **On material use** — whenever you open a leaf to *use* its content, or merge into it
-  during condensation (not a passing glance) — bump `frecency` by **+5** (cap 60) and set
-  `seen:: <today>`.
+- **On material use** — a use credits `frecency` **+5** (cap 60) and sets `seen:: <today>`.
+  Opening a leaf with `outl_page_get` is now credited **automatically**: a
+  `PostToolUse` hook runs `memory-index touch <slug>` on every successful fetch (it
+  self-skips non-`knowledge` slugs and caps at 60), so a plain read needs **no** manual
+  bump — do not hand-bump on top of a fetch. Still bump by hand for a use that is *not* a
+  fetch — e.g. merging into a leaf during condensation — via `outl page prop set` or
+  `memory-index touch`.
 - **Daily sweep — now mechanized by the hook.** On the first session of a new day the
   SessionStart hook runs `memory-index maintain`, which decays every non-pinned
   `type:: knowledge` leaf whose `seen::` is not today by `frecency − 1` and sets

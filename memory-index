@@ -54,6 +54,8 @@ DEFAULT_THRESHOLD = 150  # node count at/above which the index is considered "ac
 BM25_WEIGHTS = (10.0, 4.0, 1.0)
 
 FRECENCY_SEED = 30  # per AGENTS.md: a fresh leaf seeds at 30
+FRECENCY_CAP = 60   # per AGENTS.md: frecency saturates at 60
+FRECENCY_BUMP = 5   # per AGENTS.md: a material use credits +5 (see `touch`)
 RETENTION_COUNT = 5  # keep the 5 most recent journal files; anything older is aged out
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -65,9 +67,30 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 HEAL_DEFAULT = "dangling,selfloop"
 FRECENCY_RISK = 5  # a knowledge leaf at/below this frecency is nearing prune (seed is 30)
 
+# A small closed-class stopword set. Stripped from FTS queries so a full-sentence query
+# (e.g. one pushed straight from a user prompt) is not OR'd token-by-token into low-IDF
+# noise that pollutes bm25 ranking. Deliberately tiny — only words that carry no recall
+# signal — so it never drops a real content term. If a query is ALL stopwords, the caller
+# falls back to the raw terms rather than matching nothing.
+STOPWORDS = frozenset("""
+a an and the or of to in is are was were be been being for on with as at by it its this
+that these those i you we they he she my our your their from about into if then than so
+but not no do does did can could should would will just how what why when where who which
+me us them there here have has had get got make made want need please thanks
+""".split())
+
 FM_RE = re.compile(r"^([A-Za-z_][\w-]*)::\s?(.*)$")
 LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 SECTION_RE = re.compile(r"^\s*-\s+(#{1,6})\s+(.*)$")  # a bullet whose text is a heading
+
+# Frontmatter keys that MUST be hoisted (parse_md only reads `key:: value` lines ABOVE the
+# first bullet). When one of these appears as a body bullet instead, the parser — and so the
+# index, maintain, and touch — never sees it, and the page silently falls out of tracking
+# (e.g. a leaf missing `type:: knowledge` is invisible to the frecency sweep). doctor flags it.
+HOISTABLE_KEYS = ("type", "frecency", "seen", "parent", "project", "summary",
+                  "updated", "tags", "status", "pin", "source", "icon", "aliases")
+PROP_BULLET_RE = re.compile(
+    r"^\s*-?\s*(" + "|".join(HOISTABLE_KEYS) + r")::\s", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------- db
@@ -160,11 +183,29 @@ def _schema_ok(con) -> bool:
     return v is not None and int(v) == SCHEMA_VERSION
 
 
+def _needs_build(con, ws: str) -> bool:
+    """True when the index is EMPTY (no pages) but the workspace has markdown to index —
+    i.e. it was never built, or the .sqlite was deleted and merely re-created empty by
+    connect(). Distinct from a stale schema (handled by _schema_ok): here the schema is
+    fine, there's just nothing in it. Without this, a `search` that is the first command
+    to touch an empty index returns nothing and depends on `refresh`/`rebuild` having run
+    first — so push-retrieval could go silently dark if the index is missing when a prompt
+    fires."""
+    has_pages = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pages'"
+    ).fetchone() is not None
+    n = con.execute("SELECT COUNT(*) FROM pages").fetchone()[0] if has_pages else 0
+    if n > 0:
+        return False
+    return any(True for _ in iter_source_files(ws))
+
+
 def _open_current(ws: str):
-    """connect() to the index, transparently rebuilding it first if the on-disk schema
-    is stale. Read/refresh commands go through here so a schema bump self-heals."""
+    """connect() to the index, transparently rebuilding it first if the on-disk schema is
+    stale OR the index is empty over a populated workspace. Read/refresh commands go through
+    here so a schema bump self-heals and a never-built/deleted index self-initializes."""
     con = connect(ws)
-    if not _schema_ok(con):
+    if not _schema_ok(con) or _needs_build(con, ws):
         con.close()
         cmd_rebuild(ws, None, quiet=True)
         con = connect(ws)
@@ -458,7 +499,7 @@ def _keyword_hits(con, query: str, k: int):
         return []
 
 
-def cmd_search(ws: str, query: str, k: int, no_graph: bool):
+def cmd_search(ws: str, query: str, k: int, no_graph: bool, as_json: bool = False):
     con = _open_current(ws)
     init_schema(con)
     depth = _auto_depth(con)
@@ -480,7 +521,20 @@ def cmd_search(ws: str, query: str, k: int, no_graph: bool):
             label = f"(via {via} · {etype} · {d}h ·w{weight})"
             results.append(("link", cand, label, summary, 0.0))
 
-    _render_results(query, results)
+    if as_json:
+        # Machine shape for programmatic callers (e.g. the UserPromptSubmit push-retrieval
+        # hook), so gating/dedupe live in the caller, not in scraped human text. `score` is
+        # raw bm25 for keyword hits (lower == better; graph rows carry null) and `heading`
+        # on a graph row is the `(via … · type · Nh · wW)` provenance label.
+        out = {"query": query, "depth": depth, "results": [
+            {"kind": kind, "slug": slug, "heading": heading,
+             "snippet": " ".join(text.split())[:200],
+             "score": (None if kind == "link" else round(score, 4))}
+            for kind, slug, heading, text, score in results
+        ]}
+        print(json.dumps(out))
+    else:
+        _render_results(query, results)
     con.close()
 
 
@@ -490,7 +544,9 @@ def _fts_query(q: str) -> str:
     # sides, so morphological variants collapse before prefixing. Quote to stay safe
     # against FTS5 operator characters in the raw query.
     terms = re.findall(r"[A-Za-z0-9_]+", q)
-    return " OR ".join(f'"{t}"*' for t in terms) if terms else '""'
+    kept = [t for t in terms if t.lower() not in STOPWORDS and len(t) > 1]
+    kept = kept or terms  # all-stopword query: fall back to raw terms rather than match nothing
+    return " OR ".join(f'"{t}"*' for t in kept) if kept else '""'
 
 
 def _render_results(query: str, results):
@@ -665,11 +721,35 @@ def _cap(items, n=8):
     return ", ".join(map(str, items[:n])) + f"  (+{len(items) - n} more)"
 
 
+def _unhoisted_props(ws: str) -> dict:
+    """Pages whose BODY contains a `key:: value` bullet for a hoistable key — i.e. props
+    authored as bullets instead of frontmatter, which parse_md cannot see. Returns
+    {slug: [keys]}. Read-only, from the source markdown. This is the guard against the
+    silent-untracked trap: a leaf whose `type:: knowledge` lives in the body is invisible
+    to the frecency sweep, so it never decays or gets credited."""
+    out = {}
+    for slug, kind, path in iter_source_files(ws):
+        if kind != "page":
+            continue
+        _fm, body, _raw = parse_md(path)
+        found = []
+        for ln in body:
+            if SECTION_RE.match(ln):  # a `- ## heading` bullet is not a prop
+                continue
+            m = PROP_BULLET_RE.match(ln)
+            if m:
+                found.append(m.group(1).lower())
+        if found:
+            out[slug] = sorted(set(found))
+    return out
+
+
 def cmd_doctor(ws: str, as_json: bool):
     con = _open_current(ws)
     init_schema(con)
     h = _graph_health(con)
     con.close()
+    h["unhoisted_props"] = _unhoisted_props(ws)
     if as_json:
         print(json.dumps(h))
         return
@@ -687,6 +767,9 @@ def cmd_doctor(ws: str, as_json: bool):
     print(f"superseded: {len(h['superseded_targets'])} target(s)  {_cap(h['superseded_targets'])}")
     fr = [f"{d['slug']}({d['frecency']})" for d in h["frecency_risk"]]
     print(f"decay-risk: {len(fr)} leaf/leaves ≤{FRECENCY_RISK}  {_cap(fr)}")
+    up = h["unhoisted_props"]
+    up_disp = [f"{s}({','.join(k)})" for s, k in up.items()]
+    print(f"unhoisted : {len(up)} page(s) with props as body bullets  {_cap(up_disp)}")
     print(f"heals     : {h['heal_policy'] or '(none active — run `memory-index medic`)'}")
     # Verdict: name the actionable pathologies, performance-first.
     flags = []
@@ -698,6 +781,9 @@ def cmd_doctor(ws: str, as_json: bool):
         flags.append(f"graph fragmented into {h['components']} islands (assoc. recall can't cross them)")
     if h["orphans"]:
         flags.append(f"{len(h['orphans'])} orphan(s) unreachable by graph walk")
+    if up:
+        flags.append(f"{len(up)} page(s) have props as body bullets (invisible to the parser — "
+                     f"hoist to frontmatter via `outl page prop set`, or the page falls out of tracking)")
     print("\nverdict   : " + ("healthy — nothing to prune" if not flags
                               else "; ".join(flags) + "  →  `memory-index medic`"))
 
@@ -873,6 +959,47 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
     return 0
 
 
+def cmd_touch(ws: str, slugs, today: str, bump: int, as_json: bool):
+    """Credit a material USE of one or more knowledge leaves: frecency += bump (seed 30 if
+    unset, saturating at FRECENCY_CAP), seen = today. This is the missing other half of the
+    frecency loop — `maintain` decays daily, `touch` reinforces on use — so decay reflects
+    real usage instead of relying on the agent to hand-run `outl page prop set`. Writes go
+    through outl so the .outl sidecar stays in sync; journals and non-knowledge pages are
+    silently skipped (they carry no frecency). Called by the PostToolUse(outl_page_get)
+    hook and safe to run by hand."""
+    outl = _outl_bin()
+    if outl is None:
+        print("memory-index touch: outl binary not found; cannot write props", file=sys.stderr)
+        return 3
+    touched, skipped = [], []
+    for slug in slugs:
+        path = os.path.join(ws, "pages", f"{slug}.md")
+        if not os.path.exists(path):
+            skipped.append(slug)
+            continue
+        fm, _body, _raw = parse_md(path)
+        if (fm.get("type") or "").strip() != "knowledge":
+            skipped.append(slug)
+            continue
+        old = _int_or_none(fm.get("frecency"))
+        old = FRECENCY_SEED if old is None else old
+        new = min(FRECENCY_CAP, old + bump)
+        _outl_prop(outl, ws, slug, "frecency", str(new))
+        _outl_prop(outl, ws, slug, "seen", today)
+        touched.append({"slug": slug, "from": old, "to": new})
+    if touched:
+        cmd_refresh(ws, None, quiet=True)  # reflect the bumped frontmatter in the index
+    result = {"date": today, "bump": bump, "touched": touched, "skipped": skipped}
+    if as_json:
+        print(json.dumps(result))
+    else:
+        for t in touched:
+            print(f"touch {t['slug']}: {t['from']} → {t['to']}")
+        if skipped:
+            print(f"skipped (not a knowledge leaf): {', '.join(skipped)}")
+    return 0
+
+
 def _outl_prop(outl: str, ws: str, slug: str, key: str, value: str):
     try:
         subprocess.run(
@@ -987,8 +1114,14 @@ def main(argv=None):
     sp.add_argument("query")
     sp.add_argument("-k", type=int, default=6)
     sp.add_argument("--no-graph", action="store_true")
+    sp.add_argument("--json", action="store_true", help="machine-readable results (for hooks)")
     ss = sub.add_parser("stats")
     ss.add_argument("--json", action="store_true")
+    st = sub.add_parser("touch", help="credit a use: frecency += bump on the named knowledge leaves")
+    st.add_argument("slugs", nargs="+")
+    st.add_argument("--bump", type=int, default=FRECENCY_BUMP)
+    st.add_argument("--today", default=None, help="override the date (default: today)")
+    st.add_argument("--json", action="store_true")
     sm = sub.add_parser("maintain")
     sm.add_argument("--dry-run", action="store_true", help="compute the sweep but write nothing")
     sm.add_argument("--today", default=None, help="override the date (default: today)")
@@ -1019,9 +1152,12 @@ def main(argv=None):
     elif args.cmd == "refresh":
         cmd_refresh(ws, args.threshold)
     elif args.cmd == "search":
-        cmd_search(ws, args.query, args.k, args.no_graph)
+        cmd_search(ws, args.query, args.k, args.no_graph, args.json)
     elif args.cmd == "stats":
         cmd_stats(ws, args.threshold, args.json)
+    elif args.cmd == "touch":
+        today = args.today or datetime.date.today().isoformat()
+        return cmd_touch(ws, args.slugs, today, args.bump, args.json) or 0
     elif args.cmd == "maintain":
         today = args.today or datetime.date.today().isoformat()
         return cmd_maintain(ws, today, args.dry_run, args.json) or 0

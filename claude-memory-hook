@@ -51,6 +51,110 @@ if [ "$event" = "PreCompact" ]; then
   exit 0
 fi
 
+# ---- UserPromptSubmit: push-retrieval (surface memory relevant to THIS prompt) ------
+# Runs the local FTS/graph index against the user's actual prompt BEFORE the model sees
+# it, and injects the top few STRONG keyword hits as compact pointers. Turns memory from
+# pull-when-the-agent-remembers into push-when-relevant, with no tool round-trip. Gated
+# conservatively (bm25 score ceiling + >=2 content terms + per-session dedupe) so a
+# trivial/off-topic prompt injects nothing. Skipped inside the headless memory agents
+# (they have no user prompt). Never fails the turn.
+if [ "$event" = "UserPromptSubmit" ]; then
+  if [ -x "$MEMIDX" ] && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] && [ -z "${MEMORY_DUMP_ACTIVE:-}" ]; then
+    ctx="$(MEMORY_PUSH_MAXSCORE="${MEMORY_PUSH_MAXSCORE:--8.0}" \
+           MEMORY_PUSH_K="${MEMORY_PUSH_K:-3}" MEMIDX="$MEMIDX" WS="$WS" \
+           python3 - "$input" <<'PY'
+import os, sys, json, subprocess, re, glob, time
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+prompt = (d.get("prompt") or "").strip()
+sid = d.get("session_id") or "nosid"
+# Skip slash/bang commands and prompts too thin to carry a recall signal.
+if not prompt or prompt[0] in "/!":
+    sys.exit(0)
+STOP = set("a an the and or of to in is are was be for on with as at by it this that these "
+           "those i you we they my our your do does did can could should would will how what "
+           "why when where who which please thanks yes no not go make add fix run use".split())
+terms = [t for t in re.findall(r"[A-Za-z0-9_]+", prompt.lower()) if t not in STOP and len(t) > 1]
+if len(terms) < 2:
+    sys.exit(0)
+memidx, ws = os.environ["MEMIDX"], os.environ["WS"]
+maxscore, k = float(os.environ["MEMORY_PUSH_MAXSCORE"]), int(os.environ["MEMORY_PUSH_K"])
+try:
+    out = subprocess.run([memidx, "-w", ws, "search", "--json", prompt, "-k", str(k)],
+                         capture_output=True, text=True, timeout=10).stdout
+    results = json.loads(out)["results"]
+except Exception:
+    sys.exit(0)
+# Strong keyword hits only (bm25 lower == better; keep score <= gate); best score per slug.
+best = {}
+for r in results:
+    if r["kind"] != "hit" or r["score"] is None or r["score"] > maxscore:
+        continue
+    if r["slug"] not in best or r["score"] < best[r["slug"]]["score"]:
+        best[r["slug"]] = r
+if not best:
+    sys.exit(0)
+# Per-session dedupe so a slug is surfaced at most once per session.
+cdir = os.path.join(ws, ".push-cache")
+os.makedirs(cdir, exist_ok=True)
+cfile = os.path.join(cdir, re.sub(r"[^A-Za-z0-9_-]", "_", sid))
+seen = set()
+try:
+    with open(cfile) as f:
+        seen = {ln.strip() for ln in f if ln.strip()}
+except Exception:
+    pass
+fresh = sorted((r for s, r in best.items() if s not in seen), key=lambda r: r["score"])[:k]
+if not fresh:
+    sys.exit(0)
+for old in glob.glob(os.path.join(cdir, "*")):  # opportunistic GC of stale session caches
+    try:
+        if time.time() - os.path.getmtime(old) > 86400:
+            os.remove(old)
+    except Exception:
+        pass
+try:
+    with open(cfile, "a") as f:
+        for r in fresh:
+            f.write(r["slug"] + "\n")
+except Exception:
+    pass
+lines = ["Relevant memory (auto-surfaced from your prompt — POINTERS only; "
+         "`outl_page_get <slug>` to read the full page before relying on it):"]
+for r in fresh:
+    lines.append(f"- {r['slug']} › {r['heading']} — {r['snippet'][:140]}")
+print("\n".join(lines))
+PY
+)"
+    [ -n "$ctx" ] && CTX="$ctx" emit "UserPromptSubmit"
+  fi
+  exit 0
+fi
+
+# ---- PostToolUse: credit a page fetch to frecency (close the reinforcement loop) ----
+# A successful outl_page_get is an unambiguous "this leaf mattered" signal, so bump its
+# frecency (touch self-skips non-knowledge slugs and caps at 60). This is the missing
+# counterpart to the daily decay sweep. Fire-and-forget; never blocks or fails the turn.
+# Skipped inside the headless memory agents (their reads are maintenance, not use).
+if [ "$event" = "PostToolUse" ]; then
+  if [ -x "$MEMIDX" ] && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] && [ -z "${MEMORY_DUMP_ACTIVE:-}" ]; then
+    slug="$(printf '%s' "$input" | python3 -c 'import sys, json
+try:
+    d = json.load(sys.stdin)
+    if d.get("tool_name") == "mcp__outl__outl_page_get":
+        print(((d.get("tool_input") or {}).get("slug") or "").strip())
+except Exception:
+    pass' 2>/dev/null)"
+    if [ -n "$slug" ]; then
+      ( "$MEMIDX" -w "$WS" touch "$slug" >/dev/null 2>&1 & )
+      disown 2>/dev/null || true
+    fi
+  fi
+  exit 0
+fi
+
 # ---- SessionEnd: flush the session's durable facts to today's journal -------
 # Journaling on close does not depend on a compaction ever happening. Spawn the
 # detached headless journaler (Sonnet 5) with the transcript path — unless we're

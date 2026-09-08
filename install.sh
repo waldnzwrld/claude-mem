@@ -99,23 +99,33 @@ except (FileNotFoundError, ValueError):
 
 hooks = data.setdefault('hooks', {})
 
-def ensure(event):
+def ensure(event, matcher=None):
     groups = hooks.setdefault(event, [])
     for g in groups:
+        if matcher is not None and g.get('matcher') != matcher:
+            continue
         for h in g.get('hooks', []):
             if h.get('type') == 'command' and h.get('command') == cmd:
                 return False
-    groups.append({'hooks': [{'type': 'command', 'command': cmd}]})
+    group = {'hooks': [{'type': 'command', 'command': cmd}]}
+    if matcher is not None:
+        group['matcher'] = matcher
+    groups.append(group)
     return True
 
-changed = ensure('SessionStart') | ensure('PreCompact') | ensure('SessionEnd')
+# UserPromptSubmit → push-retrieval; PostToolUse(outl_page_get) → frecency touch. The
+# PostToolUse matcher scopes it to the one tool so the hook doesn't fire on every call.
+changed = (ensure('SessionStart') | ensure('PreCompact') | ensure('SessionEnd')
+           | ensure('UserPromptSubmit')
+           | ensure('PostToolUse', matcher='mcp__outl__outl_page_get'))
 
 if changed:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
         f.write('\n')
-    print(f"✔ settings.json  -> wired SessionStart + PreCompact + SessionEnd hooks")
+    print("✔ settings.json  -> wired SessionStart + PreCompact + SessionEnd + "
+          "UserPromptSubmit + PostToolUse hooks")
 else:
     print("• settings.json already has the hooks; left as-is")
 PY
@@ -123,9 +133,11 @@ else
   cat <<EOF
 ! python3 not found — add these to the "hooks" object in $SETTINGS yourself:
 
-  "SessionStart": [ { "hooks": [ { "type": "command", "command": "$HOOK" } ] } ],
-  "PreCompact":   [ { "hooks": [ { "type": "command", "command": "$HOOK" } ] } ],
-  "SessionEnd":   [ { "hooks": [ { "type": "command", "command": "$HOOK" } ] } ]
+  "SessionStart":    [ { "hooks": [ { "type": "command", "command": "$HOOK" } ] } ],
+  "PreCompact":      [ { "hooks": [ { "type": "command", "command": "$HOOK" } ] } ],
+  "SessionEnd":      [ { "hooks": [ { "type": "command", "command": "$HOOK" } ] } ],
+  "UserPromptSubmit":[ { "hooks": [ { "type": "command", "command": "$HOOK" } ] } ],
+  "PostToolUse":     [ { "matcher": "mcp__outl__outl_page_get", "hooks": [ { "type": "command", "command": "$HOOK" } ] } ]
 EOF
 fi
 
