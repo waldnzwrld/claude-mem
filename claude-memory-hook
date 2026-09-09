@@ -72,7 +72,7 @@ except Exception:
 fi
 
 # ---- SessionStart (default) ----
-ctx="You have persistent memory: an outl graph at ~/.claude/memory. Current state is below; retrieve detail on demand with outl_page_get (do not brute-force the graph). Protocol: ~/.claude/memory/AGENTS.md."$'\n\n'
+ctx="You have persistent, cross-session memory: an outl graph at ~/.claude/memory. This is your ACTIVE, VIVID memory — your persistence layer on this machine, not a reference archive and not a maintenance chore. It holds the concepts, projects, decisions, and user facts you work with regularly, and it is loaded every session (state below). MEMORY FIRST: when the user says something, check it against memory BEFORE reaching for code, a file/dir search, or the web — read the injected index + journals below first, and dispatch the memory-recall subagent (Sonnet) for anything deeper (it walks the graph in isolation and returns the conclusion + [[slugs]] without loading page bodies here). Keep it curated as you go — append durable decisions/discoveries to today's journal at each checkpoint (don't wait for session end), and write impactful facts through to their leaf. Reserve a direct outl_page_get for a quick single-slug read; do not brute-force the graph. Full protocol (read only when doing maintenance, not every session): ~/.claude/memory/AGENTS.md."$'\n\n'
 
 # Table of contents (index page), with a raw-file fallback.
 toc="$("$OUTL" export md index -w "$WS" 2>/dev/null)"

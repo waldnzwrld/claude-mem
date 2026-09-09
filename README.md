@@ -61,6 +61,7 @@ Everything is deployed by `install.sh`:
 | `memory-index` | `~/.local/bin/` | Stdlib-only SQLite retrieval sidecar (see below). |
 | `memory-consolidate` | `~/.local/bin/` | Headless agent that distills aged journals into knowledge pages, then reaps them. Runs on **Sonnet 5** (override with `MEMORY_MODEL`). Single-instanced, safe to re-run. |
 | `claude-memory-dump` | `~/.local/bin/` | On-close journaler fired by the SessionEnd hook: a detached headless agent reads the session transcript and appends only the durable facts to today's journal, deduping against existing entries. Runs on **Sonnet 5**; never edits anything but the journal. |
+| `agents/memory-recall.md` | `~/.claude/agents/` | Read-only retrieval subagent (**Sonnet**) scoped to the outl read tools. The main thread delegates memory lookups to it; it walks the graph in an isolated context and returns the conclusion + `[[slugs]]`, keeping page bodies out of the main thread's context. |
 | `CLAUDE_TEMPLATE.md` | appended to `~/.claude/CLAUDE.md` | The `## Persistent memory` section that points the agent at the protocol. |
 
 ## `memory-index` — the retrieval sidecar
