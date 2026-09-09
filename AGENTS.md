@@ -137,11 +137,16 @@ Depth is not fixed — add a level whenever one gets crowded.
 
 Two rules keep the tree lean:
 
-- **Split on growth.** When a leaf grows past roughly **150 lines / ~1500 words** — the
-  point where reading it would eat a big slice of context — convert it into a TOC: extract
-  its sections into child leaf documents (`<slug>-<section>`), and leave one-line `[[links]]`
-  + hooks behind. Detail moves down a level; the parent stays scannable. Better to traverse
-  three tiny pages than load one huge one.
+- **Split on growth.** When a leaf's body exceeds the load-cost budget — **~1800 estimated
+  tokens** (`MEMORY_SPLIT_TOKENS`, measured as the `.md` projection's chars/4, i.e. what an
+  `outl_page_get` actually spends; ≈150 lines / ~1500 words as a rough human gauge) — convert
+  it into a TOC: extract its sections into child leaf documents (`<slug>-<section>`), and
+  leave one-line `[[links]]` + hooks behind. Detail moves down a level; the parent stays
+  scannable. Better to traverse three tiny pages than load one huge one. This is **mechanized**:
+  the daily `memory-index maintain` sweep flags any `type:: knowledge` leaf over budget and the
+  SessionStart hook surfaces them as a `⚠ Split-on-growth candidates` directive (TOCs are
+  exempt — they are link-heavy by design). Detection is automatic; the carve itself, which
+  needs section-boundary judgment, stays your call.
 - **TOCs live with their children.** A TOC is structural — effectively pinned while it holds
   ≥1 live child, and not itself frecency-decayed. When pruning removes its last child,
   delete the now-empty TOC and its link in the parent too.
@@ -428,9 +433,10 @@ node, and the pruning sweep — `outl_page_delete` — could destroy it). Link t
   (foundational leaves add `pin:: true`). Reference stubs carry `type:: reference` +
   `source::` + `status::` and deliberately omit the frecency pair (see *Research
   references*).
-- **Keep every page small.** If a leaf pushes ~150 lines, split it into a TOC + child
-  leaves (see *The graph model*). A page that would eat a big slice of context on read is a
-  bug — traversing tiny pages is the whole point.
+- **Keep every page small.** A `type:: knowledge` leaf whose body exceeds ~1800 tokens (the
+  `MEMORY_SPLIT_TOKENS` budget) is flagged for splitting into a TOC + child leaves by the daily
+  maintain sweep (see *Split on growth* and *The graph model*). A page that would eat a big
+  slice of context on read is a bug — traversing tiny pages is the whole point.
 - Prefer editing an existing leaf over creating a near-duplicate; descend the tree or
   `outl_search` first. Editing an existing leaf also refreshes its frecency — another
   reason to merge rather than fork.

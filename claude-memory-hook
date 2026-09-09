@@ -176,7 +176,7 @@ except Exception:
 fi
 
 # ---- SessionStart (default) ----
-ctx="You have persistent, cross-session memory: an outl graph at ~/.claude/memory. This is your ACTIVE, VIVID memory — your persistence layer on this machine, not a reference archive and not a maintenance chore. It holds the concepts, projects, decisions, and user facts you work with regularly, and it is loaded every session (state below). MEMORY FIRST: when the user says something, check it against memory BEFORE reaching for code, a file/dir search, or the web. Relevant memory is also PUSHED to you: a UserPromptSubmit hook surfaces prompt-relevant slugs as a 'Relevant memory (auto-surfaced …)' pointer block before you act — treat those as pointers and outl_page_get to confirm (that fetch also credits frecency); their absence does not mean memory is empty. Read the injected index + journals below first; for anything deeper, dispatch the memory-recall subagent (Sonnet, read-only) — it walks the graph in isolation and returns the conclusion + [[slugs]] without loading page bodies here (a page it fetches still credits frecency). Keep memory curated as you go — append durable decisions/discoveries to today's journal at each checkpoint (don't wait for session end), and write impactful facts through to their leaf. Reserve a direct outl_page_get for a quick single-slug read; do not brute-force the graph. Full protocol (read only when doing maintenance, not every session): ~/.claude/memory/AGENTS.md."$'\n\n'
+ctx="Persistent cross-session memory: an outl graph at ~/.claude/memory — your active persistence layer, always loaded (state below), the FIRST place you look before code, a file/dir search, or the web. A UserPromptSubmit hook also PUSHES prompt-relevant slugs as a 'Relevant memory (auto-surfaced …)' pointer block before you act — pointers only, so outl_page_get to confirm (that fetch credits frecency); their absence does not mean memory is empty. Work from the injected index + journals below; for anything deeper dispatch the memory-recall subagent (Sonnet, read-only) — it walks the graph in isolation and returns the conclusion + [[slugs]] with the page bodies kept off this thread. Reserve a direct outl_page_get for a quick single-slug read; never brute-force the graph. Curate as you go: append durable decisions/discoveries to today's journal at each checkpoint, and write impactful facts through to their leaf. Full protocol (read only for maintenance): ~/.claude/memory/AGENTS.md."$'\n\n'
 
 # Table of contents (index page), with a raw-file fallback.
 toc="$("$OUTL" export md index -w "$WS" 2>/dev/null)"
@@ -184,26 +184,42 @@ toc="$("$OUTL" export md index -w "$WS" 2>/dev/null)"
 [ -n "$toc" ] && ctx+="## Memory index (TOC)"$'\n\n'"$toc"$'\n\n'
 
 # Recent workflow window (statically loaded, so it's cached and cheap — not re-fetched
-# via tool calls mid-session): today's journal IN FULL, plus the `## Focus` digest of the
-# previous up-to-4 dated journals. That is the recent-5 high-res window in bounded form —
-# each prior day contributes only its day's-work TOC; pull a full prior journal on demand
-# with outl_daily_get when a digest line points somewhere you need to read.
+# via tool calls mid-session): today's journal, plus the `## Focus` digest of the previous
+# up-to-4 dated journals. That is the recent-5 high-res window in bounded form — each prior
+# day contributes only its day's-work TOC; pull a full prior journal on demand with
+# outl_daily_get when a digest line points somewhere you need to read.
+#
+# Extract a journal's `## Focus` subtree: from its bullet-heading to the next `## ` section.
+focus_of() { awk '/^[[:space:]]*-[[:space:]]+## Focus/{p=1;print;next} /^[[:space:]]*-[[:space:]]+## /{p=0} p' "$1" 2>/dev/null; }
+
+# Today's journal is injected IN FULL while small, but it grows through the day and is
+# re-paid at every session-start that day. Once it crosses MEMORY_TODAY_MAXBYTES (~1.5k
+# tok) we inject only its `## Focus` digest — the same bounded form as prior days — with a
+# pointer to pull the rest (Decisions/Discoveries/etc.) via outl_daily_today on demand.
 tf="$WS/journals/$TODAY.md"
-[ -f "$tf" ] && ctx+="## Journal $TODAY"$'\n\n'"$(cat "$tf" 2>/dev/null)"$'\n\n'
+if [ -f "$tf" ]; then
+  tbytes="$(wc -c <"$tf" 2>/dev/null | tr -d ' ')"
+  case "$tbytes" in ''|*[!0-9]*) tbytes=0 ;; esac
+  if [ "$tbytes" -le "${MEMORY_TODAY_MAXBYTES:-6000}" ]; then
+    ctx+="## Journal $TODAY"$'\n\n'"$(cat "$tf" 2>/dev/null)"$'\n\n'
+  else
+    tfocus="$(focus_of "$tf")"
+    ctx+="## Journal $TODAY (Focus digest — today's journal is large; pull it in full, incl. Decisions/Discoveries/Open threads, via outl_daily_today)"$'\n\n'"${tfocus}"$'\n\n'
+  fi
+fi
 
 # Append discipline — injected every session because the mechanical rule lives in
 # AGENTS.md, which sessions are told NOT to read routinely. Without this reminder in
 # front of them, sessions reach for the flat outl_daily_append with a "## Header\n- ..."
 # blob and sprout duplicate ## Focus / ## Discoveries blocks (see AGENTS.md 'Scaffold once').
-ctx+="Writing to the journal: it has five fixed sections — ## Focus / ## Key Decisions / ## Discoveries / ## Action Items / ## Session Notes, laid down ONCE by the journal template. Append each item as a CHILD under the matching EXISTING section: read the journal outline (outl_daily_today / outl_daily_get) to get that section's block id, then outl_block_append under it with NO '## ' header in the text. NEVER use outl_daily_append for section content (it appends a flat top-level block and cannot nest), and NEVER emit a '## Section' that already exists — that is exactly what sprouts duplicate ## Focus / ## Discoveries blocks. Full protocol in AGENTS.md."$'\n\n'
+ctx+="Journal writing: the day's sections are laid down ONCE by the template. Append each item as a CHILD of the matching EXISTING section — get its block id from outl_daily_today, then outl_block_append under it with NO '## ' header in the text. NEVER use outl_daily_append for section content (it appends a flat top-level block and cannot nest), and NEVER emit a '## Section' that already exists — that is what sprouts duplicate section blocks. Full protocol in AGENTS.md."$'\n\n'
 prev="$(ls "$WS"/journals/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null \
         | grep -v "/$TODAY\.md$" | sort -r | head -4)"
 digest=""
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   d="$(basename "$f" .md)"
-  # Extract the `## Focus` section: from its bullet-heading to the next `## ` section.
-  focus="$(awk '/^[[:space:]]*-[[:space:]]+## Focus/{p=1;print;next} /^[[:space:]]*-[[:space:]]+## /{p=0} p' "$f" 2>/dev/null)"
+  focus="$(focus_of "$f")"
   [ -n "$focus" ] && digest+="### $d"$'\n'"$focus"$'\n\n'
 done <<< "$prev"
 [ -n "$digest" ] && ctx+="## Recent journal focus (prior days — full text via outl_daily_get <date>)"$'\n\n'"$digest"
@@ -221,7 +237,7 @@ try:
 except Exception:
     print("")' 2>/dev/null)"
   if [ "$active" = "1" ]; then
-    ctx+="Retrieval: the memory-index is ACTIVE for this graph. To recall, run \`memory-index search \"<query terms>\"\` FIRST (keyword/FTS5, then a walk of the typed [[link]] graph out from the hits — labelled via·type·hops·weight), then \`outl_page_get\` the slugs it names. Hop depth is set by graph size. Per the 'Retrieval regime auto-scales' section of AGENTS.md. Fall back to TOC descent if it returns nothing."$'\n\n'
+    ctx+="Retrieval: the memory-index is ACTIVE. To recall, run \`memory-index search \"<terms>\"\` FIRST (FTS5 + a walk of the typed [[link]] graph out from the hits), then \`outl_page_get\` the slugs it names; fall back to TOC descent if it returns nothing. Per AGENTS.md 'Retrieval regime auto-scales'."$'\n\n'
   fi
 
   # Consolidation — EVERY session (not marker-gated), so a missed reminder is caught
@@ -317,6 +333,18 @@ except Exception:
     print("")' 2>/dev/null)"
     if [ -n "$cands" ]; then
       ctx+="⚠ Frecency prune candidates (reached 0 in today's sweep): $cands — per the Frecency & pruning section of AGENTS.md, decide for each whether to delete it (outl_page_delete, then remove its parent-TOC link) or bump its frecency if it's still relevant."$'\n\n'
+    fi
+    # Split-on-growth candidates: knowledge leaves whose body now exceeds the token budget
+    # (MEMORY_SPLIT_TOKENS). Detection is mechanized here; the carve itself needs section-
+    # boundary judgment, so surface it as a reviewed action exactly like prune candidates.
+    split="$(printf '%s' "$sweep" | python3 -c 'import sys, json
+try:
+    c = json.load(sys.stdin).get("split_candidates", [])
+    print(", ".join(d["slug"] + " (~" + str(d["tokens"]) + " tok)" for d in c))
+except Exception:
+    print("")' 2>/dev/null)"
+    if [ -n "$split" ]; then
+      ctx+="⚠ Split-on-growth candidates (leaf body over the token budget): $split — per the 'Split on growth' rule in AGENTS.md, convert each into a TOC: extract its sections into <slug>-<section> child leaves, leave one-line [[links]] + hooks behind, and update the parent TOC. Skip only a leaf that is genuinely one atomic topic with no split seam. Not urgent — do it when it won't derail the user's request."$'\n\n'
     fi
   fi
 

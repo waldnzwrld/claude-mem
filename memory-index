@@ -67,6 +67,14 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 HEAL_DEFAULT = "dangling,selfloop"
 FRECENCY_RISK = 5  # a knowledge leaf at/below this frecency is nearing prune (seed is 30)
 
+# Split-on-growth (per AGENTS.md): a `type:: knowledge` leaf whose body is estimated to cost
+# more than this many tokens to load should be carved into a TOC + `<slug>-<section>` child
+# leaves. Estimated as len(body)//CHARS_PER_TOKEN — what an outl_page_get actually spends —
+# not by lines/words, which undercount markup- and code-heavy pages. ~1800 ≈ 3.5× the median
+# leaf, the point where loading the whole page clearly beats descending a TOC. Env-tunable.
+CHARS_PER_TOKEN = 4
+SPLIT_TOKENS = int(os.environ.get("MEMORY_SPLIT_TOKENS", "1800"))
+
 # A small closed-class stopword set. Stripped from FTS queries so a full-sentence query
 # (e.g. one pushed straight from a user prompt) is not OR'd token-by-token into low-IDF
 # noise that pollutes bm25 ranking. Deliberately tiny — only words that carry no recall
@@ -917,13 +925,22 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
         print("memory-index maintain: outl binary not found; cannot write props", file=sys.stderr)
         return 3
 
-    decayed, candidates, skipped = [], [], 0
+    decayed, candidates, skipped, split_cands = [], [], 0, []
     for slug, kind, path in iter_source_files(ws):
         if kind != "page":
             continue
         fm, _body, _raw = parse_md(path)
         if (fm.get("type") or "").strip() != "knowledge":
             continue
+        # Split-on-growth (independent of the frecency-decay skips below, so a pinned or
+        # already-seen-today leaf is still checked): flag a leaf whose load would cost more
+        # than SPLIT_TOKENS as a carve-into-TOC candidate. Size proxy is the .md projection's
+        # byte size — what an outl_page_get actually renders — since parse_md's `body` is a
+        # thin projection, not the block content. Detection only — the actual split needs
+        # section-boundary judgment, so it stays a reviewed agent action.
+        est_tok = os.path.getsize(path) // CHARS_PER_TOKEN
+        if est_tok > SPLIT_TOKENS:
+            split_cands.append({"slug": slug, "tokens": est_tok})
         if _truthy(fm.get("pin")):
             skipped += 1
             continue
@@ -940,11 +957,13 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
         if new <= 0:
             candidates.append(slug)
 
+    split_cands.sort(key=lambda d: d["tokens"], reverse=True)
     result = {
         "date": today,
         "dry_run": dry_run,
         "decayed": decayed,
         "prune_candidates": candidates,
+        "split_candidates": split_cands,
         "skipped": skipped,
     }
     if as_json:
@@ -956,6 +975,9 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
             print(f"  {d['slug']}: {d['from']} → {d['to']}")
         if candidates:
             print(f"prune candidates (frecency ≤ 0, review per AGENTS.md): {', '.join(candidates)}")
+        if split_cands:
+            pretty = ", ".join(f"{d['slug']} (~{d['tokens']} tok)" for d in split_cands)
+            print(f"split candidates (body > {SPLIT_TOKENS} tok, review per AGENTS.md 'Split on growth'): {pretty}")
     return 0
 
 
