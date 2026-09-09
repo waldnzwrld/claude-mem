@@ -2,22 +2,40 @@
 
 You (Claude) have persistent, cross-session memory. It lives in an **outl** outliner graph
 at `~/.claude/memory` and is reachable through the `outl` MCP tools (also the `outl` CLI).
-This document is the source of truth for how that memory works. It is imported by
-`~/.claude/CLAUDE.md`, so it loads in every session automatically — you never need to be
-told that you have memory.
+It is your **active, vivid persistence layer** — always loaded, and the **first place you
+look** before reaching for code, a file/dir search, or the web, not a reference archive you
+consult last. Keep it curated continuously, not just at maintenance time.
+This document is the source of truth for how that memory works. `~/.claude/CLAUDE.md` points
+at it and the SessionStart hook injects the live memory state every session, so you never
+need to be told that you have memory — but this full protocol is **not** loaded every
+session; read it only when doing memory maintenance.
 
 ## How memory reaches you
 
 At the start of every session a **SessionStart hook** injects, as context:
 
 1. The **`index` page** — a compact table of contents (the "MOC", map of content).
-2. The **most recent journal(s)** — the last day or two of raw notes.
+2. **Today's journal in full**, plus the **`## Focus` digest** of the previous up-to-4 dated
+   journals (each prior day contributes only its day's-work TOC — pull a full prior journal
+   with `outl_daily_get <date>` when a digest line points somewhere you need).
 3. Occasionally a **`⚠ Consolidation due`** flag (see *Condensation* below).
+
+Beyond the session-start injection, a **`UserPromptSubmit` hook pushes retrieval per prompt**:
+it runs the index against the user's prompt and, on a strong hit, injects a **"Relevant memory
+(auto-surfaced …)"** block of `slug › heading` pointers *before you act* (see *Retrieval
+regime auto-scales*). Those are pointers, not content — `outl_page_get` a slug to confirm.
 
 So at the start of a session you already know the shape of memory. **Do not** re-read the
 whole graph. Work from the injected index and pull detail on demand.
 
 ## Retrieving context (TOC-first — descend, don't dump)
+
+**For any lookup deeper than a quick single-slug read, prefer delegating to the
+`memory-recall` subagent** (Sonnet, read-only outl tools). It performs the walk below in an
+isolated context and returns the conclusion + `[[slugs]]`, so the bulky page bodies never
+enter the main thread. A page it fetches still credits frecency (the `PostToolUse` touch hook
+fires inside subagents too). Reserve a direct `outl_page_get` on the main thread for a quick
+single-slug read. The protocol below is what that agent — or you, for that quick read — follows.
 
 Memory is a **tree of nested TOCs** (see *The graph model*). Answering a question is a walk
 *down* that tree, following one `[[link]]` per hop — never a scan of the whole graph. The

@@ -29,8 +29,9 @@ HOOK="$BIN_DIR/claude-memory-hook"
 MEMIDX="$BIN_DIR/memory-index"
 CONS="$BIN_DIR/memory-consolidate"
 DUMP="$BIN_DIR/claude-memory-dump"
+AGENTS_DIR="$CLAUDE_DIR/agents"
 
-mkdir -p "$MEM_DIR" "$BIN_DIR"
+mkdir -p "$MEM_DIR" "$BIN_DIR" "$AGENTS_DIR"
 
 # ---- 1. protocol doc --------------------------------------------------------
 cp "$SRC/AGENTS.md" "$MEM_DIR/AGENTS.md"
@@ -62,6 +63,14 @@ echo "✔ memory-consolidate -> $CONS"
 cp "$SRC/claude-memory-dump" "$DUMP"
 chmod 755 "$DUMP"
 echo "✔ claude-memory-dump -> $DUMP"
+
+# ---- 2e. memory-recall subagent: isolated read-only retrieval (keeps page ----
+#          bodies out of the main thread). Deployed as a Claude Code agent def.
+for a in "$SRC"/agents/*.md; do
+  [ -e "$a" ] || continue
+  cp "$a" "$AGENTS_DIR/$(basename "$a")"
+  echo "✔ agent          -> $AGENTS_DIR/$(basename "$a")"
+done
 
 # ---- 3. CLAUDE.md (append the memory section if it isn't already there) ------
 if [ -f "$CLAUDEMD" ] && grep -q '^## Persistent memory' "$CLAUDEMD"; then

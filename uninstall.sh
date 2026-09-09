@@ -20,6 +20,7 @@
 #
 set -euo pipefail
 
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 MEM_DIR="$CLAUDE_DIR/memory"
@@ -100,6 +101,17 @@ fi
 
 # ---- 2. remove the deployed binaries ---------------------------------------
 for f in "$HOOK" "$MEMIDX" "$CONS" "$DUMP"; do
+  if [ -e "$f" ]; then
+    rm -f "$f" && echo "✔ removed        $f"
+  else
+    echo "• not present    $f"
+  fi
+done
+
+# ---- 2b. remove deployed agent definitions ---------------------------------
+for a in "$SRC"/agents/*.md; do
+  [ -e "$a" ] || continue
+  f="$CLAUDE_DIR/agents/$(basename "$a")"
   if [ -e "$f" ]; then
     rm -f "$f" && echo "✔ removed        $f"
   else
