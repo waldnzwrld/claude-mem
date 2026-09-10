@@ -49,6 +49,12 @@ and can be rebuilt from the markdown on any machine.
 - **Retrieval auto-scales.** Below a node threshold the graph is small enough to read by
   descending the TOC; at/above it, `memory-index search` becomes the search-first entry
   point. The hook tells the agent which regime is active.
+- **Retrieval is also pushed, not only pulled.** A `UserPromptSubmit` hook runs the index
+  against each prompt and injects the strong hits as pointers before the agent acts — so
+  relevant memory surfaces even when the agent wouldn't have thought to look. It's gated
+  conservatively (bm25 ceiling, ≤3 pointers, deduped per session) so trivial prompts inject
+  nothing. Fetching a surfaced page (`outl_page_get`) then credits its frecency via a
+  `PostToolUse` hook, closing the loop the daily decay sweep opens.
 
 ## Components
 
@@ -57,10 +63,11 @@ Everything is deployed by `install.sh`:
 | File | Installed to | Role |
 |------|--------------|------|
 | `AGENTS.md` | `~/.claude/memory/AGENTS.md` | The full protocol the agent follows (graph model, crosslinking, writing, condensation, frecency, retrieval). |
-| `claude-memory-hook` | `~/.local/bin/` | SessionStart: inject TOC + recent-journal window, refresh the index, run daily chores. PreCompact: remind the agent to flush notes before compaction. SessionEnd: fire the on-close journaler. Designed to never fail a session. |
+| `claude-memory-hook` | `~/.local/bin/` | SessionStart: inject TOC + recent-journal window, refresh the index, run daily chores. PreCompact: remind the agent to flush notes before compaction. SessionEnd: fire the on-close journaler. **UserPromptSubmit: push-retrieval** — surface memory relevant to the prompt as pointers (conservative bm25 gate, deduped per session). **PostToolUse(`outl_page_get`): frecency touch** — credit a fetched leaf's use. Designed to never fail a session. |
 | `memory-index` | `~/.local/bin/` | Stdlib-only SQLite retrieval sidecar (see below). |
 | `memory-consolidate` | `~/.local/bin/` | Headless agent that distills aged journals into knowledge pages, then reaps them. Runs on **Sonnet 5** (override with `MEMORY_MODEL`). Single-instanced, safe to re-run. |
 | `claude-memory-dump` | `~/.local/bin/` | On-close journaler fired by the SessionEnd hook: a detached headless agent reads the session transcript and appends only the durable facts to today's journal, deduping against existing entries. Runs on **Sonnet 5**; never edits anything but the journal. |
+| `agents/memory-recall.md` | `~/.claude/agents/` | Read-only retrieval subagent (**Sonnet**) scoped to the outl read tools. The main thread delegates a deep memory lookup to it; it walks the graph in an isolated context and returns the conclusion + `[[slugs]]`, keeping page bodies out of the main thread's context. A page it fetches still credits frecency (the `PostToolUse` touch hook fires inside subagents too). |
 | `CLAUDE_TEMPLATE.md` | appended to `~/.claude/CLAUDE.md` | The `## Persistent memory` section that points the agent at the protocol. |
 
 ## `memory-index` — the retrieval sidecar
@@ -88,6 +95,9 @@ scales with graph size (1 → 2 → 3).
 memory-index rebuild        # full reindex from markdown (idempotent)
 memory-index refresh        # incremental: reindex only pages whose content changed
 memory-index search "q"     # field-weighted bm25 hits + typed [[link]] graph walk
+                            #   (--json for machine output; consumed by the push hook)
+memory-index touch <slug>…  # credit a use: frecency +5 (cap 60), seen=today, on the named
+                            #   knowledge leaves (fired by the PostToolUse page-get hook)
 memory-index stats          # node/chunk/edge counts, freshness, active/inactive
 memory-index doctor         # read-only link-graph health report (--json)
 memory-index medic          # prune pathological edges from the index (--dry-run, --off)

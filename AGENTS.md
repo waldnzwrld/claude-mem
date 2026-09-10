@@ -2,22 +2,40 @@
 
 You (Claude) have persistent, cross-session memory. It lives in an **outl** outliner graph
 at `~/.claude/memory` and is reachable through the `outl` MCP tools (also the `outl` CLI).
-This document is the source of truth for how that memory works. It is imported by
-`~/.claude/CLAUDE.md`, so it loads in every session automatically — you never need to be
-told that you have memory.
+It is your **active, vivid persistence layer** — always loaded, and the **first place you
+look** before reaching for code, a file/dir search, or the web, not a reference archive you
+consult last. Keep it curated continuously, not just at maintenance time.
+This document is the source of truth for how that memory works. `~/.claude/CLAUDE.md` points
+at it and the SessionStart hook injects the live memory state every session, so you never
+need to be told that you have memory — but this full protocol is **not** loaded every
+session; read it only when doing memory maintenance.
 
 ## How memory reaches you
 
 At the start of every session a **SessionStart hook** injects, as context:
 
 1. The **`index` page** — a compact table of contents (the "MOC", map of content).
-2. The **most recent journal(s)** — the last day or two of raw notes.
+2. **Today's journal in full**, plus the **`## Focus` digest** of the previous up-to-4 dated
+   journals (each prior day contributes only its day's-work TOC — pull a full prior journal
+   with `outl_daily_get <date>` when a digest line points somewhere you need).
 3. Occasionally a **`⚠ Consolidation due`** flag (see *Condensation* below).
+
+Beyond the session-start injection, a **`UserPromptSubmit` hook pushes retrieval per prompt**:
+it runs the index against the user's prompt and, on a strong hit, injects a **"Relevant memory
+(auto-surfaced …)"** block of `slug › heading` pointers *before you act* (see *Retrieval
+regime auto-scales*). Those are pointers, not content — `outl_page_get` a slug to confirm.
 
 So at the start of a session you already know the shape of memory. **Do not** re-read the
 whole graph. Work from the injected index and pull detail on demand.
 
 ## Retrieving context (TOC-first — descend, don't dump)
+
+**For any lookup deeper than a quick single-slug read, prefer delegating to the
+`memory-recall` subagent** (Sonnet, read-only outl tools). It performs the walk below in an
+isolated context and returns the conclusion + `[[slugs]]`, so the bulky page bodies never
+enter the main thread. A page it fetches still credits frecency (the `PostToolUse` touch hook
+fires inside subagents too). Reserve a direct `outl_page_get` on the main thread for a quick
+single-slug read. The protocol below is what that agent — or you, for that quick read — follows.
 
 Memory is a **tree of nested TOCs** (see *The graph model*). Answering a question is a walk
 *down* that tree, following one `[[link]]` per hop — never a scan of the whole graph. The
@@ -62,12 +80,20 @@ You never choose the regime; it's gated on node count.
   library only: no third-party packages, no venv, no build step, so it just works on any
   machine that has Python. Delete it and `memory-index rebuild` reconstructs it from the
   markdown. The markdown graph remains the only authority.
-- **Edges carry meaning, and it's derived — the markdown is never annotated.** Each edge has
-  a `type` (`refs` by default, or `supersedes` / `contradicts` / `part-of`) inferred from the
-  wording of the line the link sits on, and a `weight` = how many times src links dst. You do
-  nothing to produce this; keep authoring plain `[[links]]`, one relation per bullet (line-
-  granular inference tags every link on a line alike). A schema bump self-heals: a stale index
-  is rebuilt automatically on the next read.
+- **Edges carry a typed relationship, authored or inferred.** Each edge has a `type` (`refs`
+  by default, or `supersedes` / `contradicts` / `part-of`) and a `weight` (link multiplicity),
+  and exactly one edge is kept per src→dst (the highest-precedence type). Typing has two
+  sources, **authored beating inferred**:
+  - **Authored (authoritative):** a frontmatter prop that names the relationship, its value one
+    or more `[[slug]]` links — `supersedes:: [[old-note]]`, `contradicts:: [[other]]`,
+    `parent:: [[toc]]` (→ `part-of`). State the type here when you mean it; the keyword guess
+    never overrides it. Prefer this for any real supersede/contradict relation.
+  - **Inferred (fallback):** a bare inline `[[link]]` takes its type from the wording of its
+    line (line-granular — every link on a line is tagged alike), else `refs`.
+- **Type steers the walk, it isn't just a label.** A page that something `supersedes` is stale,
+  so association never surfaces it — the graph walk skips superseded targets. (The opt-in
+  `medic --prune-superseded` heal additionally drops plain refs into them.) You do nothing to
+  produce edges beyond authoring links/props; a schema bump self-heals on the next read.
 - **The SessionStart hook injects whether the index is ACTIVE.** When it is, retrieve like
   this: run **`memory-index search "<query terms>"`** *first* to land directly on the narrow
   relevant band — keyword (FTS5/bm25) ranking that returns `slug › heading` pointers, **then**
@@ -82,6 +108,14 @@ You never choose the regime; it's gated on node count.
 - **When the index is inactive** (small graph, or the hook says so), use the TOC-descent
   above unchanged. It is also the **universal fallback** whenever the index is stale or
   `memory-index` is unavailable — the system always works without it.
+- **Push-retrieval — memory relevant to a prompt is surfaced for you.** A
+  `UserPromptSubmit` hook runs the index against the user's prompt *before* you see it and
+  injects a **"Relevant memory (auto-surfaced …)"** block of `slug › heading` pointers when
+  a hit is strong (conservative bm25 gate, ≤3 pointers, once per slug per session; a
+  trivial/off-topic prompt surfaces nothing). Treat those lines as **pointers, not
+  content** — `outl_page_get` a slug before relying on it (that fetch also credits its
+  frecency). This complements, and never replaces, your own `memory-index search`: absence
+  of a surfaced block does not mean memory is empty — search or descend when the task needs it.
 - Writing is unchanged: you still author markdown/journals normally. The hook keeps the
   index fresh (`memory-index refresh`, incremental by page hash) with no action from you.
 
@@ -111,11 +145,19 @@ Depth is not fixed — add a level whenever one gets crowded.
 
 Two rules keep the tree lean:
 
-- **Split on growth.** When a leaf grows past roughly **150 lines / ~1500 words** — the
-  point where reading it would eat a big slice of context — convert it into a TOC: extract
-  its sections into child leaf documents (`<slug>-<section>`), and leave one-line `[[links]]`
-  + hooks behind. Detail moves down a level; the parent stays scannable. Better to traverse
-  three tiny pages than load one huge one.
+- **Split on growth.** When **any page's** body exceeds the load-cost budget — **~1800
+  estimated tokens** (`MEMORY_SPLIT_TOKENS`, measured as the `.md` projection's chars/4, i.e.
+  what an `outl_page_get` actually spends; ≈150 lines / ~1500 words as a rough human gauge) —
+  it is split so no single page is expensive to load. A content **leaf** becomes a TOC: its
+  sections move into child leaves (`<slug>-<section>`), one-line `[[links]]` + hooks left
+  behind. An overgrown **TOC/hub** becomes a thin index of **sub-TOCs**: its entries are
+  grouped into sub-TOCs (`<slug>-<group>`) and only their one-line `[[link]]` + hook stays in
+  the parent. Either way detail moves down a level and the parent stays scannable — better to
+  traverse a few tiny pages than load one huge one. This is **automatic**: the daily
+  `memory-index maintain` sweep flags any page over budget (leaf or hub), and the SessionStart
+  hook hands them to the headless `memory-consolidate` compaction agent (which also distils
+  journals and prunes dead leaves) — it carves them with no prompting. A `⚠ Split-on-growth
+  candidates` directive is only the fallback for when the agent CLI is unavailable.
 - **TOCs live with their children.** A TOC is structural — effectively pinned while it holds
   ≥1 live child, and not itself frecency-decayed. When pruning removes its last child,
   delete the now-empty TOC and its link in the parent too.
@@ -340,9 +382,13 @@ real-but-occasional knowledge survives, short enough that stale detail clears ou
   decayed** — they live while they hold ≥1 live child (see *The graph model*).
 - Each leaf carries `frecency::` (integer, seed **30**, cap **60**) and `seen::` (last date
   the score changed).
-- **On material use** — whenever you open a leaf to *use* its content, or merge into it
-  during condensation (not a passing glance) — bump `frecency` by **+5** (cap 60) and set
-  `seen:: <today>`.
+- **On material use** — a use credits `frecency` **+5** (cap 60) and sets `seen:: <today>`.
+  Opening a leaf with `outl_page_get` is now credited **automatically**: a
+  `PostToolUse` hook runs `memory-index touch <slug>` on every successful fetch (it
+  self-skips non-`knowledge` slugs and caps at 60), so a plain read needs **no** manual
+  bump — do not hand-bump on top of a fetch. Still bump by hand for a use that is *not* a
+  fetch — e.g. merging into a leaf during condensation — via `outl page prop set` or
+  `memory-index touch`.
 - **Daily sweep — now mechanized by the hook.** On the first session of a new day the
   SessionStart hook runs `memory-index maintain`, which decays every non-pinned
   `type:: knowledge` leaf whose `seen::` is not today by `frecency − 1` and sets
@@ -357,6 +403,28 @@ real-but-occasional knowledge survives, short enough that stale detail clears ou
   decay and pruning entirely.
 - Optional: order each TOC's link list by `frecency` (high → low) so the most-used
   pathways surface first.
+
+**Section-level frecency (within a leaf).** Page frecency ages out a whole leaf; section
+frecency ages out an individual `## section` of a leaf, so a stale note inside an otherwise
+live leaf clears on its own instead of riding the leaf's score. Same model, one granularity
+down:
+
+- **Unit & store.** Granularity is the `## section` (the unit the index chunks and a search
+  hit resolves to). Scores live in a ws-level ledger `~/.claude/memory/.frecency/sections.json`
+  keyed `{slug: {heading: {f, seen}}}` — **outside** `.outl/`, so `rebuild` never wipes it. It
+  is a usage signal, not knowledge: if lost, sections just reseed at 30. **Never hand-edit it**;
+  `memory-index` owns it.
+- **Credit (the attribution the whole-page fetch can't give).** A whole-page `outl_page_get`
+  is weak evidence, so it bumps *every* section of the page only **+2**. The precise signal is
+  the **search hit**: it resolves to an exact `slug › heading`, so the push-retrieval hook's
+  `memory-index search --credit` bumps just that section **+1** (seed 30, cap 60).
+- **Decay & prune.** The same daily `maintain` sweep decays each section **−1** in lockstep
+  with its leaf (pin/`seen`-guarded), GCs headings that no longer exist, and surfaces any
+  section that reached **0** as a *section prune candidate* (`slug › heading`). Pruning one
+  removes **just that section's subtree** (`outl_block_delete` the heading block + descendants),
+  never the whole leaf, preserving crosslinks into sibling sections — the background compaction
+  agent does this, or the injected `⚠` directive is the fallback. `doctor` shows a `sec-decay`
+  line; a rename reseeds that section (acceptable for a usage ledger).
 
 Scale: a fresh leaf (seed 30) survives ~30 idle days; each use adds ~5 days; a
 heavily-used leaf rides at the 60-day cap. Deletion here is intentional and unrecoverable,
@@ -398,9 +466,11 @@ node, and the pruning sweep — `outl_page_delete` — could destroy it). Link t
   (foundational leaves add `pin:: true`). Reference stubs carry `type:: reference` +
   `source::` + `status::` and deliberately omit the frecency pair (see *Research
   references*).
-- **Keep every page small.** If a leaf pushes ~150 lines, split it into a TOC + child
-  leaves (see *The graph model*). A page that would eat a big slice of context on read is a
-  bug — traversing tiny pages is the whole point.
+- **Keep every page small.** ANY page — leaf or TOC — whose body exceeds ~1800 tokens (the
+  `MEMORY_SPLIT_TOKENS` budget) is automatically split by the compaction agent: a leaf into a
+  TOC + child leaves, an overgrown hub into grouped sub-TOCs (see *Split on growth* and *The
+  graph model*). A page that would eat a big slice of context on read is a bug — traversing
+  tiny pages is the whole point.
 - Prefer editing an existing leaf over creating a near-duplicate; descend the tree or
   `outl_search` first. Editing an existing leaf also refreshes its frecency — another
   reason to merge rather than fork.

@@ -51,9 +51,107 @@ if [ "$event" = "PreCompact" ]; then
   exit 0
 fi
 
+# ---- UserPromptSubmit: push-retrieval ----
+# Run the FTS/graph index on the prompt; inject top strong keyword hits as pointers.
+# Gated (bm25 ceiling + >=2 content terms + per-session dedupe). Skipped in headless agents.
+if [ "$event" = "UserPromptSubmit" ]; then
+  if [ -x "$MEMIDX" ] && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] && [ -z "${MEMORY_DUMP_ACTIVE:-}" ]; then
+    ctx="$(MEMORY_PUSH_MAXSCORE="${MEMORY_PUSH_MAXSCORE:--8.0}" \
+           MEMORY_PUSH_K="${MEMORY_PUSH_K:-3}" MEMIDX="$MEMIDX" WS="$WS" \
+           python3 - "$input" <<'PY'
+import os, sys, json, subprocess, re, glob, time
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+prompt = (d.get("prompt") or "").strip()
+sid = d.get("session_id") or "nosid"
+# Skip slash/bang commands and prompts too thin to carry a recall signal.
+if not prompt or prompt[0] in "/!":
+    sys.exit(0)
+STOP = set("a an the and or of to in is are was be for on with as at by it this that these "
+           "those i you we they my our your do does did can could should would will how what "
+           "why when where who which please thanks yes no not go make add fix run use".split())
+terms = [t for t in re.findall(r"[A-Za-z0-9_]+", prompt.lower()) if t not in STOP and len(t) > 1]
+if len(terms) < 2:
+    sys.exit(0)
+memidx, ws = os.environ["MEMIDX"], os.environ["WS"]
+maxscore, k = float(os.environ["MEMORY_PUSH_MAXSCORE"]), int(os.environ["MEMORY_PUSH_K"])
+try:
+    # --credit: each keyword hit credits its slug/heading section frecency. Capped at SECTION_CAP; decayed daily.
+    out = subprocess.run([memidx, "-w", ws, "search", "--json", "--credit", prompt, "-k", str(k)],
+                         capture_output=True, text=True, timeout=10).stdout
+    results = json.loads(out)["results"]
+except Exception:
+    sys.exit(0)
+# Strong keyword hits only (bm25 lower == better; keep score <= gate); best score per slug.
+best = {}
+for r in results:
+    if r["kind"] != "hit" or r["score"] is None or r["score"] > maxscore:
+        continue
+    if r["slug"] not in best or r["score"] < best[r["slug"]]["score"]:
+        best[r["slug"]] = r
+if not best:
+    sys.exit(0)
+# Per-session dedupe so a slug is surfaced at most once per session.
+cdir = os.path.join(ws, ".push-cache")
+os.makedirs(cdir, exist_ok=True)
+cfile = os.path.join(cdir, re.sub(r"[^A-Za-z0-9_-]", "_", sid))
+seen = set()
+try:
+    with open(cfile) as f:
+        seen = {ln.strip() for ln in f if ln.strip()}
+except Exception:
+    pass
+fresh = sorted((r for s, r in best.items() if s not in seen), key=lambda r: r["score"])[:k]
+if not fresh:
+    sys.exit(0)
+for old in glob.glob(os.path.join(cdir, "*")):  # opportunistic GC of stale session caches
+    try:
+        if time.time() - os.path.getmtime(old) > 86400:
+            os.remove(old)
+    except Exception:
+        pass
+try:
+    with open(cfile, "a") as f:
+        for r in fresh:
+            f.write(r["slug"] + "\n")
+except Exception:
+    pass
+lines = ["Relevant memory (auto-surfaced from your prompt — POINTERS only; "
+         "`outl_page_get <slug>` to read the full page before relying on it):"]
+for r in fresh:
+    lines.append(f"- {r['slug']} › {r['heading']} — {r['snippet'][:140]}")
+print("\n".join(lines))
+PY
+)"
+    [ -n "$ctx" ] && CTX="$ctx" emit "UserPromptSubmit"
+  fi
+  exit 0
+fi
+
+# ---- PostToolUse: credit a page fetch to frecency ----
+# outl_page_get bumps the slug's frecency (touch skips non-knowledge slugs, caps at 60).
+# Fire-and-forget. Skipped in headless agents (their reads are maintenance, not use).
+if [ "$event" = "PostToolUse" ]; then
+  if [ -x "$MEMIDX" ] && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] && [ -z "${MEMORY_DUMP_ACTIVE:-}" ]; then
+    slug="$(printf '%s' "$input" | python3 -c 'import sys, json
+try:
+    d = json.load(sys.stdin)
+    if d.get("tool_name") == "mcp__outl__outl_page_get":
+        print(((d.get("tool_input") or {}).get("slug") or "").strip())
+except Exception:
+    pass' 2>/dev/null)"
+    if [ -n "$slug" ]; then
+      ( "$MEMIDX" -w "$WS" touch "$slug" >/dev/null 2>&1 & )
+      disown 2>/dev/null || true
+    fi
+  fi
+  exit 0
+fi
+
 # ---- SessionEnd: flush the session's durable facts to today's journal -------
-# Journaling on close does not depend on a compaction ever happening. Spawn the
-# detached headless journaler (Sonnet 5) with the transcript path — unless we're
+# Spawn the detached headless journaler (Sonnet 5) with the transcript path, unless
 # already inside a spawned agent (its own SessionEnd must not re-trigger us).
 if [ "$event" = "SessionEnd" ]; then
   if [ -z "${MEMORY_DUMP_ACTIVE:-}" ] && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] \
@@ -72,42 +170,47 @@ except Exception:
 fi
 
 # ---- SessionStart (default) ----
-ctx="You have persistent memory: an outl graph at ~/.claude/memory. Current state is below; retrieve detail on demand with outl_page_get (do not brute-force the graph). Protocol: ~/.claude/memory/AGENTS.md."$'\n\n'
+ctx="Persistent cross-session memory: an outl graph at ~/.claude/memory — your active persistence layer, always loaded (state below), the FIRST place you look before code, a file/dir search, or the web. A UserPromptSubmit hook also PUSHES prompt-relevant slugs as a 'Relevant memory (auto-surfaced …)' pointer block before you act — pointers only, so outl_page_get to confirm (that fetch credits frecency); their absence does not mean memory is empty. Work from the injected index + journals below; for anything deeper dispatch the memory-recall subagent (Sonnet, read-only) — it walks the graph in isolation and returns the conclusion + [[slugs]] with the page bodies kept off this thread. Reserve a direct outl_page_get for a quick single-slug read; never brute-force the graph. Curate as you go: append durable decisions/discoveries to today's journal at each checkpoint, and write impactful facts through to their leaf. Full protocol (read only for maintenance): ~/.claude/memory/AGENTS.md."$'\n\n'
 
 # Table of contents (index page), with a raw-file fallback.
 toc="$("$OUTL" export md index -w "$WS" 2>/dev/null)"
 [ -z "$toc" ] && [ -f "$WS/pages/index.md" ] && toc="$(cat "$WS/pages/index.md" 2>/dev/null)"
 [ -n "$toc" ] && ctx+="## Memory index (TOC)"$'\n\n'"$toc"$'\n\n'
 
-# Recent workflow window (statically loaded, so it's cached and cheap — not re-fetched
-# via tool calls mid-session): today's journal IN FULL, plus the `## Focus` digest of the
-# previous up-to-4 dated journals. That is the recent-5 high-res window in bounded form —
-# each prior day contributes only its day's-work TOC; pull a full prior journal on demand
-# with outl_daily_get when a digest line points somewhere you need to read.
-tf="$WS/journals/$TODAY.md"
-[ -f "$tf" ] && ctx+="## Journal $TODAY"$'\n\n'"$(cat "$tf" 2>/dev/null)"$'\n\n'
+# Recent workflow window: today's journal + the `## Focus` digest of the prior up-to-4
+# dated journals. Pull a full prior journal with outl_daily_get.
+# focus_of: extract a journal's `## Focus` subtree (heading bullet to next `## ` section).
+focus_of() { awk '/^[[:space:]]*-[[:space:]]+## Focus/{p=1;print;next} /^[[:space:]]*-[[:space:]]+## /{p=0} p' "$1" 2>/dev/null; }
 
-# Append discipline — injected every session because the mechanical rule lives in
-# AGENTS.md, which sessions are told NOT to read routinely. Without this reminder in
-# front of them, sessions reach for the flat outl_daily_append with a "## Header\n- ..."
-# blob and sprout duplicate ## Focus / ## Discoveries blocks (see AGENTS.md 'Scaffold once').
-ctx+="Writing to the journal: it has five fixed sections — ## Focus / ## Key Decisions / ## Discoveries / ## Action Items / ## Session Notes, laid down ONCE by the journal template. Append each item as a CHILD under the matching EXISTING section: read the journal outline (outl_daily_today / outl_daily_get) to get that section's block id, then outl_block_append under it with NO '## ' header in the text. NEVER use outl_daily_append for section content (it appends a flat top-level block and cannot nest), and NEVER emit a '## Section' that already exists — that is exactly what sprouts duplicate ## Focus / ## Discoveries blocks. Full protocol in AGENTS.md."$'\n\n'
+# Inject today's journal in full while small; over MEMORY_TODAY_MAXBYTES inject only its
+# `## Focus` digest, with a pointer to pull the rest via outl_daily_today.
+tf="$WS/journals/$TODAY.md"
+if [ -f "$tf" ]; then
+  tbytes="$(wc -c <"$tf" 2>/dev/null | tr -d ' ')"
+  case "$tbytes" in ''|*[!0-9]*) tbytes=0 ;; esac
+  if [ "$tbytes" -le "${MEMORY_TODAY_MAXBYTES:-6000}" ]; then
+    ctx+="## Journal $TODAY"$'\n\n'"$(cat "$tf" 2>/dev/null)"$'\n\n'
+  else
+    tfocus="$(focus_of "$tf")"
+    ctx+="## Journal $TODAY (Focus digest — today's journal is large; pull it in full, incl. Decisions/Discoveries/Open threads, via outl_daily_today)"$'\n\n'"${tfocus}"$'\n\n'
+  fi
+fi
+
+# Journal-append discipline, injected every session (rule lives in AGENTS.md).
+ctx+="Journal writing: the day's sections are laid down ONCE by the template. Append each item as a CHILD of the matching EXISTING section — get its block id from outl_daily_today, then outl_block_append under it with NO '## ' header in the text. NEVER use outl_daily_append for section content (it appends a flat top-level block and cannot nest), and NEVER emit a '## Section' that already exists — that is what sprouts duplicate section blocks. Full protocol in AGENTS.md."$'\n\n'
 prev="$(ls "$WS"/journals/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md 2>/dev/null \
         | grep -v "/$TODAY\.md$" | sort -r | head -4)"
 digest=""
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   d="$(basename "$f" .md)"
-  # Extract the `## Focus` section: from its bullet-heading to the next `## ` section.
-  focus="$(awk '/^[[:space:]]*-[[:space:]]+## Focus/{p=1;print;next} /^[[:space:]]*-[[:space:]]+## /{p=0} p' "$f" 2>/dev/null)"
+  focus="$(focus_of "$f")"
   [ -n "$focus" ] && digest+="### $d"$'\n'"$focus"$'\n\n'
 done <<< "$prev"
 [ -n "$digest" ] && ctx+="## Recent journal focus (prior days — full text via outl_daily_get <date>)"$'\n\n'"$digest"
 
-# Retrieval index (memory-index): keep it fresh, then tell the agent whether the
-# graph is large enough that the index is ACTIVE (search-first) or not (TOC descent).
-# Best-effort and non-fatal: if the tool or its deps are missing, memory just works
-# via TOC traversal, exactly as before.
+# Retrieval index: refresh it, then report whether it is ACTIVE (search-first) or not
+# (TOC descent). Non-fatal: if missing, memory works via TOC traversal.
 if [ -x "$MEMIDX" ]; then
   "$MEMIDX" -w "$WS" refresh >/dev/null 2>&1 || true
   stats="$("$MEMIDX" -w "$WS" stats --json 2>/dev/null)"
@@ -117,21 +220,15 @@ try:
 except Exception:
     print("")' 2>/dev/null)"
   if [ "$active" = "1" ]; then
-    ctx+="Retrieval: the memory-index is ACTIVE for this graph. To recall, run \`memory-index search \"<query terms>\"\` FIRST (keyword/FTS5, then a walk of the typed [[link]] graph out from the hits — labelled via·type·hops·weight), then \`outl_page_get\` the slugs it names. Hop depth is set by graph size. Per the 'Retrieval regime auto-scales' section of AGENTS.md. Fall back to TOC descent if it returns nothing."$'\n\n'
+    ctx+="Retrieval: the memory-index is ACTIVE. To recall, run \`memory-index search \"<terms>\"\` FIRST (FTS5 + a walk of the typed [[link]] graph out from the hits), then \`outl_page_get\` the slugs it names; fall back to TOC descent if it returns nothing. Per AGENTS.md 'Retrieval regime auto-scales'."$'\n\n'
   fi
 
-  # Consolidation — EVERY session (not marker-gated), so a missed reminder is caught
-  # the next session, not lost until tomorrow. Two halves:
-  #   * reap (mechanical): delete aged journals the agent already marked consolidated::
-  #     — guarded, so an undistilled journal is never deleted.
-  #   * distill (LLM): if any aged journal is still un-distilled, run it AUTOMATICALLY
-  #     in a detached, headless `claude -p` agent (memory-consolidate) so it happens
-  #     with no prompting, on any machine. The interactive MANDATORY directive is now
-  #     only the fallback for when the claude CLI or the script is unavailable.
-  # Cheap pure-bash pre-check first: retention is by COUNT — keep the 5 most recent
-  # dated journals, age out anything older. In steady state there are exactly 5 on disk,
-  # so we skip the subprocess entirely — the common session pays nothing. We only spin up
-  # the tool when a 6th (or more) journal exists.
+  # Consolidation, every session (not marker-gated). Two halves:
+  #   * reap: delete aged journals already marked consolidated:: (guarded).
+  #   * distill: run any un-distilled aged journal via detached memory-consolidate agent;
+  #     interactive directive is the fallback when the CLI/script is unavailable.
+  # Retention is by COUNT (keep 5 most recent); pure-bash pre-check skips the subprocess
+  # unless a 6th journal exists.
   jcount=0
   for f in "$WS"/journals/*.md; do
     [ -e "$f" ] || continue
@@ -149,15 +246,11 @@ try:
 except Exception:
     print("")' 2>/dev/null)"
   fi
-  # Skip entirely inside the headless consolidation agent's own session (it has its
-  # own -p prompt); only act for real interactive sessions.
+  # Skip inside the headless consolidation agent's own session; act only for interactive sessions.
   if [ -n "$pend" ] && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ]; then
-    # A journal still pending at THIS session start means any prior background run did
-    # NOT clear it (the reap above already ran). Count consecutive automatic attempts
-    # per journal so a silently-failing agent can't loop forever — unseen, and
-    # re-billing a `claude -p` every morning. Once a journal has been auto-attempted
-    # MAX_CONSOLIDATE_ATTEMPTS times without clearing, we stop launching and surface
-    # the interactive fallback so the stuck backlog becomes visible.
+    # Still-pending here means a prior background run did not clear it. Count consecutive
+    # auto-attempts per journal; after MAX_CONSOLIDATE_ATTEMPTS, stop launching and surface
+    # the interactive fallback.
     maxtries=0
     newstate=""
     for j in $pend; do
@@ -172,37 +265,31 @@ except Exception:
 
     if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1 \
        && [ "$maxtries" -le "$MAX_CONSOLIDATE_ATTEMPTS" ]; then
-      # Automatic path: distill + reap in a detached background agent. SessionStart
-      # returns immediately; the backlog clears with zero prompting, every install.
+      # Automatic path: distill + reap in a detached agent.
       nohup "$CONS" >/dev/null 2>&1 &
       disown 2>/dev/null || true
       ctx+="Memory consolidation is running automatically in a background agent for aged journals ($pend) — it will distill them into the knowledge tree and reap them. Do NOT consolidate or delete journals yourself."$'\n\n'
     else
-      # Fallback: either the tooling is missing (no claude CLI / no memory-consolidate),
-      # OR the background agent has failed to clear these journals MAX_CONSOLIDATE_ATTEMPTS
-      # times — in which case we pause the silent, re-billing retry loop and have THIS
-      # interactive session do the distillation instead.
+      # Fallback: tooling missing, or background agent failed MAX_CONSOLIDATE_ATTEMPTS times.
+      # Pause auto-retry; have THIS session do the distillation.
       if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1; then
         ctx+="⚠ Automatic background consolidation has not cleared these journals after $MAX_CONSOLIDATE_ATTEMPTS attempt(s) ($pend); auto-retry is paused to avoid a silent, re-billing loop. Do the consolidation in THIS session instead, as below."$'\n\n'
       fi
       ctx+="⚠ CONSOLIDATION REQUIRED before other work this session — these journals are older than the 5 most recent and are NOT yet distilled: $pend. For EACH date, per the Condensation section of AGENTS.md: cluster its items by the [[page]] they concern, merge the distilled points into the right knowledge leaf (create/split as needed; set each such leaf's \`updated:: $TODAY\` plus summary::/frecency). Then, as the LAST actions for that date: (1) record evidence — \`outl_page_prop_set <date> distilled-into='[[slug-a]] [[slug-b]]'\` listing every leaf you wrote to, or \`distilled-into=none\` if nothing was durable; (2) \`outl_page_prop_set <date> consolidated=$TODAY\`. The reap deletes any aged journal carrying a \`consolidated::\` mark, so marking it done is what removes it — do NOT delete journals yourself. Do this now, then address the user's request."$'\n\n'
     fi
   else
-    # No backlog (or we're the headless agent). Clear stale counters only when the
-    # backlog is genuinely empty, so a future backlog starts its count fresh.
+    # No backlog (or headless agent). Clear counters only when backlog empty.
     [ -z "$pend" ] && rm -f "$ATTEMPTS" 2>/dev/null || true
   fi
 fi
 
-# Once-per-new-day work (frecency sweep). The consolidation backlog is handled every
-# session above, not here, so a missed reminder is never lost until the next day.
+# Once-per-new-day work (frecency sweep).
 last=""
 [ -f "$MARKER" ] && last="$(cat "$MARKER" 2>/dev/null)"
 if [ "$last" != "$TODAY" ]; then
-  # Mechanized frecency sweep (once per new day): decay non-pinned `type:: knowledge`
-  # leaves by 1 (seed 30) via `outl page prop set` — sidecar-safe, never raw edits —
-  # and surface any leaf that reached 0 as a prune candidate for review. Deletion is
-  # NOT automatic (it needs parent-TOC link cleanup), so it stays an agent decision.
+  # Frecency sweep: decay non-pinned knowledge leaves by 1 via `outl page prop set`, then
+  # compute prune candidates (reached 0) and split-on-growth candidates (over
+  # MEMORY_SPLIT_TOKENS). Detached agent does the work; ⚠ directives are the fallback.
   if [ -x "$MEMIDX" ]; then
     sweep="$("$MEMIDX" -w "$WS" maintain --json 2>/dev/null)"
     "$MEMIDX" -w "$WS" refresh >/dev/null 2>&1 || true   # re-index the decayed frontmatter
@@ -211,8 +298,34 @@ try:
     print(" ".join(json.load(sys.stdin).get("prune_candidates", [])))
 except Exception:
     print("")' 2>/dev/null)"
-    if [ -n "$cands" ]; then
-      ctx+="⚠ Frecency prune candidates (reached 0 in today's sweep): $cands — per the Frecency & pruning section of AGENTS.md, decide for each whether to delete it (outl_page_delete, then remove its parent-TOC link) or bump its frecency if it's still relevant."$'\n\n'
+    split="$(printf '%s' "$sweep" | python3 -c 'import sys, json
+try:
+    c = json.load(sys.stdin).get("split_candidates", [])
+    print(", ".join(d["slug"] + " (~" + str(d["tokens"]) + " tok)" for d in c))
+except Exception:
+    print("")' 2>/dev/null)"
+    secprune="$(printf '%s' "$sweep" | python3 -c 'import sys, json
+try:
+    print(", ".join(json.load(sys.stdin).get("section_prune_candidates", [])))
+except Exception:
+    print("")' 2>/dev/null)"
+    if [ -n "$cands" ] || [ -n "$split" ] || [ -n "$secprune" ]; then
+      if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1 && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ]; then
+        # memory-consolidate also compacts the tree. Pass the authoritative sweep JSON through
+        # (this run already decayed frecency + seen, so a re-computed list would be empty).
+        MEMORY_CONSOLIDATE_SWEEP="$sweep" nohup "$CONS" >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+        note=""
+        [ -n "$split" ] && note="splitting oversized leaves ($split)"
+        [ -n "$cands" ] && { [ -n "$note" ] && note="$note; "; note="${note}pruning dead leaves ($cands)"; }
+        [ -n "$secprune" ] && { [ -n "$note" ] && note="$note; "; note="${note}removing dead sections ($secprune)"; }
+        ctx+="Memory compaction is running automatically in a background agent — $note. Do NOT split, prune, or restructure memory pages yourself this session."$'\n\n'
+      else
+        # Fallback (script/CLI unavailable): surface work as directives.
+        [ -n "$cands" ] && ctx+="⚠ Frecency prune candidates (reached 0 in today's sweep): $cands — per the Frecency & pruning section of AGENTS.md, decide for each whether to delete it (outl_page_delete, then remove its parent-TOC link) or bump its frecency if it's still relevant."$'\n\n'
+        [ -n "$secprune" ] && ctx+="⚠ Section prune candidates (a single ## section whose section-frecency reached 0, though its leaf is still live): $secprune — per the Frecency & pruning section of AGENTS.md at section granularity, for each 'slug › heading' either keep it (reseeds on next use) or remove JUST that section's subtree (outl_block_delete the heading block + descendants), never the whole leaf, preserving crosslinks into sibling sections."$'\n\n'
+        [ -n "$split" ] && ctx+="⚠ Split-on-growth candidates (leaf body over the token budget): $split — per the 'Split on growth' rule in AGENTS.md, convert each into a TOC: extract its sections into <slug>-<section> child leaves, leave one-line [[links]] + hooks behind, and update the parent TOC. Skip only a leaf that is genuinely one atomic topic with no split seam."$'\n\n'
+      fi
     fi
   fi
 

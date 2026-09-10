@@ -3,7 +3,8 @@
 # uninstall.sh — cleanly decouple the Claude persistent-memory integration.
 #
 # Reverses install.sh's three coupling actions:
-#   1. removes the SessionStart + PreCompact + SessionEnd hooks from settings.json
+#   1. removes the SessionStart + PreCompact + SessionEnd + UserPromptSubmit +
+#      PostToolUse hooks from settings.json
 #   2. deletes the deployed binaries (claude-memory-hook, memory-index,
 #      memory-consolidate, claude-memory-dump) from ~/.local/bin
 #   3. strips the "## Persistent memory" section from ~/.claude/CLAUDE.md
@@ -19,6 +20,7 @@
 #
 set -euo pipefail
 
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 MEM_DIR="$CLAUDE_DIR/memory"
@@ -60,7 +62,7 @@ def is_ours(h):
     return c == cmd or c.rstrip('/').endswith('/claude-memory-hook') or c == 'claude-memory-hook'
 
 changed = False
-for event in ('SessionStart', 'PreCompact', 'SessionEnd'):
+for event in ('SessionStart', 'PreCompact', 'SessionEnd', 'UserPromptSubmit', 'PostToolUse'):
     groups = hooks.get(event)
     if not isinstance(groups, list):
         continue
@@ -88,7 +90,8 @@ if changed:
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
         f.write('\n')
-    print("✔ settings.json  -> removed SessionStart + PreCompact memory hooks")
+    print("✔ settings.json  -> removed memory hooks (SessionStart/PreCompact/SessionEnd/"
+          "UserPromptSubmit/PostToolUse)")
 else:
     print("• settings.json  -> no memory hooks found; left as-is")
 PY
@@ -98,6 +101,17 @@ fi
 
 # ---- 2. remove the deployed binaries ---------------------------------------
 for f in "$HOOK" "$MEMIDX" "$CONS" "$DUMP"; do
+  if [ -e "$f" ]; then
+    rm -f "$f" && echo "✔ removed        $f"
+  else
+    echo "• not present    $f"
+  fi
+done
+
+# ---- 2b. remove deployed agent definitions ---------------------------------
+for a in "$SRC"/agents/*.md; do
+  [ -e "$a" ] || continue
+  f="$CLAUDE_DIR/agents/$(basename "$a")"
   if [ -e "$f" ]; then
     rm -f "$f" && echo "✔ removed        $f"
   else
