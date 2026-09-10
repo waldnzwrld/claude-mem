@@ -6,9 +6,12 @@
 #
 #     ./install.sh
 #
-# It copies the repo's files to where Claude Code expects them and wires the
-# SessionStart/PreCompact/SessionEnd hooks into settings.json. It does NOT initialize the
-# outl workspace or register the outl MCP server — do those two yourself:
+# It copies the repo's files to where Claude Code expects them, wires the
+# SessionStart/PreCompact/SessionEnd/UserPromptSubmit/PostToolUse hooks into
+# settings.json, and auto-allows the read-only recall tools (outl reads +
+# memory-recall + memory-index) so the memory-first path never prompts. It does
+# NOT initialize the outl workspace or register the outl MCP server — do those
+# two yourself:
 #
 #     brew tap outlmd/outl https://github.com/outlmd/outl
 #     brew trust outlmd/outl
@@ -90,7 +93,7 @@ else
   fi
 fi
 
-# ---- 4. wire SessionStart + PreCompact hooks into settings.json -------------
+# ---- 4. wire hooks + auto-allow read-only recall tools into settings.json ----
 if command -v python3 >/dev/null 2>&1; then
   SETTINGS="$SETTINGS" HOOK="$HOOK" python3 - <<'PY'
 import json, os
@@ -124,19 +127,55 @@ def ensure(event, matcher=None):
 
 # UserPromptSubmit → push-retrieval; PostToolUse(outl_page_get) → frecency touch. The
 # PostToolUse matcher scopes it to the one tool so the hook doesn't fire on every call.
-changed = (ensure('SessionStart') | ensure('PreCompact') | ensure('SessionEnd')
-           | ensure('UserPromptSubmit')
-           | ensure('PostToolUse', matcher='mcp__outl__outl_page_get'))
+hooks_changed = (ensure('SessionStart') | ensure('PreCompact') | ensure('SessionEnd')
+                 | ensure('UserPromptSubmit')
+                 | ensure('PostToolUse', matcher='mcp__outl__outl_page_get'))
 
-if changed:
+# Pre-approve the on-demand recall path so memory-first lookups never prompt.
+# Read-only tools ONLY — every mutating outl tool (page/block/daily writes, deletes,
+# templates) is deliberately omitted so writes to the graph still surface a prompt.
+OUTL_READ_TOOLS = [
+    'outl_backlinks', 'outl_block_get', 'outl_block_refs', 'outl_block_tree',
+    'outl_daily_get', 'outl_daily_range', 'outl_daily_today',
+    'outl_export_json', 'outl_export_md', 'outl_page_get', 'outl_page_list',
+    'outl_page_prop_get', 'outl_page_prop_list', 'outl_page_render',
+    'outl_query', 'outl_search', 'outl_tag_list', 'outl_tag_pages',
+    'outl_workspace_info',
+]
+allow_wanted = ['mcp__outl__' + t for t in OUTL_READ_TOOLS]
+allow_wanted.append('Task(memory-recall)')
+# Read-only memory-index subcommands, bare and rtk-rewritten (the rtk Bash hook,
+# when present, rewrites `memory-index …` → `rtk memory-index …`).
+for sub in ('doctor', 'search', 'stats'):
+    allow_wanted.append('Bash(memory-index %s:*)' % sub)
+    allow_wanted.append('Bash(rtk memory-index %s:*)' % sub)
+
+perms = data.setdefault('permissions', {})
+allow = perms.get('allow')
+if not isinstance(allow, list):
+    allow = []
+    perms['allow'] = allow
+have = set(allow)
+added = [e for e in allow_wanted if e not in have]
+allow.extend(added)
+perms_changed = bool(added)
+
+if hooks_changed or perms_changed:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
         f.write('\n')
+
+if hooks_changed:
     print("✔ settings.json  -> wired SessionStart + PreCompact + SessionEnd + "
           "UserPromptSubmit + PostToolUse hooks")
 else:
     print("• settings.json already has the hooks; left as-is")
+if perms_changed:
+    print("✔ settings.json  -> auto-allowed %d read-only recall entries "
+          "(outl reads + memory-recall + memory-index)" % len(added))
+else:
+    print("• settings.json already allows the read-only recall tools; left as-is")
 PY
 else
   cat <<EOF
@@ -147,6 +186,11 @@ else
   "SessionEnd":      [ { "hooks": [ { "type": "command", "command": "$HOOK" } ] } ],
   "UserPromptSubmit":[ { "hooks": [ { "type": "command", "command": "$HOOK" } ] } ],
   "PostToolUse":     [ { "matcher": "mcp__outl__outl_page_get", "hooks": [ { "type": "command", "command": "$HOOK" } ] } ]
+
+  ...and, under "permissions": { "allow": [ ... ] }, the read-only recall tools:
+  the mcp__outl__ read tools (backlinks, block_get/refs/tree, daily_*, export_*,
+  page_get/list/prop_*/render, query, search, tag_*, workspace_info),
+  "Task(memory-recall)", and "Bash(memory-index doctor|search|stats:*)".
 EOF
 fi
 
