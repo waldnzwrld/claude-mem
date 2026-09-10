@@ -4,12 +4,10 @@ memory-index — a rebuildable retrieval sidecar over the outl memory graph.
 
 The outl markdown graph at ~/.claude/memory is the sole source of truth. This tool
 builds a DERIVED, disposable SQLite index over it (Porter-stemmed, field-weighted FTS5
-keyword + a typed/weighted link/edge table) so recall can land on the narrow relevant
-band in one shot, then walk
-outward along [[links]] via a recursive graph traversal. The index is never
-authoritative: delete it and `rebuild` reconstructs it from the markdown on any machine.
-Edges are a pure projection of the files — type is inferred from link wording, never
-annotated in the markdown — so the source stays clean and there is only one source of truth.
+keyword + a typed/weighted link/edge table), then walks outward along [[links]] via a
+recursive graph traversal. The index is never authoritative: delete it and `rebuild`
+reconstructs it from the markdown. Edges are a pure projection of the files — type is
+inferred from link wording, never annotated in the markdown.
 
 Commands:
   memory-index rebuild            Full reindex from markdown (idempotent).
@@ -21,9 +19,9 @@ Commands:
                                   index freshness, active/inactive.
 
 Design notes:
-  * STDLIB ONLY — no third-party packages, no venv, no build step. It relies only on
-    Python 3.9+ and the sqlite3/FTS5 that ship with CPython, so it is a single file
-    that just works on any machine. The whole index is one SQLite file (.outl/index.sqlite).
+  * STDLIB ONLY — no third-party packages, no venv, no build step; relies only on
+    Python 3.9+ and the sqlite3/FTS5 that ship with CPython. The whole index is one
+    SQLite file (.outl/index.sqlite).
   * Auto-scale gate: below --threshold nodes the graph is small enough that agentic
     TOC-traversal beats an index; `stats` reports inactive and callers skip it.
   * Lexical recall is Porter-stemmed (consolidate≈consolidation), diacritic-folded, and
@@ -276,9 +274,9 @@ def chunk_body(fm: dict, body: list[str]):
     return chunks
 
 
-# Edge-type inference: the markdown is NEVER annotated with a link type — files stay
-# clean, source-of-truth intact — so the type is derived from the wording of the line
-# the [[link]] sits on. First keyword group to match wins; otherwise a plain 'refs'.
+# Edge-type inference: the markdown is never annotated with a link type, so the type is
+# derived from the wording of the line the [[link]] sits on. First keyword group to match
+# wins; otherwise a plain 'refs'.
 EDGE_TYPES = (
     ("supersedes",  ("supersede", "replaces", "replace", "obsoletes", "deprecates")),
     ("contradicts", ("contradict", "conflicts", "conflict", "disagrees", "refutes")),
@@ -332,7 +330,7 @@ def cmd_rebuild(ws: str, threshold: int | None, quiet: bool = False):
         int(prior) if prior is not None else DEFAULT_THRESHOLD
     )
     con.execute("DROP TABLE IF EXISTS chunks_fts")
-    con.execute("DROP TABLE IF EXISTS vectors")  # legacy: drop if a prior version made it
+    con.execute("DROP TABLE IF EXISTS vectors")  # legacy table; drop if present
     for t in ("pages", "chunks", "edges"):
         con.execute(f"DROP TABLE IF EXISTS {t}")
     init_schema(con)
@@ -372,7 +370,7 @@ def cmd_refresh(ws: str, threshold: int | None, quiet: bool = False):
 
 def _delete_slug(con, slug: str):
     # External-content FTS5 deletes must replay the ORIGINAL column values so the exact
-    # tokens are removed; passing '' (as an earlier version did) leaks stale terms.
+    # tokens are removed; passing '' leaks stale terms.
     rows = con.execute(
         "SELECT id, title, heading, text FROM chunks WHERE slug=?", (slug,)
     ).fetchall()
@@ -409,9 +407,8 @@ def _index_files(con, ws: str, files, full: bool):
         page_title = fm.get("title") or ""
         for heading, text in chunk_body(fm, body):
             # Put the page title in the weighted `title` column ONLY on the synthetic
-            # summary chunk (the page's headline representation). Denormalizing it onto
-            # every chunk would make the title term appear corpus-wide, crushing its IDF
-            # and destroying the very discrimination the weight is meant to add.
+            # summary chunk. Denormalizing it onto every chunk would make the title term
+            # appear corpus-wide, crushing its IDF.
             fts_title = page_title if heading == "(summary)" else ""
             cur = con.execute(
                 "INSERT INTO chunks(slug,title,heading,anchor,text) VALUES(?,?,?,?,?)",
@@ -984,12 +981,10 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
 
 def cmd_touch(ws: str, slugs, today: str, bump: int, as_json: bool):
     """Credit a material USE of one or more knowledge leaves: frecency += bump (seed 30 if
-    unset, saturating at FRECENCY_CAP), seen = today. This is the missing other half of the
-    frecency loop — `maintain` decays daily, `touch` reinforces on use — so decay reflects
-    real usage instead of relying on the agent to hand-run `outl page prop set`. Writes go
-    through outl so the .outl sidecar stays in sync; journals and non-knowledge pages are
-    silently skipped (they carry no frecency). Called by the PostToolUse(outl_page_get)
-    hook and safe to run by hand."""
+    unset, saturating at FRECENCY_CAP), seen = today. The other half of the frecency loop:
+    `maintain` decays daily, `touch` reinforces on use. Writes go through outl so the .outl
+    sidecar stays in sync; journals and non-knowledge pages are silently skipped (they carry
+    no frecency). Called by the PostToolUse(outl_page_get) hook and safe to run by hand."""
     outl = _outl_bin()
     if outl is None:
         print("memory-index touch: outl binary not found; cannot write props", file=sys.stderr)
@@ -1053,23 +1048,15 @@ def _aged_journals(ws: str, today: str):
 def cmd_consolidate(ws: str, today: str, reap: bool, as_json: bool):
     """Report the consolidation backlog and (optionally) mechanically reap.
 
-    Retention is dead simple and by COUNT: the 5 most recent journals are vivid
-    memory and stay; every older ("aged") journal is deleted once it has been
-    distilled. An aged journal is bucketed solely by whether the distiller has
-    marked it done:
-      * reapable   — carries a valid `consolidated:: <date>` mark → the distiller
-                     ran, so it is safe to delete; `--reap` does so via
-                     `outl page delete`.
+    Retention is by COUNT: the 5 most recent journals stay; every older ("aged")
+    journal is deleted once it has been distilled. An aged journal is bucketed solely
+    by whether the distiller has marked it done:
+      * reapable   — carries a valid `consolidated:: <date>` mark → safe to delete;
+                     `--reap` does so via `outl page delete`.
       * pending    — no `consolidated::` yet → still to distill.
 
-    NOTE: this deliberately does NOT re-verify that every `distilled-into::` target
-    leaf exists and was freshly bumped. That per-leaf `updated:: >= consolidated`
-    gate (removed) was the source of a re-queue loop: a correctly-distilled journal
-    whose leaf stored `updated::` as a bullet instead of hoisted frontmatter, or a
-    leaf that already held the fact and wasn't re-stamped, failed verification —
-    so the journal was never deleted, was re-distilled every session, and lingered
-    past the 5-journal window. Presence of `consolidated::` (the distiller's last
-    action) is the evidence; aged + marked → gone."""
+    Bucketing is on the presence of `consolidated::` alone; it does NOT re-verify that
+    every `distilled-into::` target leaf exists and was freshly bumped."""
     aged = _aged_journals(ws, today)
     pending, reapable, unverified = [], [], []
     for slug, path in aged:

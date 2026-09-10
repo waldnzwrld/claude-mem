@@ -2,8 +2,7 @@
 #
 # memory-consolidate — automatic, headless compaction of the memory graph.
 #
-# One headless agent keeps the whole graph lean, with no interactive prompting.
-# It handles three backlogs in a single pass:
+# One headless agent handles three backlogs in a single pass:
 #   * journals — distil aged, un-`consolidated::` journals into knowledge leaves,
 #     mark each `consolidated:: <today>`, then reap (delete) the marked ones.
 #   * split    — carve a `type:: knowledge` leaf grown past the load budget
@@ -11,10 +10,9 @@
 #   * prune    — delete (soft/recoverable) a leaf whose frecency decayed to 0,
 #     after cleaning up its parent-TOC link, or bump it if it still earns a place.
 # Reaping and candidate detection are mechanical (`memory-index`); the distil,
-# split, and keep-vs-delete calls need an LLM, so this spawns a detached,
-# headless `claude -p` agent per ~/.claude/memory/AGENTS.md. The SessionStart hook
-# backgrounds this whenever any backlog exists, so the graph keeps itself lean on
-# its own, on any machine — no one ever has to ask for a trim or a cleanup.
+# split, and keep-vs-delete calls need an LLM, so this spawns a detached, headless
+# `claude -p` agent per ~/.claude/memory/AGENTS.md. The SessionStart hook backgrounds
+# this whenever any backlog exists.
 #
 # Safe to run any time and repeatedly: it no-ops when nothing is pending,
 # single-instances via a lock, and refuses to recurse into the agent it spawns.
@@ -25,17 +23,15 @@ MEMIDX="${MEMORY_INDEX_BIN:-$HOME/.local/bin/memory-index}"
 CLAUDE="${CLAUDE_BIN:-claude}"
 # Hooks can run with a minimal PATH; fall back to the usual install location.
 command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE="$HOME/.local/bin/claude"
-# Offline distillation is a comprehension-heavy summarisation task — run it on a
-# capable model so nuance survives condensation. Override with MEMORY_MODEL.
+# Distillation runs on a capable model. Override with MEMORY_MODEL.
 MODEL="${MEMORY_MODEL:-claude-sonnet-5}"
 WS="$HOME/.claude/memory"
 LOCKDIR="$WS/.consolidate.lock.d"
 LOG="$WS/.consolidate.log"
 TODAY="$(date +%F)"
 
-# Never recurse: the headless agent we spawn starts its own Claude session (and
-# fires the SessionStart hook); that must not launch us again. The hook guards on
-# this too — belt and braces.
+# Never recurse: the spawned agent starts its own Claude session (and fires the
+# SessionStart hook); that must not launch us again. The hook guards on this too.
 [ -n "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] && exit 0
 
 [ -x "$MEMIDX" ] || exit 0
@@ -90,9 +86,8 @@ if ! command -v "$CLAUDE" >/dev/null 2>&1; then
   exit 0
 fi
 
-# Build the task list from whichever backlogs are non-empty. One agent, one pass, handles
-# all three kinds of compaction: distilling journals, splitting oversized leaves, pruning
-# dead ones.
+# Build the task list from whichever backlogs are non-empty: distilling journals,
+# splitting oversized leaves, pruning dead ones.
 tasks=""
 [ -n "$pend" ] && tasks="${tasks}
 JOURNALS — distill these aged journals (older than the 5 most recent, not yet consolidated): $pend
