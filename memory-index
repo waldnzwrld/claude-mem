@@ -6,8 +6,9 @@ The outl markdown graph at ~/.claude/memory is the sole source of truth. This to
 builds a DERIVED, disposable SQLite index over it (Porter-stemmed, field-weighted FTS5
 keyword + a typed/weighted link/edge table), then walks outward along [[links]] via a
 recursive graph traversal. The index is never authoritative: delete it and `rebuild`
-reconstructs it from the markdown. Edges are a pure projection of the files — type is
-inferred from link wording, never annotated in the markdown.
+reconstructs it from the markdown. Edges are a pure projection of the files — their type is
+either AUTHORED (a frontmatter prop naming the relationship, e.g. `supersedes:: [[x]]`) or,
+for a bare inline [[link]], INFERRED from the wording of its line; authored beats inferred.
 
 Commands:
   memory-index rebuild            Full reindex from markdown (idempotent).
@@ -57,27 +58,31 @@ FRECENCY_BUMP = 5   # per AGENTS.md: a material use credits +5 (see `touch`)
 RETENTION_COUNT = 5  # keep the 5 most recent journal files; anything older is aged out
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-# Retrieval-graph heals (see cmd_medic). Each prunes pathological edges from the DERIVED
-# edge table only — the markdown source is never touched. `dangling` + `selfloop` are
-# unambiguously performance/precision-positive and are the medic default; `caphubs` and
-# `superseded` are more aggressive and opt-in. The active set is stored in meta so every
-# rebuild/refresh (incl. the SessionStart hook's) re-applies it and the graph stays healthy.
+# Section-level frecency: decays each `## section` of a leaf independently, so a stale note
+# in a live leaf ages out on its own (prune candidate). Credit signal is the search HIT
+# (resolves to a `slug › heading`, +HIT); a page_get gives every section only +PAGEGET.
+# Decayed −1/day. Ledger lives outside .outl/ (survives rebuild); keyed by (slug, heading).
+SECTION_SEED = 30
+SECTION_CAP = 60
+SECTION_PAGEGET_BUMP = 2   # whole-page fetch: weak per-section evidence
+SECTION_HIT_BUMP = 1       # a search hit resolved to this exact section
+SECTION_PRUNE = 0          # a section at/below this is a prune candidate
+
+# Retrieval-graph heals (see cmd_medic): prune pathological edges from the DERIVED edge
+# table only (markdown untouched). `dangling`+`selfloop` are the safe default; `caphubs`
+# and `superseded` are opt-in. Active set stored in meta, re-applied on every rebuild/refresh.
 HEAL_DEFAULT = "dangling,selfloop"
 FRECENCY_RISK = 5  # a knowledge leaf at/below this frecency is nearing prune (seed is 30)
 
-# Split-on-growth (per AGENTS.md): a `type:: knowledge` leaf whose body is estimated to cost
-# more than this many tokens to load should be carved into a TOC + `<slug>-<section>` child
-# leaves. Estimated as len(body)//CHARS_PER_TOKEN — what an outl_page_get actually spends —
-# not by lines/words, which undercount markup- and code-heavy pages. ~1800 ≈ 3.5× the median
-# leaf, the point where loading the whole page clearly beats descending a TOC. Env-tunable.
+# Split-on-growth: a knowledge leaf whose body costs more than this many tokens to load
+# should be carved into a TOC + `<slug>-<section>` child leaves. Estimated as
+# len(body)//CHARS_PER_TOKEN. Env-tunable via MEMORY_SPLIT_TOKENS.
 CHARS_PER_TOKEN = 4
 SPLIT_TOKENS = int(os.environ.get("MEMORY_SPLIT_TOKENS", "1800"))
 
-# A small closed-class stopword set. Stripped from FTS queries so a full-sentence query
-# (e.g. one pushed straight from a user prompt) is not OR'd token-by-token into low-IDF
-# noise that pollutes bm25 ranking. Deliberately tiny — only words that carry no recall
-# signal — so it never drops a real content term. If a query is ALL stopwords, the caller
-# falls back to the raw terms rather than matching nothing.
+# Closed-class stopwords, stripped from FTS queries so a full-sentence query is not OR'd
+# into low-IDF noise. Tiny by design. If a query is ALL stopwords, the caller falls back
+# to the raw terms.
 STOPWORDS = frozenset("""
 a an and the or of to in is are was were be been being for on with as at by it its this
 that these those i you we they he she my our your their from about into if then than so
@@ -89,10 +94,8 @@ FM_RE = re.compile(r"^([A-Za-z_][\w-]*)::\s?(.*)$")
 LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 SECTION_RE = re.compile(r"^\s*-\s+(#{1,6})\s+(.*)$")  # a bullet whose text is a heading
 
-# Frontmatter keys that MUST be hoisted (parse_md only reads `key:: value` lines ABOVE the
-# first bullet). When one of these appears as a body bullet instead, the parser — and so the
-# index, maintain, and touch — never sees it, and the page silently falls out of tracking
-# (e.g. a leaf missing `type:: knowledge` is invisible to the frecency sweep). doctor flags it.
+# Frontmatter keys that MUST be hoisted (parse_md reads `key:: value` only above the first
+# bullet). If one appears as a body bullet, the page falls out of tracking. doctor flags it.
 HOISTABLE_KEYS = ("type", "frecency", "seen", "parent", "project", "summary",
                   "updated", "tags", "status", "pin", "source", "icon", "aliases")
 PROP_BULLET_RE = re.compile(
@@ -274,14 +277,19 @@ def chunk_body(fm: dict, body: list[str]):
     return chunks
 
 
-# Edge-type inference: the markdown is never annotated with a link type, so the type is
-# derived from the wording of the line the [[link]] sits on. First keyword group to match
-# wins; otherwise a plain 'refs'.
+# Edge typing, authored beating inferred:
+#   * AUTHORED: a frontmatter prop naming the relationship (e.g. `supersedes:: [[x]]`).
+#   * INFERRED: for a bare body [[link]], guessed from the line's wording, else 'refs'.
+# One edge per (src, target): the highest-precedence type wins.
 EDGE_TYPES = (
     ("supersedes",  ("supersede", "replaces", "replace", "obsoletes", "deprecates")),
     ("contradicts", ("contradict", "conflicts", "conflict", "disagrees", "refutes")),
     ("part-of",     ("part of", "parent", "belongs to", "under ", "child of", "subpage")),
 )
+TYPE_PRECEDENCE = {"supersedes": 3, "contradicts": 2, "part-of": 1, "refs": 0}
+# Frontmatter keys whose [[slug]] value(s) are AUTHORED typed edges (key -> edge type).
+AUTHORED_EDGE_KEYS = {"supersedes": "supersedes", "contradicts": "contradicts",
+                      "parent": "part-of"}
 
 
 def _edge_type(line: str) -> str:
@@ -292,19 +300,37 @@ def _edge_type(line: str) -> str:
     return "refs"
 
 
-def links_in(body: list[str]) -> dict[tuple[str, str], int]:
-    """Map every [[link]] to a typed, weighted edge. Type is INFERRED from the line's
-    wording (see EDGE_TYPES; else 'refs'); weight is the link's multiplicity within the
-    page. Returns {(target, type): weight}."""
-    out: dict[tuple[str, str], int] = {}
+def _targets(text: str):
+    for m in LINK_RE.finditer(text or ""):
+        target = m.group(1).split("|")[0].split("#")[0].strip()
+        if target:
+            yield target
+
+
+def links_in(fm: dict, body: list[str]) -> dict[str, tuple[str, int]]:
+    """Collapse a page's [[links]] to one typed, weighted edge PER TARGET. Returns
+    {target: (type, weight)} where weight is the link's multiplicity within the page and
+    type is the highest-precedence type seen for that target — authored frontmatter edges
+    (AUTHORED_EDGE_KEYS) beating the wording-inferred type of inline body links."""
+    typ: dict[str, str] = {}   # target -> best type so far
+    wt: dict[str, int] = {}    # target -> link multiplicity
+
+    def consider(target: str, etype: str, authored: bool):
+        wt[target] = wt.get(target, 0) + 1
+        cur = typ.get(target)
+        # Authored type always wins; otherwise higher precedence wins.
+        if cur is None or authored or TYPE_PRECEDENCE[etype] > TYPE_PRECEDENCE[cur]:
+            typ[target] = etype
+
     for ln in body:
         etype = _edge_type(ln)
-        for m in LINK_RE.finditer(ln):
-            target = m.group(1).split("|")[0].split("#")[0].strip()
-            if target:
-                key = (target, etype)
-                out[key] = out.get(key, 0) + 1
-    return out
+        for target in _targets(ln):
+            consider(target, etype, authored=False)
+    for key, etype in AUTHORED_EDGE_KEYS.items():
+        for target in _targets(fm.get(key, "")):
+            consider(target, etype, authored=True)
+
+    return {t: (typ[t], wt.get(t, 1)) for t in typ}
 
 
 def sha256_text(s: str) -> str:
@@ -406,9 +432,8 @@ def _index_files(con, ws: str, files, full: bool):
         )
         page_title = fm.get("title") or ""
         for heading, text in chunk_body(fm, body):
-            # Put the page title in the weighted `title` column ONLY on the synthetic
-            # summary chunk. Denormalizing it onto every chunk would make the title term
-            # appear corpus-wide, crushing its IDF.
+            # Title goes in the weighted `title` column only on the synthetic summary chunk;
+            # on every chunk it would crush the title term's IDF.
             fts_title = page_title if heading == "(summary)" else ""
             cur = con.execute(
                 "INSERT INTO chunks(slug,title,heading,anchor,text) VALUES(?,?,?,?,?)",
@@ -418,7 +443,7 @@ def _index_files(con, ws: str, files, full: bool):
                 "INSERT INTO chunks_fts(rowid, title, heading, text) VALUES(?,?,?,?)",
                 (cur.lastrowid, fts_title, heading, text),
             )
-        for (dst, etype), weight in links_in(body).items():
+        for dst, (etype, weight) in links_in(fm, body).items():
             con.execute(
                 "INSERT OR IGNORE INTO edges(src,dst,type,weight) VALUES(?,?,?,?)",
                 (slug, dst, etype, weight),
@@ -470,6 +495,9 @@ def _graph_expand(con, seeds, depth: int, limit: int):
         SELECT slug, depth, weight, type, via
         FROM ranked
         WHERE rn = 1 AND slug NOT IN (SELECT slug FROM seed)
+          -- Type-aware: a page something supersedes is stale, so association never
+          -- surfaces it (the supersedes edge steers the walk, not just labels it).
+          AND slug NOT IN (SELECT dst FROM edges WHERE type='supersedes')
         ORDER BY depth ASC, weight DESC
         LIMIT ?
     """
@@ -504,7 +532,8 @@ def _keyword_hits(con, query: str, k: int):
         return []
 
 
-def cmd_search(ws: str, query: str, k: int, no_graph: bool, as_json: bool = False):
+def cmd_search(ws: str, query: str, k: int, no_graph: bool, as_json: bool = False,
+               credit: bool = False):
     con = _open_current(ws)
     init_schema(con)
     depth = _auto_depth(con)
@@ -526,11 +555,30 @@ def cmd_search(ws: str, query: str, k: int, no_graph: bool, as_json: bool = Fals
             label = f"(via {via} · {etype} · {d}h ·w{weight})"
             results.append(("link", cand, label, summary, 0.0))
 
+    # Section-frecency credit: a keyword hit resolved to an exact `slug › heading`. Opt-in
+    # (push-retrieval hook passes --credit); graph 'link' rows have no section, so skip.
+    if credit:
+        today = datetime.date.today().isoformat()
+        sfrec = _load_sfrec(ws)
+        dirty = False
+        for kind, slug, heading, _text, _score in results:
+            if kind != "hit" or heading in ("(summary)", "(top)"):
+                continue
+            try:  # section frecency is knowledge-leaves only; skip journal/TOC hits
+                fm, _b, _r = parse_md(os.path.join(ws, "pages", f"{slug}.md"))
+            except Exception:
+                continue
+            if (fm.get("type") or "").strip() != "knowledge":
+                continue
+            _bump_sections(sfrec, slug, [heading], SECTION_HIT_BUMP, today)
+            dirty = True
+        if dirty:
+            _save_sfrec(ws, sfrec)
+
     if as_json:
-        # Machine shape for programmatic callers (e.g. the UserPromptSubmit push-retrieval
-        # hook), so gating/dedupe live in the caller, not in scraped human text. `score` is
-        # raw bm25 for keyword hits (lower == better; graph rows carry null) and `heading`
-        # on a graph row is the `(via … · type · Nh · wW)` provenance label.
+        # Machine shape for programmatic callers (push-retrieval hook), so gating/dedupe
+        # live in the caller. `score` is raw bm25 for keyword hits (null for graph rows);
+        # `heading` on a graph row is the provenance label.
         out = {"query": query, "depth": depth, "results": [
             {"kind": kind, "slug": slug, "heading": heading,
              "snippet": " ".join(text.split())[:200],
@@ -544,10 +592,9 @@ def cmd_search(ws: str, query: str, k: int, no_graph: bool, as_json: bool = Fals
 
 
 def _fts_query(q: str) -> str:
-    # OR the terms so paraphrase-ish queries still match; each is a PREFIX token ("term"*)
-    # so "consol" reaches "consolidation". The Porter tokenizer additionally stems both
-    # sides, so morphological variants collapse before prefixing. Quote to stay safe
-    # against FTS5 operator characters in the raw query.
+    # OR the terms (paraphrase-ish queries still match); each is a PREFIX token ("term"*)
+    # so "consol" reaches "consolidation". Porter stems both sides. Quote to stay safe
+    # against FTS5 operator characters.
     terms = re.findall(r"[A-Za-z0-9_]+", q)
     kept = [t for t in terms if t.lower() not in STOPWORDS and len(t) > 1]
     kept = kept or terms  # all-stopword query: fall back to raw terms rather than match nothing
@@ -772,6 +819,11 @@ def cmd_doctor(ws: str, as_json: bool):
     print(f"superseded: {len(h['superseded_targets'])} target(s)  {_cap(h['superseded_targets'])}")
     fr = [f"{d['slug']}({d['frecency']})" for d in h["frecency_risk"]]
     print(f"decay-risk: {len(fr)} leaf/leaves ≤{FRECENCY_RISK}  {_cap(fr)}")
+    srisk = sorted(f"{slug}›{hdg}({int(rec.get('f', SECTION_SEED))})"
+                   for slug, secs in _load_sfrec(ws).items()
+                   for hdg, rec in secs.items()
+                   if int(rec.get("f", SECTION_SEED)) <= FRECENCY_RISK)
+    print(f"sec-decay : {len(srisk)} section(s) ≤{FRECENCY_RISK}  {_cap(srisk)}")
     up = h["unhoisted_props"]
     up_disp = [f"{s}({','.join(k)})" for s, k in up.items()]
     print(f"unhoisted : {len(up)} page(s) with props as body bullets  {_cap(up_disp)}")
@@ -911,6 +963,48 @@ def _truthy(v) -> bool:
     return str(v).strip().lower() in ("true", "1", "yes")
 
 
+# ---------------------------------------------- section-level frecency (ledger)
+# A ws-level JSON ledger {slug: {heading: {"f": frecency, "seen": date}}}. Lives outside
+# .outl/ so `rebuild` never wipes it. See the SECTION_* constants for the decay/credit model.
+def _sfrec_path(ws: str) -> str:
+    return os.path.join(ws, ".frecency", "sections.json")
+
+
+def _load_sfrec(ws: str) -> dict:
+    try:
+        with open(_sfrec_path(ws), "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_sfrec(ws: str, data: dict):
+    path = _sfrec_path(ws)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, separators=(",", ":"), sort_keys=True)
+    os.replace(tmp, path)  # atomic
+
+
+def _page_sections(fm: dict, body: list[str]) -> list[str]:
+    """A page's real `## section` headings — the unit section-frecency tracks. These are the
+    chunk_body headings minus the synthetic '(summary)' and the pre-heading '(top)' bucket."""
+    return [h for h, _t in chunk_body(fm, body) if h not in ("(summary)", "(top)")]
+
+
+def _bump_sections(sfrec: dict, slug: str, headings, amount: int, today: str):
+    """Credit a use: each named section's frecency += amount (seed SECTION_SEED if new,
+    saturating at SECTION_CAP), seen = today. Mutates sfrec in place."""
+    page = sfrec.setdefault(slug, {})
+    for h in headings:
+        rec = page.get(h) or {"f": SECTION_SEED, "seen": ""}
+        rec["f"] = min(SECTION_CAP, int(rec.get("f", SECTION_SEED)) + amount)
+        rec["seen"] = today
+        page[h] = rec
+
+
 def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
     """Daily frecency sweep, per AGENTS.md. For each non-pinned `type:: knowledge`
     leaf not already decayed today: frecency -= 1 (seed 30 if unset), set seen=today.
@@ -923,22 +1017,24 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
         return 3
 
     decayed, candidates, skipped, split_cands = [], [], 0, []
+    sfrec = _load_sfrec(ws)
+    live_sections: dict[str, set] = {}   # knowledge-leaf slug -> its current section set (for GC)
+    section_prune: list[str] = []        # "slug › heading" for sections that reached SECTION_PRUNE
     for slug, kind, path in iter_source_files(ws):
         if kind != "page":
             continue
-        fm, _body, _raw = parse_md(path)
+        fm, body, _raw = parse_md(path)
         typ = (fm.get("type") or "").strip()
-        # Split-on-growth applies to EVERY page — hub or leaf ("keep every page small"): flag
-        # any page whose load would cost more than SPLIT_TOKENS. Size proxy is the .md
-        # projection's byte size — what an outl_page_get actually renders — since parse_md's
-        # `body` is a thin projection, not the block content. Detection only; the carve (a leaf
-        # into child leaves, or an overgrown TOC into grouped sub-TOCs) is the agent's call.
+        # Split-on-growth applies to EVERY page (hub or leaf): flag any whose load costs more
+        # than SPLIT_TOKENS. Size proxy is the .md byte size. Detection only; the carve is the agent's call.
         est_tok = os.path.getsize(path) // CHARS_PER_TOKEN
         if est_tok > SPLIT_TOKENS:
             split_cands.append({"slug": slug, "tokens": est_tok, "type": typ or "?"})
         # Frecency decay + prune-candidate reporting apply only to knowledge leaves.
         if typ != "knowledge":
             continue
+        sects = _page_sections(fm, body)
+        live_sections[slug] = set(sects)  # recorded for ALL knowledge leaves (even pinned/seen)
         if _truthy(fm.get("pin")):
             skipped += 1
             continue
@@ -954,6 +1050,31 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
         decayed.append({"slug": slug, "from": old, "to": new})
         if new <= 0:
             candidates.append(slug)
+        # Section decay, in lockstep with the page sweep (same pin/seen guards). Each section −1
+        # unless decayed today; one reaching SECTION_PRUNE is a prune candidate (remove that subtree).
+        page = sfrec.setdefault(slug, {})
+        for h in sects:
+            rec = page.get(h) or {"f": SECTION_SEED, "seen": ""}
+            if rec.get("seen") == today:
+                continue
+            rec["f"] = int(rec.get("f", SECTION_SEED)) - 1
+            rec["seen"] = today
+            page[h] = rec
+            if rec["f"] <= SECTION_PRUNE:
+                section_prune.append(f"{slug} › {h}")
+
+    # GC the ledger: drop pages no longer live knowledge leaves, and headings a leaf no longer has.
+    for slug in list(sfrec.keys()):
+        if slug not in live_sections:
+            del sfrec[slug]
+            continue
+        for h in list(sfrec[slug].keys()):
+            if h not in live_sections[slug]:
+                del sfrec[slug][h]
+        if not sfrec[slug]:
+            del sfrec[slug]
+    if not dry_run:
+        _save_sfrec(ws, sfrec)
 
     split_cands.sort(key=lambda d: d["tokens"], reverse=True)
     result = {
@@ -961,6 +1082,7 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
         "dry_run": dry_run,
         "decayed": decayed,
         "prune_candidates": candidates,
+        "section_prune_candidates": sorted(set(section_prune)),
         "split_candidates": split_cands,
         "skipped": skipped,
     }
@@ -973,6 +1095,9 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
             print(f"  {d['slug']}: {d['from']} → {d['to']}")
         if candidates:
             print(f"prune candidates (frecency ≤ 0, review per AGENTS.md): {', '.join(candidates)}")
+        if result["section_prune_candidates"]:
+            print(f"section prune candidates (section frecency ≤ {SECTION_PRUNE}; remove the "
+                  f"subtree, not the leaf): {', '.join(result['section_prune_candidates'])}")
         if split_cands:
             pretty = ", ".join(f"{d['slug']} (~{d['tokens']} tok)" for d in split_cands)
             print(f"split candidates (body > {SPLIT_TOKENS} tok, review per AGENTS.md 'Split on growth'): {pretty}")
@@ -990,12 +1115,14 @@ def cmd_touch(ws: str, slugs, today: str, bump: int, as_json: bool):
         print("memory-index touch: outl binary not found; cannot write props", file=sys.stderr)
         return 3
     touched, skipped = [], []
+    sfrec = _load_sfrec(ws)
+    sfrec_dirty = False
     for slug in slugs:
         path = os.path.join(ws, "pages", f"{slug}.md")
         if not os.path.exists(path):
             skipped.append(slug)
             continue
-        fm, _body, _raw = parse_md(path)
+        fm, body, _raw = parse_md(path)
         if (fm.get("type") or "").strip() != "knowledge":
             skipped.append(slug)
             continue
@@ -1005,6 +1132,12 @@ def cmd_touch(ws: str, slugs, today: str, bump: int, as_json: bool):
         _outl_prop(outl, ws, slug, "frecency", str(new))
         _outl_prop(outl, ws, slug, "seen", today)
         touched.append({"slug": slug, "from": old, "to": new})
+        # Whole-page fetch is weak per-section evidence: bump every section a little. A search
+        # HIT credits the exact section more precisely (see cmd_search --credit).
+        _bump_sections(sfrec, slug, _page_sections(fm, body), SECTION_PAGEGET_BUMP, today)
+        sfrec_dirty = True
+    if sfrec_dirty:
+        _save_sfrec(ws, sfrec)
     if touched:
         cmd_refresh(ws, None, quiet=True)  # reflect the bumped frontmatter in the index
     result = {"date": today, "bump": bump, "touched": touched, "skipped": skipped}
@@ -1125,6 +1258,8 @@ def main(argv=None):
     sp.add_argument("-k", type=int, default=6)
     sp.add_argument("--no-graph", action="store_true")
     sp.add_argument("--json", action="store_true", help="machine-readable results (for hooks)")
+    sp.add_argument("--credit", action="store_true",
+                    help="credit section frecency for each keyword hit's section (for the push hook)")
     ss = sub.add_parser("stats")
     ss.add_argument("--json", action="store_true")
     st = sub.add_parser("touch", help="credit a use: frecency += bump on the named knowledge leaves")
@@ -1162,7 +1297,7 @@ def main(argv=None):
     elif args.cmd == "refresh":
         cmd_refresh(ws, args.threshold)
     elif args.cmd == "search":
-        cmd_search(ws, args.query, args.k, args.no_graph, args.json)
+        cmd_search(ws, args.query, args.k, args.no_graph, args.json, args.credit)
     elif args.cmd == "stats":
         cmd_stats(ws, args.threshold, args.json)
     elif args.cmd == "touch":

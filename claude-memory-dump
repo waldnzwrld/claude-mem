@@ -28,8 +28,7 @@ LOG="$WS/.dump.log"
 MIN_LINES="${MEMORY_DUMP_MIN_LINES:-8}"   # skip trivial sessions
 TRANSCRIPT="${MEMORY_DUMP_TRANSCRIPT:-${1:-}}"
 
-# Never recurse: the spawned agent starts its own Claude session, whose SessionEnd
-# would fire this again. The hook guards on this too.
+# Never recurse: the spawned agent's SessionEnd must not refire this. The hook guards this too.
 [ -n "${MEMORY_DUMP_ACTIVE:-}" ] && exit 0
 [ -n "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] && exit 0
 
@@ -38,7 +37,7 @@ TRANSCRIPT="${MEMORY_DUMP_TRANSCRIPT:-${1:-}}"
 [ -d "$WS" ] || exit 0
 command -v "$CLAUDE" >/dev/null 2>&1 || exit 0
 
-# Skip trivial sessions; line count is a schema-agnostic proxy for meaningful work.
+# Skip trivial sessions; line count proxies meaningful work.
 lines="$(wc -l < "$TRANSCRIPT" 2>/dev/null | tr -d ' ')"
 case "$lines" in ''|*[!0-9]*) lines=0 ;; esac
 [ "$lines" -ge "$MIN_LINES" ] || exit 0

@@ -80,12 +80,20 @@ You never choose the regime; it's gated on node count.
   library only: no third-party packages, no venv, no build step, so it just works on any
   machine that has Python. Delete it and `memory-index rebuild` reconstructs it from the
   markdown. The markdown graph remains the only authority.
-- **Edges carry meaning, and it's derived — the markdown is never annotated.** Each edge has
-  a `type` (`refs` by default, or `supersedes` / `contradicts` / `part-of`) inferred from the
-  wording of the line the link sits on, and a `weight` = how many times src links dst. You do
-  nothing to produce this; keep authoring plain `[[links]]`, one relation per bullet (line-
-  granular inference tags every link on a line alike). A schema bump self-heals: a stale index
-  is rebuilt automatically on the next read.
+- **Edges carry a typed relationship, authored or inferred.** Each edge has a `type` (`refs`
+  by default, or `supersedes` / `contradicts` / `part-of`) and a `weight` (link multiplicity),
+  and exactly one edge is kept per src→dst (the highest-precedence type). Typing has two
+  sources, **authored beating inferred**:
+  - **Authored (authoritative):** a frontmatter prop that names the relationship, its value one
+    or more `[[slug]]` links — `supersedes:: [[old-note]]`, `contradicts:: [[other]]`,
+    `parent:: [[toc]]` (→ `part-of`). State the type here when you mean it; the keyword guess
+    never overrides it. Prefer this for any real supersede/contradict relation.
+  - **Inferred (fallback):** a bare inline `[[link]]` takes its type from the wording of its
+    line (line-granular — every link on a line is tagged alike), else `refs`.
+- **Type steers the walk, it isn't just a label.** A page that something `supersedes` is stale,
+  so association never surfaces it — the graph walk skips superseded targets. (The opt-in
+  `medic --prune-superseded` heal additionally drops plain refs into them.) You do nothing to
+  produce edges beyond authoring links/props; a schema bump self-heals on the next read.
 - **The SessionStart hook injects whether the index is ACTIVE.** When it is, retrieve like
   this: run **`memory-index search "<query terms>"`** *first* to land directly on the narrow
   relevant band — keyword (FTS5/bm25) ranking that returns `slug › heading` pointers, **then**
@@ -395,6 +403,28 @@ real-but-occasional knowledge survives, short enough that stale detail clears ou
   decay and pruning entirely.
 - Optional: order each TOC's link list by `frecency` (high → low) so the most-used
   pathways surface first.
+
+**Section-level frecency (within a leaf).** Page frecency ages out a whole leaf; section
+frecency ages out an individual `## section` of a leaf, so a stale note inside an otherwise
+live leaf clears on its own instead of riding the leaf's score. Same model, one granularity
+down:
+
+- **Unit & store.** Granularity is the `## section` (the unit the index chunks and a search
+  hit resolves to). Scores live in a ws-level ledger `~/.claude/memory/.frecency/sections.json`
+  keyed `{slug: {heading: {f, seen}}}` — **outside** `.outl/`, so `rebuild` never wipes it. It
+  is a usage signal, not knowledge: if lost, sections just reseed at 30. **Never hand-edit it**;
+  `memory-index` owns it.
+- **Credit (the attribution the whole-page fetch can't give).** A whole-page `outl_page_get`
+  is weak evidence, so it bumps *every* section of the page only **+2**. The precise signal is
+  the **search hit**: it resolves to an exact `slug › heading`, so the push-retrieval hook's
+  `memory-index search --credit` bumps just that section **+1** (seed 30, cap 60).
+- **Decay & prune.** The same daily `maintain` sweep decays each section **−1** in lockstep
+  with its leaf (pin/`seen`-guarded), GCs headings that no longer exist, and surfaces any
+  section that reached **0** as a *section prune candidate* (`slug › heading`). Pruning one
+  removes **just that section's subtree** (`outl_block_delete` the heading block + descendants),
+  never the whole leaf, preserving crosslinks into sibling sections — the background compaction
+  agent does this, or the injected `⚠` directive is the fallback. `doctor` shows a `sec-decay`
+  line; a rename reseeds that section (acceptable for a usage ledger).
 
 Scale: a fresh leaf (seed 30) survives ~30 idle days; each use adds ~5 days; a
 heavily-used leaf rides at the 60-day cap. Deletion here is intentional and unrecoverable,
