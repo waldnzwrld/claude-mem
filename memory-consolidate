@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 #
-# memory-consolidate — automatic, headless distillation of aged journals.
+# memory-consolidate — automatic, headless compaction of the memory graph.
 #
-# Consolidation has two halves. Reaping (deleting aged journals already marked
-# `consolidated::`) is mechanical — `memory-index consolidate --reap` does it.
-# Distillation — synthesising a journal's items into knowledge leaves — needs an
-# LLM. This script is that LLM step, run WITHOUT any interactive prompting: it
-# spawns a detached, headless `claude -p` agent that distills every aged,
-# un-distilled journal per ~/.claude/memory/AGENTS.md and marks each
-# `consolidated:: <today>`, then reaps. The SessionStart hook backgrounds this
-# whenever an aged journal exists, so the backlog clears on its own, on any
-# machine this repo is installed on — no one has to remember to run it.
+# One headless agent keeps the whole graph lean, with no interactive prompting.
+# It handles three backlogs in a single pass:
+#   * journals — distil aged, un-`consolidated::` journals into knowledge leaves,
+#     mark each `consolidated:: <today>`, then reap (delete) the marked ones.
+#   * split    — carve a `type:: knowledge` leaf grown past the load budget
+#     (MEMORY_SPLIT_TOKENS) into a TOC + `<slug>-<section>` child leaves.
+#   * prune    — delete (soft/recoverable) a leaf whose frecency decayed to 0,
+#     after cleaning up its parent-TOC link, or bump it if it still earns a place.
+# Reaping and candidate detection are mechanical (`memory-index`); the distil,
+# split, and keep-vs-delete calls need an LLM, so this spawns a detached,
+# headless `claude -p` agent per ~/.claude/memory/AGENTS.md. The SessionStart hook
+# backgrounds this whenever any backlog exists, so the graph keeps itself lean on
+# its own, on any machine — no one ever has to ask for a trim or a cleanup.
 #
 # Safe to run any time and repeatedly: it no-ops when nothing is pending,
 # single-instances via a lock, and refuses to recurse into the agent it spawns.
@@ -54,38 +58,67 @@ except Exception:
 
 pend="$(pending)"
 
-# Nothing to distill — still reap anything already marked, then done.
-if [ -z "$pend" ]; then
+# Tree-compaction candidates: leaves to split (over the load budget) and leaves to prune
+# (frecency decayed to 0). The SessionStart hook passes the authoritative sweep JSON via
+# MEMORY_CONSOLIDATE_SWEEP (that run already decayed frecency+seen, so a re-computed prune
+# list would be empty); standalone, fall back to a dry-run sweep.
+sweep="${MEMORY_CONSOLIDATE_SWEEP:-}"
+[ -z "$sweep" ] && sweep="$("$MEMIDX" -w "$WS" maintain --dry-run --json 2>/dev/null)"
+split_slugs="$(printf '%s' "$sweep" | python3 -c 'import sys, json
+try:
+    c = json.load(sys.stdin).get("split_candidates", [])
+except Exception:
+    c = []
+print(" ".join(d["slug"] if isinstance(d, dict) else d for d in c))' 2>/dev/null)"
+prune_slugs="$(printf '%s' "$sweep" | python3 -c 'import sys, json
+try:
+    v = json.load(sys.stdin).get("prune_candidates", [])
+except Exception:
+    v = []
+print(" ".join(v))' 2>/dev/null)"
+
+# Nothing to do at all — still reap anything already marked, then done.
+if [ -z "$pend" ] && [ -z "$split_slugs" ] && [ -z "$prune_slugs" ]; then
   "$MEMIDX" -w "$WS" consolidate --reap >/dev/null 2>&1 || true
   exit 0
 fi
 
-# Distillation needs the CLI. If it's absent, leave the journals for the hook's
-# interactive fallback directive rather than losing them.
-command -v "$CLAUDE" >/dev/null 2>&1 || exit 0
+# The LLM work below needs the CLI. If it's absent, reap what is already marked and leave
+# the rest for the hook's interactive fallback directives rather than losing anything.
+if ! command -v "$CLAUDE" >/dev/null 2>&1; then
+  "$MEMIDX" -w "$WS" consolidate --reap >/dev/null 2>&1 || true
+  exit 0
+fi
 
-prompt="You are running headless as the memory-system consolidation agent. Do ONLY the task below, then stop — ignore everything else.
+# Build the task list from whichever backlogs are non-empty. One agent, one pass, handles
+# all three kinds of compaction: distilling journals, splitting oversized leaves, pruning
+# dead ones.
+tasks=""
+[ -n "$pend" ] && tasks="${tasks}
+JOURNALS — distill these aged journals (older than the 5 most recent, not yet consolidated): $pend
+  Follow the Condensation section of AGENTS.md exactly. For EACH date: (1) outl_daily_get and read it; (2) cluster items by the [[page]]/topic they concern — an item already marked #in-deep [[leaf]] was written through when authored, so do NOT re-merge it, just verify the leaf still carries it and list that leaf in the date's distilled-into evidence; (3) tier every remaining cluster: DROP ephemeral git/branch/working-tree/status/session-local notes outright, promote-or-drop borderline items DELIBERATELY, and for each lasting cluster (cross-repo relationships, plan state, decisions+why, gotchas, durable user facts — but not what the repo/git/CLAUDE.md already holds) descend to the right knowledge leaf (create a leaf or split a crowded TOC as needed) and merge the DISTILLED points (synthesise, never paste, never duplicate a point already there); refresh updated::/summary::, ensure project::/parent:: and back-links, touch frecency (new leaf seeds frecency:: 30; a merge is +5 capped 60) and set seen:: $TODAY; (4) add any new leaf/TOC's one-line [[link]]+hook to its parent TOC (and to index for a new top-level topic); (5) as the LAST actions for that date, record evidence then mark done: outl_page_prop_set <date> distilled-into=\"[[a]] [[b]]\" (every leaf merged into; =none if nothing durable), then outl_page_prop_set <date> consolidated=$TODAY. Do NOT delete journals — reaping is automatic once consolidated:: is set. Finally refresh index: bump updated:: and trim Recent journals to the retention window."
+[ -n "$split_slugs" ] && tasks="${tasks}
+PAGES TO SPLIT (any page — a content leaf OR a TOC/hub — whose body now costs more than the load budget to read): $split_slugs
+  For EACH, follow the 'Split on growth' rule in AGENTS.md, so that NO page stays oversized and the graph is still navigable in a few hops:
+   - A content LEAF (type:: knowledge): carve its sections into child leaf documents named <slug>-<section>, move the DETAIL down into those children, and leave in the (now type:: moc) parent one concise one-line [[link]]+hook per child. Give each child full leaf frontmatter (type:: knowledge, project::, parent:: [[the new toc]], updated:: $TODAY, summary::, frecency:: 30, seen:: $TODAY).
+   - A HUB (type:: moc) that has grown too big: group its child entries into a few coherent sub-topics, create a sub-TOC (type:: moc, named <slug>-<group>) for each group, move those entries' [[link]]s+hooks down into the matching sub-TOC, and leave in the parent one [[link]]+hook per sub-TOC. The parent stays a thin index OF sub-TOCs; set parent:: on each new sub-TOC and keep every back-link intact.
+  Either way: preserve every fact and every crosslink (no dangling links, no orphans), and re-point the page's own parent-TOC entry if its role changed. If a page genuinely has no clean split seam, LEAVE it and say so."
+[ -n "$prune_slugs" ] && tasks="${tasks}
+LEAVES TO PRUNE (frecency decayed to 0 — unused for ~a month): $prune_slugs
+  For EACH, follow the 'Frecency & pruning' section of AGENTS.md. Decide deliberately: if the leaf still holds durable value, do NOT delete it — bump its frecency (outl_page_prop_set <slug> frecency=<n>) and set seen:: $TODAY. Only if it is genuinely dead weight, FIRST remove its [[link]] from the parent TOC (and any other page linking it, so no dangling link is left), THEN outl_page_delete <slug> (a soft, recoverable move to trash). NEVER delete a type:: moc that still has >=1 live child, and never delete a pin:: true leaf."
 
-Distill these aged journals, which are older than the 5 most recent journals and are not yet consolidated: $pend
+prompt="You are running headless as the memory-system compaction agent. Do ONLY the tasks below, then stop — ignore everything else. Work entirely within the outl memory graph at ~/.claude/memory; do NOT touch code, git, or anything outside it. Read the named sections of ~/.claude/memory/AGENTS.md and follow them exactly.
+$tasks
 
-Follow the Condensation section of ~/.claude/memory/AGENTS.md exactly. For EACH date:
-  1. outl_daily_get <date> and read the raw journal.
-  2. Cluster its items by the [[page]]/topic they concern. Any item already marked #in-deep [[leaf]] was written through to deep memory when authored — do NOT re-merge it; just verify the named leaf still carries the fact and include that leaf in this journal's distilled-into evidence (step 5).
-  3. Tier every remaining cluster first. DROP ephemeral items outright: transient git/branch/working-tree state, currently-doing status, session-local notes (e.g. \"branch X has uncommitted changes\" never becomes a leaf). For BORDERLINE items whose durability is genuinely uncertain, apply 'What long-term memory is for' and promote-or-drop DELIBERATELY — do not reflexively keep. For each cluster with lasting value — KEEP cross-repo relationships, long-running plan state, decisions + their why, non-obvious gotchas, durable user facts; DROP anything the repo, its git log, or its CLAUDE.md already holds — descend the TOC tree to the right knowledge leaf (create a new leaf, or split a crowded TOC, as needed) and merge the DISTILLED points in (synthesise, do not copy verbatim, and never duplicate a point the leaf already states). Refresh updated:: and summary::; ensure project:: [[...]], parent:: [[<toc>]] and back-links; touch frecency (new leaf seeds frecency:: 30; merging is a use, +5 capped at 60) and set seen:: $TODAY.
-  4. If you created a leaf or TOC, add its one-line [[link]] + hook to the parent TOC (and to index if it is a new top-level project/topic).
-  5. Record the evidence, then mark done — BOTH properties, and only as the LAST actions for that date, after steps 1-4 are truly written:
-     a. outl_page_prop_set <date> distilled-into=\"[[slug-a]] [[slug-b]] ...\" — every knowledge page you actually merged this journal's content into (space-separated [[links]]). If the journal held nothing durable and you distilled it to nothing, set distilled-into=none instead.
-     b. outl_page_prop_set <date> consolidated=$TODAY.
-     The reap deletes any aged journal carrying a consolidated:: mark, so setting it is what removes the journal — set it ONLY after steps 1-4 are genuinely written, since there is no separate per-leaf re-verification to catch a premature mark. The distilled-into evidence is recorded for provenance/auditing, not as a reap gate.
-Finally, refresh index: bump updated:: and trim the Recent journals list to the retention window.
-
-Do NOT delete any journal — reaping is automatic once you mark consolidated::. Do NOT touch code, git, or anything outside the memory graph."
+Priorities, in order: (1) never lose a durable fact; (2) keep the graph navigable — every page reachable from its parent TOC by a one-hop [[link]], no dangling links, no orphans; (3) keep every page small. When in doubt on a delete, bump frecency instead. When done, print a one-paragraph summary of what you distilled, what you split (and the child leaves you created), and what you pruned vs kept."
 
 MEMORY_CONSOLIDATE_ACTIVE=1 "$CLAUDE" -p "$prompt" \
   --model "$MODEL" \
   --dangerously-skip-permissions \
   >>"$LOG" 2>&1 || true
 
-# The agent has marked the distilled journals consolidated:: — now reap them.
+# Reap any journals the agent marked consolidated::, then reindex the restructured tree so
+# search/retrieval sees the new shape immediately.
 "$MEMIDX" -w "$WS" consolidate --reap >>"$LOG" 2>&1 || true
+"$MEMIDX" -w "$WS" refresh >>"$LOG" 2>&1 || true
 exit 0

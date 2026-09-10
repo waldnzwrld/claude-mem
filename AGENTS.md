@@ -137,16 +137,19 @@ Depth is not fixed — add a level whenever one gets crowded.
 
 Two rules keep the tree lean:
 
-- **Split on growth.** When a leaf's body exceeds the load-cost budget — **~1800 estimated
-  tokens** (`MEMORY_SPLIT_TOKENS`, measured as the `.md` projection's chars/4, i.e. what an
-  `outl_page_get` actually spends; ≈150 lines / ~1500 words as a rough human gauge) — convert
-  it into a TOC: extract its sections into child leaf documents (`<slug>-<section>`), and
-  leave one-line `[[links]]` + hooks behind. Detail moves down a level; the parent stays
-  scannable. Better to traverse three tiny pages than load one huge one. This is **mechanized**:
-  the daily `memory-index maintain` sweep flags any `type:: knowledge` leaf over budget and the
-  SessionStart hook surfaces them as a `⚠ Split-on-growth candidates` directive (TOCs are
-  exempt — they are link-heavy by design). Detection is automatic; the carve itself, which
-  needs section-boundary judgment, stays your call.
+- **Split on growth.** When **any page's** body exceeds the load-cost budget — **~1800
+  estimated tokens** (`MEMORY_SPLIT_TOKENS`, measured as the `.md` projection's chars/4, i.e.
+  what an `outl_page_get` actually spends; ≈150 lines / ~1500 words as a rough human gauge) —
+  it is split so no single page is expensive to load. A content **leaf** becomes a TOC: its
+  sections move into child leaves (`<slug>-<section>`), one-line `[[links]]` + hooks left
+  behind. An overgrown **TOC/hub** becomes a thin index of **sub-TOCs**: its entries are
+  grouped into sub-TOCs (`<slug>-<group>`) and only their one-line `[[link]]` + hook stays in
+  the parent. Either way detail moves down a level and the parent stays scannable — better to
+  traverse a few tiny pages than load one huge one. This is **automatic**: the daily
+  `memory-index maintain` sweep flags any page over budget (leaf or hub), and the SessionStart
+  hook hands them to the headless `memory-consolidate` compaction agent (which also distils
+  journals and prunes dead leaves) — it carves them with no prompting. A `⚠ Split-on-growth
+  candidates` directive is only the fallback for when the agent CLI is unavailable.
 - **TOCs live with their children.** A TOC is structural — effectively pinned while it holds
   ≥1 live child, and not itself frecency-decayed. When pruning removes its last child,
   delete the now-empty TOC and its link in the parent too.
@@ -433,10 +436,11 @@ node, and the pruning sweep — `outl_page_delete` — could destroy it). Link t
   (foundational leaves add `pin:: true`). Reference stubs carry `type:: reference` +
   `source::` + `status::` and deliberately omit the frecency pair (see *Research
   references*).
-- **Keep every page small.** A `type:: knowledge` leaf whose body exceeds ~1800 tokens (the
-  `MEMORY_SPLIT_TOKENS` budget) is flagged for splitting into a TOC + child leaves by the daily
-  maintain sweep (see *Split on growth* and *The graph model*). A page that would eat a big
-  slice of context on read is a bug — traversing tiny pages is the whole point.
+- **Keep every page small.** ANY page — leaf or TOC — whose body exceeds ~1800 tokens (the
+  `MEMORY_SPLIT_TOKENS` budget) is automatically split by the compaction agent: a leaf into a
+  TOC + child leaves, an overgrown hub into grouped sub-TOCs (see *Split on growth* and *The
+  graph model*). A page that would eat a big slice of context on read is a bug — traversing
+  tiny pages is the whole point.
 - Prefer editing an existing leaf over creating a near-duplicate; descend the tree or
   `outl_search` first. Editing an existing leaf also refreshes its frecency — another
   reason to merge rather than fork.

@@ -320,9 +320,11 @@ last=""
 [ -f "$MARKER" ] && last="$(cat "$MARKER" 2>/dev/null)"
 if [ "$last" != "$TODAY" ]; then
   # Mechanized frecency sweep (once per new day): decay non-pinned `type:: knowledge`
-  # leaves by 1 (seed 30) via `outl page prop set` — sidecar-safe, never raw edits —
-  # and surface any leaf that reached 0 as a prune candidate for review. Deletion is
-  # NOT automatic (it needs parent-TOC link cleanup), so it stays an agent decision.
+  # leaves by 1 (seed 30) via `outl page prop set` — sidecar-safe, never raw edits — then
+  # compute the two tree-health backlogs: frecency prune candidates (leaves that reached 0)
+  # and split-on-growth candidates (leaves over MEMORY_SPLIT_TOKENS). Both are handled the
+  # same way as the journal-consolidation backlog: a detached headless agent does the work
+  # automatically, with no prompting. The interactive ⚠ directives are only the fallback.
   if [ -x "$MEMIDX" ]; then
     sweep="$("$MEMIDX" -w "$WS" maintain --json 2>/dev/null)"
     "$MEMIDX" -w "$WS" refresh >/dev/null 2>&1 || true   # re-index the decayed frontmatter
@@ -331,20 +333,30 @@ try:
     print(" ".join(json.load(sys.stdin).get("prune_candidates", [])))
 except Exception:
     print("")' 2>/dev/null)"
-    if [ -n "$cands" ]; then
-      ctx+="⚠ Frecency prune candidates (reached 0 in today's sweep): $cands — per the Frecency & pruning section of AGENTS.md, decide for each whether to delete it (outl_page_delete, then remove its parent-TOC link) or bump its frecency if it's still relevant."$'\n\n'
-    fi
-    # Split-on-growth candidates: knowledge leaves whose body now exceeds the token budget
-    # (MEMORY_SPLIT_TOKENS). Detection is mechanized here; the carve itself needs section-
-    # boundary judgment, so surface it as a reviewed action exactly like prune candidates.
     split="$(printf '%s' "$sweep" | python3 -c 'import sys, json
 try:
     c = json.load(sys.stdin).get("split_candidates", [])
     print(", ".join(d["slug"] + " (~" + str(d["tokens"]) + " tok)" for d in c))
 except Exception:
     print("")' 2>/dev/null)"
-    if [ -n "$split" ]; then
-      ctx+="⚠ Split-on-growth candidates (leaf body over the token budget): $split — per the 'Split on growth' rule in AGENTS.md, convert each into a TOC: extract its sections into <slug>-<section> child leaves, leave one-line [[links]] + hooks behind, and update the parent TOC. Skip only a leaf that is genuinely one atomic topic with no split seam. Not urgent — do it when it won't derail the user's request."$'\n\n'
+    if [ -n "$cands" ] || [ -n "$split" ]; then
+      if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1 && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ]; then
+        # Automatic path: the SAME headless consolidation agent that distills journals also
+        # compacts the tree — carving oversized leaves into TOC+child leaves and pruning dead
+        # ones. One agent, one pathway. The authoritative sweep JSON is passed through (this
+        # run already decayed frecency + `seen`, so a re-computed prune list would be empty).
+        MEMORY_CONSOLIDATE_SWEEP="$sweep" nohup "$CONS" >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+        note=""
+        [ -n "$split" ] && note="splitting oversized leaves ($split)"
+        [ -n "$cands" ] && { [ -n "$note" ] && note="$note; "; note="${note}pruning dead leaves ($cands)"; }
+        ctx+="Memory compaction is running automatically in a background agent — $note. Do NOT split, prune, or restructure memory pages yourself this session."$'\n\n'
+      else
+        # Fallback (consolidate script or claude CLI unavailable): surface the work as reviewed
+        # directives so it still gets done, just not silently.
+        [ -n "$cands" ] && ctx+="⚠ Frecency prune candidates (reached 0 in today's sweep): $cands — per the Frecency & pruning section of AGENTS.md, decide for each whether to delete it (outl_page_delete, then remove its parent-TOC link) or bump its frecency if it's still relevant."$'\n\n'
+        [ -n "$split" ] && ctx+="⚠ Split-on-growth candidates (leaf body over the token budget): $split — per the 'Split on growth' rule in AGENTS.md, convert each into a TOC: extract its sections into <slug>-<section> child leaves, leave one-line [[links]] + hooks behind, and update the parent TOC. Skip only a leaf that is genuinely one atomic topic with no split seam."$'\n\n'
+      fi
     fi
   fi
 

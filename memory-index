@@ -930,17 +930,18 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
         if kind != "page":
             continue
         fm, _body, _raw = parse_md(path)
-        if (fm.get("type") or "").strip() != "knowledge":
-            continue
-        # Split-on-growth (independent of the frecency-decay skips below, so a pinned or
-        # already-seen-today leaf is still checked): flag a leaf whose load would cost more
-        # than SPLIT_TOKENS as a carve-into-TOC candidate. Size proxy is the .md projection's
-        # byte size — what an outl_page_get actually renders — since parse_md's `body` is a
-        # thin projection, not the block content. Detection only — the actual split needs
-        # section-boundary judgment, so it stays a reviewed agent action.
+        typ = (fm.get("type") or "").strip()
+        # Split-on-growth applies to EVERY page — hub or leaf ("keep every page small"): flag
+        # any page whose load would cost more than SPLIT_TOKENS. Size proxy is the .md
+        # projection's byte size — what an outl_page_get actually renders — since parse_md's
+        # `body` is a thin projection, not the block content. Detection only; the carve (a leaf
+        # into child leaves, or an overgrown TOC into grouped sub-TOCs) is the agent's call.
         est_tok = os.path.getsize(path) // CHARS_PER_TOKEN
         if est_tok > SPLIT_TOKENS:
-            split_cands.append({"slug": slug, "tokens": est_tok})
+            split_cands.append({"slug": slug, "tokens": est_tok, "type": typ or "?"})
+        # Frecency decay + prune-candidate reporting apply only to knowledge leaves.
+        if typ != "knowledge":
+            continue
         if _truthy(fm.get("pin")):
             skipped += 1
             continue
