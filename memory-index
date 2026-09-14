@@ -58,10 +58,11 @@ FRECENCY_BUMP = 5   # per AGENTS.md: a material use credits +5 (see `touch`)
 RETENTION_COUNT = 5  # keep the 5 most recent journal files; anything older is aged out
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-# Section-level frecency: decays each `## section` of a leaf independently, so a stale note
-# in a live leaf ages out on its own (prune candidate). Credit signal is the search HIT
-# (resolves to a `slug › heading`, +HIT); a page_get gives every section only +PAGEGET.
-# Decayed −1/day. Ledger lives outside .outl/ (survives rebuild); keyed by (slug, heading).
+# Block-level (line) frecency: decays each content BULLET of a page independently, keyed by
+# its stable outl block id, so a stale line ages out and is evicted on its own while the file
+# lives. Credit: a search HIT bumps the matched lines (+HIT); a page_get bumps every line
+# (+PAGEGET). Decayed −1/day. Ledger {slug: {block_id: {f, seen}}} lives outside .outl/ so a
+# rebuild never wipes it.
 SECTION_SEED = 30
 SECTION_CAP = 60
 SECTION_PAGEGET_BUMP = 2   # whole-page fetch: weak per-section evidence
@@ -555,22 +556,29 @@ def cmd_search(ws: str, query: str, k: int, no_graph: bool, as_json: bool = Fals
             label = f"(via {via} · {etype} · {d}h ·w{weight})"
             results.append(("link", cand, label, summary, 0.0))
 
-    # Section-frecency credit: a keyword hit resolved to an exact `slug › heading`. Opt-in
-    # (push-retrieval hook passes --credit); graph 'link' rows have no section, so skip.
+    # Block-frecency credit: a keyword hit resolves to `slug › heading`; credit the matched
+    # content lines under that heading (line-level recall). Opt-in (push-retrieval passes
+    # --credit); graph 'link' rows have no section, so skip. Read-only outl reads, no writes.
     if credit:
         today = datetime.date.today().isoformat()
+        outl = _outl_bin()
         sfrec = _load_sfrec(ws)
         dirty = False
+        qterms = [t.lower() for t in re.findall(r"[A-Za-z0-9_]+", query)
+                  if t.lower() not in STOPWORDS and len(t) > 1]
+        seen_slugs: set = set()
         for kind, slug, heading, _text, _score in results:
-            if kind != "hit" or heading in ("(summary)", "(top)"):
+            if kind != "hit" or heading in ("(summary)", "(top)") or slug in seen_slugs:
                 continue
-            try:  # section frecency is knowledge-leaves only; skip journal/TOC hits
-                fm, _b, _r = parse_md(os.path.join(ws, "pages", f"{slug}.md"))
-            except Exception:
+            seen_slugs.add(slug)
+            content = _content_blocks(_outl_outline(outl, ws, slug))
+            if not content:
                 continue
-            if (fm.get("type") or "").strip() != "knowledge":
-                continue
-            _bump_sections(sfrec, slug, [heading], SECTION_HIT_BUMP, today)
+            in_sec = [b for b in content if b["heading"] == heading]
+            pool = in_sec or content
+            matched = [b for b in pool if any(t in b["text"].lower() for t in qterms)]
+            target = matched or pool
+            _bump_blocks(sfrec, slug, [b["id"] for b in target], SECTION_HIT_BUMP, today)
             dirty = True
         if dirty:
             _save_sfrec(ws, sfrec)
@@ -988,128 +996,293 @@ def _save_sfrec(ws: str, data: dict):
     os.replace(tmp, path)  # atomic
 
 
-def _page_sections(fm: dict, body: list[str]) -> list[str]:
-    """A page's real `## section` headings — the unit section-frecency tracks. These are the
-    chunk_body headings minus the synthetic '(summary)' and the pre-heading '(top)' bucket."""
-    return [h for h, _t in chunk_body(fm, body) if h not in ("(summary)", "(top)")]
+# ---------------------------------------------- outl outline + hierarchy helpers
+# The .md is authoritative but outl-managed: mutate ONLY through the outl CLI (block/page
+# delete/update) so the op log and block ids stay consistent, then refresh the sqlite index.
+_HEAD_RE = re.compile(r"^#{1,6}\s")
+_PROP_BULLET_RE = re.compile(r"^[A-Za-z_][\w-]*::\s")
 
 
-def _bump_sections(sfrec: dict, slug: str, headings, amount: int, today: str):
-    """Credit a use: each named section's frecency += amount (seed SECTION_SEED if new,
-    saturating at SECTION_CAP), seen = today. Mutates sfrec in place."""
+def _outl_outline(outl, ws: str, slug: str):
+    """Flat block list for a page via `outl page get --json`. Each entry:
+    {id, text, heading, refs, is_head, is_prop}. `heading` is the nearest ancestor
+    `## …` section text (or '(top)'); `refs` are [[link]] targets from ref tokens.
+    Returns [] on any failure (missing binary/page/parse)."""
+    if not outl:
+        return []
+    try:
+        out = subprocess.run(
+            [outl, "-w", ws, "page", "get", slug, "--json"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+        outline = json.loads(out)["data"]["outline"]
+    except Exception:
+        return []
+    flat = []
+
+    def walk(nodes, heading):
+        for n in nodes:
+            txt = (n.get("text") or "").strip()
+            is_head = bool(_HEAD_RE.match(txt))
+            h = txt.lstrip("#").strip() if is_head else heading
+            refs = [t.get("value") for t in n.get("tokens", []) if t.get("kind") == "ref"]
+            flat.append({
+                "id": n.get("id"), "text": txt, "heading": h,
+                "refs": [r for r in refs if r],
+                "is_head": is_head, "is_prop": bool(_PROP_BULLET_RE.match(txt)),
+            })
+            walk(n.get("children", []), h)
+
+    walk(outline, "(top)")
+    return flat
+
+
+def _content_blocks(blocks):
+    """Trackable body lines: real content bullets, not headings or frontmatter props."""
+    return [b for b in blocks if b["id"] and not b["is_head"] and not b["is_prop"] and b["text"]]
+
+
+def _part_of_maps(con):
+    """(parent_of, children_of) from the derived `part-of` edges (src=child, dst=parent).
+    Authoritative for hierarchy regardless of whether `parent::` is hoisted to frontmatter
+    or authored as a body bullet — the edge is built from either."""
+    parent_of, children_of = {}, {}
+    for src, dst in con.execute("SELECT src, dst FROM edges WHERE type='part-of'"):
+        parent_of.setdefault(src, dst)
+        children_of.setdefault(dst, set()).add(src)
+    return parent_of, children_of
+
+
+def _ancestors(parent_of: dict, slug: str):
+    """Parent slugs from `slug` up to root, via the part-of map. Cycle-guarded."""
+    chain, seen, cur = [], {slug}, slug
+    while True:
+        p = parent_of.get(cur)
+        if not p or p in seen:
+            break
+        seen.add(p)
+        chain.append(p)
+        cur = p
+    return chain
+
+
+def _bump_page(outl, ws: str, slug: str, bump: int, today: str):
+    """frecency += bump (seed FRECENCY_SEED if unset, cap FRECENCY_CAP), seen=today.
+    Returns (old, new) or None if the page is missing/unreadable."""
+    path = os.path.join(ws, "pages", f"{slug}.md")
+    if not os.path.exists(path):
+        return None
+    try:
+        fm, _b, _r = parse_md(path)
+    except Exception:
+        return None
+    old = _int_or_none(fm.get("frecency"))
+    old = FRECENCY_SEED if old is None else old
+    new = min(FRECENCY_CAP, old + bump)
+    _outl_prop(outl, ws, slug, "frecency", str(new))
+    _outl_prop(outl, ws, slug, "seen", today)
+    return (old, new)
+
+
+def _bump_blocks(sfrec: dict, slug: str, block_ids, amount: int, today: str):
+    """Credit content blocks by id: f += amount (seed SECTION_SEED, cap SECTION_CAP),
+    seen=today. Mutates sfrec in place."""
     page = sfrec.setdefault(slug, {})
-    for h in headings:
-        rec = page.get(h) or {"f": SECTION_SEED, "seen": ""}
+    for bid in block_ids:
+        rec = page.get(bid) or {"f": SECTION_SEED, "seen": ""}
         rec["f"] = min(SECTION_CAP, int(rec.get("f", SECTION_SEED)) + amount)
         rec["seen"] = today
-        page[h] = rec
+        page[bid] = rec
+
+
+_REF_PAT_CACHE: dict = {}
+
+
+def _strip_ref(text: str, target: str) -> str:
+    pat = _REF_PAT_CACHE.get(target)
+    if pat is None:
+        pat = re.compile(r"\[\[" + re.escape(target) + r"(?:\|[^\]]*)?\]\]")
+        _REF_PAT_CACHE[target] = pat
+    t = pat.sub("", text)
+    t = re.sub(r"\s{2,}", " ", t)
+    t = re.sub(r"(^\s*[—–-]\s*|\s*[—–-]\s*$)", "", t)
+    return t.strip()
+
+
+def _outl_run(outl, ws: str, args) -> bool:
+    try:
+        subprocess.run([outl, "-w", ws] + args, check=True, capture_output=True, timeout=30)
+        return True
+    except Exception as e:
+        print(f"memory-index maintain: outl {' '.join(args[:2])} failed: {e}", file=sys.stderr)
+        return False
+
+
+def _evict_page(outl, ws, slug):
+    return _outl_run(outl, ws, ["page", "delete", slug, "--confirm"])
+
+
+def _evict_block(outl, ws, bid):
+    return _outl_run(outl, ws, ["block", "delete", bid, "--confirm"])
+
+
+def _scrub_ref_block(outl, ws, block, dead):
+    """Remove [[dead…]] refs from one surviving block. Delete the block outright when it
+    was a pointer entry (led with the ref, nothing meaningful left); else rewrite its text."""
+    text = block["text"]
+    new = text
+    for d in dead:
+        new = _strip_ref(new, d)
+    still_links = "[[" in new
+    leads_with_ref = text.lstrip().startswith("[[")
+    if not re.search(r"[A-Za-z0-9]", new) or (leads_with_ref and not still_links):
+        _evict_block(outl, ws, block["id"])
+    else:
+        _outl_run(outl, ws, ["block", "update", block["id"], "--text", new])
 
 
 def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
-    """Daily frecency sweep, per AGENTS.md. For each non-pinned `type:: knowledge`
-    leaf not already decayed today: frecency -= 1 (seed 30 if unset), set seen=today.
-    Writes go through `outl page prop set` so the .outl sidecar stays in sync — never
-    raw .md edits. Leaves reaching 0 are REPORTED as prune candidates, not deleted:
-    deletion needs parent-TOC link cleanup, which stays a reviewed agent action."""
+    """Daily frecency sweep + silent, mechanical eviction. Frecency is the SOLE retention
+    metric for this decay-cache memory: every page (leaf AND moc) and every content block
+    decays −1/day unless credited today; `touch`/`search --credit` reinforce on use and
+    propagate up the parent chain. Anything reaching 0 is FORGOTTEN — no prompt, no message:
+      * content block → 0 : delete just that block (the file stays).
+      * knowledge leaf → 0: soft-trash the page; scrub [[it]] from every survivor; parent stays.
+      * moc/toc → 0       : soft-trash the moc AND its whole subtree; scrub inbound refs.
+    All mutations go through outl (page/block delete/update); the sqlite index is refreshed
+    after. `--dry-run` writes nothing and only reports (used for split-candidate discovery)."""
     outl = _outl_bin()
     if outl is None and not dry_run:
-        print("memory-index maintain: outl binary not found; cannot write props", file=sys.stderr)
+        print("memory-index maintain: outl binary not found; cannot evict", file=sys.stderr)
         return 3
 
-    decayed, candidates, skipped, split_cands = [], [], 0, []
     sfrec = _load_sfrec(ws)
-    live_sections: dict[str, set] = {}   # knowledge-leaf slug -> its current section set (for GC)
-    section_prune: list[str] = []        # "slug › heading" for sections that reached SECTION_PRUNE
+    decayed, split_cands = [], []
+    dead: list[str] = []                  # pages that reached frecency 0 this sweep
+    block_evict: dict[str, set] = {}
+    all_blocks: dict[str, list] = {}
+
+    con = _open_current(ws)
+    _parent_of, child_map = _part_of_maps(con)
+    con.close()
+
+    pages = []
+    page_slugs: set = set()
     for slug, kind, path in iter_source_files(ws):
-        if kind != "page":
+        if kind != "page":            # journals have their own retention/consolidation path
             continue
-        fm, body, _raw = parse_md(path)
+        try:
+            fm, body, _raw = parse_md(path)
+        except Exception:
+            continue
         typ = (fm.get("type") or "").strip()
-        # Split-on-growth applies to EVERY page (hub or leaf): flag any whose load costs more
-        # than SPLIT_TOKENS. Size proxy is the .md byte size. Detection only; the carve is the agent's call.
+        pages.append((slug, path, fm, typ))
+        page_slugs.add(slug)
+
+    for slug, path, fm, typ in pages:
         est_tok = os.path.getsize(path) // CHARS_PER_TOKEN
         if est_tok > SPLIT_TOKENS:
             split_cands.append({"slug": slug, "tokens": est_tok, "type": typ or "?"})
-        # Frecency decay + prune-candidate reporting apply only to knowledge leaves.
-        if typ != "knowledge":
-            continue
-        sects = _page_sections(fm, body)
-        live_sections[slug] = set(sects)  # recorded for ALL knowledge leaves (even pinned/seen)
-        if _truthy(fm.get("pin")):
-            skipped += 1
-            continue
-        if (fm.get("seen") or "") == today:
-            skipped += 1
-            continue
-        old = _int_or_none(fm.get("frecency"))
-        old = FRECENCY_SEED if old is None else old
-        new = old - 1
-        if not dry_run:
-            _outl_prop(outl, ws, slug, "frecency", str(new))
-            _outl_prop(outl, ws, slug, "seen", today)
-        decayed.append({"slug": slug, "from": old, "to": new})
-        if new <= 0:
-            candidates.append(slug)
-        # Section decay, in lockstep with the page sweep (same pin/seen guards). Each section −1
-        # unless decayed today; one reaching SECTION_PRUNE is a prune candidate (remove that subtree).
-        page = sfrec.setdefault(slug, {})
-        for h in sects:
-            rec = page.get(h) or {"f": SECTION_SEED, "seen": ""}
-            if rec.get("seen") == today:
-                continue
-            rec["f"] = int(rec.get("f", SECTION_SEED)) - 1
-            rec["seen"] = today
-            page[h] = rec
-            if rec["f"] <= SECTION_PRUNE:
-                section_prune.append(f"{slug} › {h}")
 
-    # GC the ledger: drop pages no longer live knowledge leaves, and headings a leaf no longer has.
-    for slug in list(sfrec.keys()):
-        if slug not in live_sections:
-            del sfrec[slug]
+        # Page-level decay: EVERY page (leaf or moc), no pin exemption. Once/day (seen guard).
+        if (fm.get("seen") or "") != today:
+            old = _int_or_none(fm.get("frecency"))
+            old = FRECENCY_SEED if old is None else old
+            new = old - 1
+            if not dry_run:
+                _outl_prop(outl, ws, slug, "frecency", str(new))
+                _outl_prop(outl, ws, slug, "seen", today)
+            decayed.append({"slug": slug, "from": old, "to": new})
+            if new <= 0:
+                dead.append(slug)
+
+        # Block-level decay (real content lines only). Read-only outl calls, skipped in dry-run.
+        if not dry_run and outl:
+            blocks = _outl_outline(outl, ws, slug)
+            all_blocks[slug] = blocks
+            page_led = sfrec.setdefault(slug, {})
+            live_ids = set()
+            for b in _content_blocks(blocks):
+                live_ids.add(b["id"])
+                rec = page_led.get(b["id"]) or {"f": SECTION_SEED, "seen": ""}
+                if rec.get("seen") == today:
+                    page_led[b["id"]] = rec
+                    continue
+                rec["f"] = int(rec.get("f", SECTION_SEED)) - 1
+                rec["seen"] = today
+                page_led[b["id"]] = rec
+                if rec["f"] <= SECTION_PRUNE:
+                    block_evict.setdefault(slug, set()).add(b["id"])
+            for bid in list(page_led.keys()):  # GC ledger ids no longer present in the page
+                if bid not in live_ids:
+                    del page_led[bid]
+
+    # A dead page takes its whole subtree with it (a moc == a page with children). Upward
+    # credit propagation guarantees a page only reaches 0 once its entire subtree is cold, so
+    # the cascade is safe. Journals are excluded (retention/consolidation own their lifecycle).
+    dead_set: set = set()
+    stack = list(dead)
+    while stack:
+        x = stack.pop()
+        if x in dead_set:
             continue
-        for h in list(sfrec[slug].keys()):
-            if h not in live_sections[slug]:
-                del sfrec[slug][h]
-        if not sfrec[slug]:
-            del sfrec[slug]
+        dead_set.add(x)
+        stack.extend(child_map.get(x, ()))
+    dead_set &= page_slugs
+
+    evicted_pages, evicted_blocks = [], []
+    if not dry_run and outl:
+        # 1) scrub inbound refs to any dead slug from SURVIVOR blocks (no dangling links left)
+        if dead_set:
+            for slug, path, fm, typ in pages:
+                if slug in dead_set:
+                    continue
+                for b in all_blocks.get(slug, []):
+                    if b["is_prop"] or not b["id"]:
+                        continue
+                    hits = [d for d in b["refs"] if d in dead_set]
+                    if hits:
+                        _scrub_ref_block(outl, ws, b, hits)
+        # 2) soft-trash every dead page (leaf, or moc + its whole subtree)
+        for slug in dead_set:
+            if _evict_page(outl, ws, slug):
+                evicted_pages.append(slug)
+            sfrec.pop(slug, None)
+        # 3) line-level: delete dead content blocks on surviving pages
+        for slug, ids in block_evict.items():
+            if slug in dead_set:
+                continue
+            for bid in ids:
+                if _evict_block(outl, ws, bid):
+                    evicted_blocks.append(f"{slug}:{bid}")
+                sfrec.get(slug, {}).pop(bid, None)
+
     if not dry_run:
         _save_sfrec(ws, sfrec)
+        if evicted_pages or evicted_blocks:
+            cmd_refresh(ws, None, quiet=True)
 
     split_cands.sort(key=lambda d: d["tokens"], reverse=True)
     result = {
         "date": today,
         "dry_run": dry_run,
         "decayed": decayed,
-        "prune_candidates": candidates,
-        "section_prune_candidates": sorted(set(section_prune)),
+        "evicted_pages": evicted_pages,
+        "evicted_blocks": evicted_blocks,
         "split_candidates": split_cands,
-        "skipped": skipped,
     }
     if as_json:
         print(json.dumps(result))
-    else:
-        tag = " (dry-run)" if dry_run else ""
-        print(f"frecency sweep{tag}: decayed {len(decayed)} leaf/leaves, skipped {skipped}")
-        for d in decayed:
-            print(f"  {d['slug']}: {d['from']} → {d['to']}")
-        if candidates:
-            print(f"prune candidates (frecency ≤ 0, review per AGENTS.md): {', '.join(candidates)}")
-        if result["section_prune_candidates"]:
-            print(f"section prune candidates (section frecency ≤ {SECTION_PRUNE}; remove the "
-                  f"subtree, not the leaf): {', '.join(result['section_prune_candidates'])}")
-        if split_cands:
-            pretty = ", ".join(f"{d['slug']} (~{d['tokens']} tok)" for d in split_cands)
-            print(f"split candidates (body > {SPLIT_TOKENS} tok, review per AGENTS.md 'Split on growth'): {pretty}")
     return 0
 
 
 def cmd_touch(ws: str, slugs, today: str, bump: int, as_json: bool):
-    """Credit a material USE of one or more knowledge leaves: frecency += bump (seed 30 if
-    unset, saturating at FRECENCY_CAP), seen = today. The other half of the frecency loop:
-    `maintain` decays daily, `touch` reinforces on use. Writes go through outl so the .outl
-    sidecar stays in sync; journals and non-knowledge pages are silently skipped (they carry
-    no frecency). Called by the PostToolUse(outl_page_get) hook and safe to run by hand."""
+    """Credit a material USE and keep the whole access PATH warm. Bumps the page's frecency,
+    its content blocks, AND every ancestor moc/toc up the `parent::` chain (using a memory
+    means using the index that led to it — so an index never dies while a memory reached
+    through it stays live). Decay's counterpart: `maintain` −1/day, `touch` reinforces on use.
+    Any page type is eligible (leaf or moc); missing pages are skipped. Called by the
+    PostToolUse(outl_page_get) hook and safe to run by hand."""
     outl = _outl_bin()
     if outl is None:
         print("memory-index touch: outl binary not found; cannot write props", file=sys.stderr)
@@ -1117,25 +1290,31 @@ def cmd_touch(ws: str, slugs, today: str, bump: int, as_json: bool):
     touched, skipped = [], []
     sfrec = _load_sfrec(ws)
     sfrec_dirty = False
+    bumped: set = set()
+    con = _open_current(ws)
+    parent_of, _children = _part_of_maps(con)
+    con.close()
     for slug in slugs:
-        path = os.path.join(ws, "pages", f"{slug}.md")
-        if not os.path.exists(path):
+        r = _bump_page(outl, ws, slug, bump, today)
+        if r is None:
             skipped.append(slug)
             continue
-        fm, body, _raw = parse_md(path)
-        if (fm.get("type") or "").strip() != "knowledge":
-            skipped.append(slug)
-            continue
-        old = _int_or_none(fm.get("frecency"))
-        old = FRECENCY_SEED if old is None else old
-        new = min(FRECENCY_CAP, old + bump)
-        _outl_prop(outl, ws, slug, "frecency", str(new))
-        _outl_prop(outl, ws, slug, "seen", today)
-        touched.append({"slug": slug, "from": old, "to": new})
-        # Whole-page fetch is weak per-section evidence: bump every section a little. A search
-        # HIT credits the exact section more precisely (see cmd_search --credit).
-        _bump_sections(sfrec, slug, _page_sections(fm, body), SECTION_PAGEGET_BUMP, today)
-        sfrec_dirty = True
+        bumped.add(slug)
+        touched.append({"slug": slug, "from": r[0], "to": r[1]})
+        # Whole-page fetch is weak per-block evidence: bump every content line a little. A
+        # search HIT credits the matched lines more precisely (see cmd_search --credit).
+        content = _content_blocks(_outl_outline(outl, ws, slug))
+        if content:
+            _bump_blocks(sfrec, slug, [b["id"] for b in content], SECTION_PAGEGET_BUMP, today)
+            sfrec_dirty = True
+        # Keep the pathway warm: propagate the bump up the parent chain to the root index.
+        for anc in _ancestors(parent_of, slug):
+            if anc in bumped:
+                continue
+            ar = _bump_page(outl, ws, anc, bump, today)
+            if ar is not None:
+                bumped.add(anc)
+                touched.append({"slug": anc, "from": ar[0], "to": ar[1], "via": slug})
     if sfrec_dirty:
         _save_sfrec(ws, sfrec)
     if touched:
@@ -1145,9 +1324,10 @@ def cmd_touch(ws: str, slugs, today: str, bump: int, as_json: bool):
         print(json.dumps(result))
     else:
         for t in touched:
-            print(f"touch {t['slug']}: {t['from']} → {t['to']}")
+            via = f"  (via {t['via']})" if t.get("via") else ""
+            print(f"touch {t['slug']}: {t['from']} → {t['to']}{via}")
         if skipped:
-            print(f"skipped (not a knowledge leaf): {', '.join(skipped)}")
+            print(f"skipped (missing page): {', '.join(skipped)}")
     return 0
 
 

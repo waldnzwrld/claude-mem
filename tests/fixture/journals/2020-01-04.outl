@@ -1,0 +1,41 @@
+{
+  "version": 2,
+  "page_id": "0DMKKV88RFHDAEY92CP3XVRQKS",
+  "last_synced_hash": "sha256:a7590a62f0e248ad6404f6523398646257f0099be07519e4a316625303886619",
+  "last_synced_at": "2026-09-13T22:32:57.416363+02:00",
+  "blocks": [
+    {
+      "id": "01M2E7J6212KEQGHG7MDMHP3TB",
+      "line": 1,
+      "indent": 0,
+      "content_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "ref_handle": "blk-mhp3tb",
+      "text": ""
+    },
+    {
+      "id": "01M2E7J625SZ43N0H3GATFG397",
+      "line": 2,
+      "indent": 0,
+      "content_hash": "sha256:1d0d345c6517ba409eff6ab4ea585aaa43b6744d4913d728e2709c9bdaa6b96f",
+      "ref_handle": "blk-tfg397",
+      "text": "## Focus"
+    },
+    {
+      "id": "01M2E7J63MY9KGXK794FAYA2MH",
+      "line": 3,
+      "indent": 0,
+      "content_hash": "sha256:438998a9625f572ae9a18e22e51ea8b0c8c164ea109b22ed96a2e694f921d9d8",
+      "ref_handle": "blk-aya2mh",
+      "text": "worked on alpha on 2020-01-04"
+    },
+    {
+      "id": "01M2E7J6HR7QCCRQZC25TBS01V",
+      "line": 4,
+      "indent": 0,
+      "content_hash": "sha256:7b74ab285e4a38ec08a26d812ed8ab874681c7f925b12a5d716daaecf9965618",
+      "ref_handle": "blk-tbs01v",
+      "text": "Decision: adopted the retry-with-backoff pattern for alpha's API client — a durable design decision that belongs in [[alpha-decisions]]."
+    }
+  ],
+  "pipeline_version": 4
+}

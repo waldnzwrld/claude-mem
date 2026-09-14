@@ -1,0 +1,49 @@
+{
+  "version": 2,
+  "page_id": "53KKR7XN18GHDT7X0V2MADN8JF",
+  "last_synced_hash": "sha256:c792cc08eb9837fdf156d6ce31decac17bd914511ec707005b8343ef6244454b",
+  "last_synced_at": "2026-09-13T22:32:55.850303+02:00",
+  "blocks": [
+    {
+      "id": "01M2E7J4WXD8WWKF54GG251KP4",
+      "line": 1,
+      "indent": 0,
+      "content_hash": "sha256:260520b0dcf3f658c8a30a9ccb5cc30b5f21fa9843d873bc6b3167fbcd3973e9",
+      "ref_handle": "blk-251kp4",
+      "text": "type:: knowledge"
+    },
+    {
+      "id": "01M2E7J4WXND3MBPDP2V52VGW2",
+      "line": 2,
+      "indent": 0,
+      "content_hash": "sha256:147e7e87bf4885f7bf02f8c7ae83566545ddae1e820c5e7b140003c6c3b30a74",
+      "ref_handle": "blk-52vgw2",
+      "text": "parent:: [[proj-alpha]]"
+    },
+    {
+      "id": "01M2E7J4WX61D2S76CECB4TDCE",
+      "line": 3,
+      "indent": 0,
+      "content_hash": "sha256:a69ccdf682630a3a88d62385b6c2895d5410b7f36ee52d046c9e8403a33b8eaa",
+      "ref_handle": "blk-b4tdce",
+      "text": "## Decisions"
+    },
+    {
+      "id": "01M2E7J4WXVAPTGXWY4V1T4RD9",
+      "line": 4,
+      "indent": 0,
+      "content_hash": "sha256:4f42db76b341edab33e896b0432a0ba49291b598f8af8e99ee31ad11deae29c3",
+      "ref_handle": "blk-1t4rd9",
+      "text": "decided to use approach X because Y"
+    },
+    {
+      "id": "01M2E7J4WXMQ8JD0CJH44MJEA7",
+      "line": 5,
+      "indent": 0,
+      "content_hash": "sha256:512f05e423abb7a41fd3a58d268224c9842497aa1fc68ab3a1ace118dbc3f36b",
+      "ref_handle": "blk-4mjea7",
+      "text": "rejected approach Z"
+    }
+  ],
+  "pipeline_version": 4
+}

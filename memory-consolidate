@@ -20,12 +20,13 @@
 set -u
 
 MEMIDX="${MEMORY_INDEX_BIN:-$HOME/.local/bin/memory-index}"
+OUTL="${OUTL_BIN:-/opt/homebrew/bin/outl}"
 CLAUDE="${CLAUDE_BIN:-claude}"
 # Hooks can run with a minimal PATH; fall back to the usual install location.
 command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE="$HOME/.local/bin/claude"
 # Distillation runs on a capable model. Override with MEMORY_MODEL.
 MODEL="${MEMORY_MODEL:-claude-sonnet-5}"
-WS="$HOME/.claude/memory"
+WS="${MEMORY_WS:-$HOME/.claude/memory}"   # override targets an isolated workspace (tests)
 LOCKDIR="$WS/.consolidate.lock.d"
 LOG="$WS/.consolidate.log"
 TODAY="$(date +%F)"
@@ -53,9 +54,11 @@ except Exception:
 
 pend="$(pending)"
 
-# Tree-compaction candidates: leaves to split (over load budget) and to prune (frecency 0).
-# The SessionStart hook passes the authoritative sweep JSON via MEMORY_CONSOLIDATE_SWEEP
-# (a re-computed prune list would be empty); standalone, fall back to a dry-run sweep.
+# Split candidates only. All pruning/eviction is now MECHANICAL and SILENT in
+# `memory-index maintain` (frecency 0 -> forgotten, no LLM); the agent handles only the two
+# generative jobs left — distilling journals and splitting oversized pages. The SessionStart
+# hook passes the authoritative sweep JSON via MEMORY_CONSOLIDATE_SWEEP; standalone, fall back
+# to a dry-run sweep (read-only, so it never double-decays).
 sweep="${MEMORY_CONSOLIDATE_SWEEP:-}"
 [ -z "$sweep" ] && sweep="$("$MEMIDX" -w "$WS" maintain --dry-run --json 2>/dev/null)"
 split_slugs="$(printf '%s' "$sweep" | python3 -c 'import sys, json
@@ -64,23 +67,9 @@ try:
 except Exception:
     c = []
 print(" ".join(d["slug"] if isinstance(d, dict) else d for d in c))' 2>/dev/null)"
-prune_slugs="$(printf '%s' "$sweep" | python3 -c 'import sys, json
-try:
-    v = json.load(sys.stdin).get("prune_candidates", [])
-except Exception:
-    v = []
-print(" ".join(v))' 2>/dev/null)"
-# Section prune candidates ("slug › heading" strings): individual sections whose
-# section-frecency decayed to 0, to remove from an otherwise-live leaf.
-secprune="$(printf '%s' "$sweep" | python3 -c 'import sys, json
-try:
-    v = json.load(sys.stdin).get("section_prune_candidates", [])
-except Exception:
-    v = []
-print("\n".join("  - " + s for s in v))' 2>/dev/null)"
 
 # Nothing to do at all — still reap anything already marked, then done.
-if [ -z "$pend" ] && [ -z "$split_slugs" ] && [ -z "$prune_slugs" ] && [ -z "$secprune" ]; then
+if [ -z "$pend" ] && [ -z "$split_slugs" ]; then
   "$MEMIDX" -w "$WS" consolidate --reap >/dev/null 2>&1 || true
   exit 0
 fi
@@ -91,8 +80,8 @@ if ! command -v "$CLAUDE" >/dev/null 2>&1; then
   exit 0
 fi
 
-# Build the task list from whichever backlogs are non-empty: distilling journals,
-# splitting oversized leaves, pruning dead ones.
+# Build the task list from whichever backlogs are non-empty: distilling aged journals and
+# splitting oversized pages. Pruning is mechanical and lives in `memory-index maintain`.
 tasks=""
 [ -n "$pend" ] && tasks="${tasks}
 JOURNALS — distill these aged journals (older than the 5 most recent, not yet consolidated): $pend
@@ -103,23 +92,24 @@ PAGES TO SPLIT (any page — a content leaf OR a TOC/hub — whose body now cost
    - A content LEAF (type:: knowledge): carve its sections into child leaf documents named <slug>-<section>, move the DETAIL down into those children, and leave in the (now type:: moc) parent one concise one-line [[link]]+hook per child. Give each child full leaf frontmatter (type:: knowledge, project::, parent:: [[the new toc]], updated:: $TODAY, summary::, frecency:: 30, seen:: $TODAY).
    - A HUB (type:: moc) that has grown too big: group its child entries into a few coherent sub-topics, create a sub-TOC (type:: moc, named <slug>-<group>) for each group, move those entries' [[link]]s+hooks down into the matching sub-TOC, and leave in the parent one [[link]]+hook per sub-TOC. The parent stays a thin index OF sub-TOCs; set parent:: on each new sub-TOC and keep every back-link intact.
   Either way: preserve every fact and every crosslink (no dangling links, no orphans), and re-point the page's own parent-TOC entry if its role changed. If a page genuinely has no clean split seam, LEAVE it and say so."
-[ -n "$secprune" ] && tasks="${tasks}
-SECTIONS TO PRUNE (a single ## section of an otherwise-live leaf whose section-frecency decayed to 0 — that note has been unused for ~a month even though the rest of the leaf is active):
-$secprune
-  For EACH 'slug › heading', open the leaf and decide deliberately, per the 'Frecency & pruning' section of AGENTS.md applied at SECTION granularity: if that section still holds durable value, KEEP it (do nothing — its frecency reseeds on next use, or fold it into a livelier section). Only if it is genuinely dead weight, remove JUST that section's subtree (outl_block_delete its heading block and descendants) — do NOT delete the whole leaf, and keep every crosslink that points into sibling sections. If pruning the section empties the leaf, then treat the leaf as a normal prune candidate: remove its parent-TOC [[link]] first, then outl_page_delete it."
-[ -n "$prune_slugs" ] && tasks="${tasks}
-LEAVES TO PRUNE (frecency decayed to 0 — unused for ~a month): $prune_slugs
-  For EACH, follow the 'Frecency & pruning' section of AGENTS.md. Decide deliberately: if the leaf still holds durable value, do NOT delete it — bump its frecency (outl_page_prop_set <slug> frecency=<n>) and set seen:: $TODAY. Only if it is genuinely dead weight, FIRST remove its [[link]] from the parent TOC (and any other page linking it, so no dangling link is left), THEN outl_page_delete <slug> (a soft, recoverable move to trash). NEVER delete a type:: moc that still has >=1 live child, and never delete a pin:: true leaf."
-
-prompt="You are running headless as the memory-system compaction agent. Do ONLY the tasks below, then stop — ignore everything else. Work entirely within the outl memory graph at ~/.claude/memory; do NOT touch code, git, or anything outside it. Read the named sections of ~/.claude/memory/AGENTS.md and follow them exactly.
+prompt="You are running headless as the memory-system compaction agent. Do ONLY the tasks below, then stop — ignore everything else. Work entirely within the outl memory graph at ~/.claude/memory; do NOT touch code, git, or anything outside it. Read the named sections of ~/.claude/memory/AGENTS.md and follow them exactly. Do NOT prune, delete, or bump the frecency of any page or section — decay and eviction are handled mechanically elsewhere; touching them here would corrupt the retention signal.
 $tasks
 
-Priorities, in order: (1) never lose a durable fact; (2) keep the graph navigable — every page reachable from its parent TOC by a one-hop [[link]], no dangling links, no orphans; (3) keep every page small. When in doubt on a delete, bump frecency instead. When done, print a one-paragraph summary of what you distilled, what you split (and the child leaves you created), and what you pruned vs kept."
+Priorities, in order: (1) never lose a durable fact while distilling; (2) keep the graph navigable — every page reachable from its parent TOC by a one-hop [[link]], no dangling links, no orphans; (3) keep every page small. Work silently."
 
+# Point the distiller's outl MCP at THIS workspace explicitly (so it operates on the
+# workspace we manage, not whatever ambient config happens to serve) and strict-scope it so
+# no unrelated MCP servers load. This is what also lets the test harness run the real
+# distiller against an isolated fixture via MEMORY_WS.
+_MCP_CFG="$(mktemp)"
+printf '{"mcpServers":{"outl":{"command":"%s","args":["mcp","serve","-w","%s"]}}}' "$OUTL" "$WS" > "$_MCP_CFG"
 MEMORY_CONSOLIDATE_ACTIVE=1 "$CLAUDE" -p "$prompt" \
   --model "$MODEL" \
+  --mcp-config "$_MCP_CFG" \
+  --strict-mcp-config \
   --dangerously-skip-permissions \
   >>"$LOG" 2>&1 || true
+rm -f "$_MCP_CFG"
 
 # Reap journals the agent marked consolidated::, then reindex the restructured tree.
 "$MEMIDX" -w "$WS" consolidate --reap >>"$LOG" 2>&1 || true

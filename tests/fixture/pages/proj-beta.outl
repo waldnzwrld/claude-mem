@@ -1,0 +1,41 @@
+{
+  "version": 2,
+  "page_id": "03H4V6Y8R6BMY9J35WVEFVNMHR",
+  "last_synced_hash": "sha256:542dfe05735a24c8036009d88add0c9f876891349b65e26c1ded24542f622cad",
+  "last_synced_at": "2026-09-13T22:32:55.268499+02:00",
+  "blocks": [
+    {
+      "id": "01M2E7J4B4S0ST8EYFGBTV5MR2",
+      "line": 1,
+      "indent": 0,
+      "content_hash": "sha256:82dfc94e73d7f1f84d2e682611c05238b098241be3f0a88b65285aedbbad5cb7",
+      "ref_handle": "blk-tv5mr2",
+      "text": "type:: moc"
+    },
+    {
+      "id": "01M2E7J4B40XVC6PYYTZJY1TAZ",
+      "line": 2,
+      "indent": 0,
+      "content_hash": "sha256:532bbf90c505b9134985e07264dd31274debe0725fb0846be1e9704c16823c95",
+      "ref_handle": "blk-jy1taz",
+      "text": "parent:: [[index]]"
+    },
+    {
+      "id": "01M2E7J4B4SWJ629MD5422WV33",
+      "line": 3,
+      "indent": 0,
+      "content_hash": "sha256:68ae27f25b6cc1b561ab0be5f104403a65bcdb1dabb398e6684d2e06bf7348b1",
+      "ref_handle": "blk-22wv33",
+      "text": "## Children"
+    },
+    {
+      "id": "01M2E7J4B44MB74VT9G4S001N3",
+      "line": 4,
+      "indent": 0,
+      "content_hash": "sha256:5f27fe4ff1feeb8db122df2e2fb83ba4e2692d20091e41b4d14fea15db99895f",
+      "ref_handle": "blk-s001n3",
+      "text": "[[beta-notes]] — beta notes"
+    }
+  ],
+  "pipeline_version": 4
+}

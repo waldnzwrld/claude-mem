@@ -1,0 +1,49 @@
+{
+  "version": 2,
+  "page_id": "5W3V0G6NBYZ9RRRNVSZWZD9NVR",
+  "last_synced_hash": "sha256:206bb08f6bae3c706bbfab56496e83be49e1a329e2e34c0de8e4d0cba4d10968",
+  "last_synced_at": "2026-09-13T22:32:54.911332+02:00",
+  "blocks": [
+    {
+      "id": "01M2E7J3ZGXPBCM0MNFAGTMSB4",
+      "line": 1,
+      "indent": 0,
+      "content_hash": "sha256:82dfc94e73d7f1f84d2e682611c05238b098241be3f0a88b65285aedbbad5cb7",
+      "ref_handle": "blk-gtmsb4",
+      "text": "type:: moc"
+    },
+    {
+      "id": "01M2E7J3ZGFFNT97SHNETA6GSS",
+      "line": 2,
+      "indent": 0,
+      "content_hash": "sha256:fcfd91ca588cb50b3e45d7f9304d0df1a3b6faf456dc17040e8df233556a2267",
+      "ref_handle": "blk-ta6gss",
+      "text": "## Projects"
+    },
+    {
+      "id": "01M2E7J3ZGF5GN5ARSXHBGVP8E",
+      "line": 3,
+      "indent": 0,
+      "content_hash": "sha256:1c4973276d12ca7b565f040ab06ba8ae0f04187edbb1d9060cd6cd83fb0486ca",
+      "ref_handle": "blk-bgvp8e",
+      "text": "[[proj-alpha]] — alpha"
+    },
+    {
+      "id": "01M2E7J3ZGB8G07HZYR9CQD6FG",
+      "line": 4,
+      "indent": 0,
+      "content_hash": "sha256:677cd8ad6280a97650716f064732f87d63da69ac2ea43d1e814124095c134354",
+      "ref_handle": "blk-cqd6fg",
+      "text": "[[proj-beta]] — beta"
+    },
+    {
+      "id": "01M2E7J3ZG7TD1BNH4CFTX18CZ",
+      "line": 5,
+      "indent": 0,
+      "content_hash": "sha256:2d5b1ef7ae505419d5ffaf9555b17a29e6ab89f6ce7a0d87085506981c94b110",
+      "ref_handle": "blk-tx18cz",
+      "text": "[[misc]] — misc"
+    }
+  ],
+  "pipeline_version": 4
+}

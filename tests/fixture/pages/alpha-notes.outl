@@ -1,0 +1,65 @@
+{
+  "version": 2,
+  "page_id": "6ED6WXSPP4G5CPT440EA6Q4A8P",
+  "last_synced_hash": "sha256:98c9056367d82c48d3e2ad0749576f9447def31bbb27aefce335dc3741944ba0",
+  "last_synced_at": "2026-09-13T22:32:55.672418+02:00",
+  "blocks": [
+    {
+      "id": "01M2E7J4P49GC7AWMC63HDWTSX",
+      "line": 1,
+      "indent": 0,
+      "content_hash": "sha256:260520b0dcf3f658c8a30a9ccb5cc30b5f21fa9843d873bc6b3167fbcd3973e9",
+      "ref_handle": "blk-hdwtsx",
+      "text": "type:: knowledge"
+    },
+    {
+      "id": "01M2E7J4P4R7ZV6TJJ6DKV4VHF",
+      "line": 2,
+      "indent": 0,
+      "content_hash": "sha256:147e7e87bf4885f7bf02f8c7ae83566545ddae1e820c5e7b140003c6c3b30a74",
+      "ref_handle": "blk-kv4vhf",
+      "text": "parent:: [[proj-alpha]]"
+    },
+    {
+      "id": "01M2E7J4P4YGMH9D650AB25ZCW",
+      "line": 3,
+      "indent": 0,
+      "content_hash": "sha256:63e13e87b378d1e85f838ead267db9020c1457b1118a37e0af9fb5f976144f4b",
+      "ref_handle": "blk-b25zcw",
+      "text": "## Notes"
+    },
+    {
+      "id": "01M2E7J4P4CNGE2K116ETEEEZY",
+      "line": 4,
+      "indent": 0,
+      "content_hash": "sha256:50e5c4d4b59abe2617ed19c73a15aab2d642d1c30de8c246cec30aa4be60e578",
+      "ref_handle": "blk-teeezy",
+      "text": "first durable fact about alpha"
+    },
+    {
+      "id": "01M2E7J4P4276Y7TDNVM7JR41B",
+      "line": 5,
+      "indent": 0,
+      "content_hash": "sha256:8ef48605e3a9f26ca2e913c89661b5f0e5289c0cdde16b931842444a42047d2f",
+      "ref_handle": "blk-7jr41b",
+      "text": "second durable fact about alpha"
+    },
+    {
+      "id": "01M2E7J4P4CD23GC95YG73Z93Z",
+      "line": 6,
+      "indent": 0,
+      "content_hash": "sha256:13b8d1375d92c62e98a2ffd61ff47c70c5ba3d54267c3e1228a19c3b08fb441c",
+      "ref_handle": "blk-73z93z",
+      "text": "a cross-reference to [[alpha-stale]] which may age out"
+    },
+    {
+      "id": "01M2E7J4P4ECQE49FB11EW2V10",
+      "line": 7,
+      "indent": 0,
+      "content_hash": "sha256:cf199c33e67a5dea9fe1a21042476a7895a2003d2c9a7914533716bf3100ffb0",
+      "ref_handle": "blk-ew2v10",
+      "text": "related work lives in [[alpha-decisions]]"
+    }
+  ],
+  "pipeline_version": 4
+}
