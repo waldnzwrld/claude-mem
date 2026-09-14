@@ -95,10 +95,13 @@ FM_RE = re.compile(r"^([A-Za-z_][\w-]*)::\s?(.*)$")
 LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 SECTION_RE = re.compile(r"^\s*-\s+(#{1,6})\s+(.*)$")  # a bullet whose text is a heading
 
-# Frontmatter keys that MUST be hoisted (parse_md reads `key:: value` only above the first
-# bullet). If one appears as a body bullet, the page falls out of tracking. doctor flags it.
-HOISTABLE_KEYS = ("type", "frecency", "seen", "parent", "project", "summary",
-                  "updated", "tags", "status", "pin", "source", "icon", "aliases")
+# Col-0 page properties: parse_md lifts only the leading `key:: value` lines (above the first
+# bullet) into the frontmatter dict. Exactly these four are col-0 in the canonical form;
+# everything else (type, parent, project, summary, updated, tags, status, …) is authored as a
+# body bullet by design. A col-0 key that instead appears as a body bullet is invisible to
+# parse_md: frecency/seen bulleted drops the page out of the decay sweep (the silent-untracked
+# trap); title/icon bulleted loses it from the index. doctor flags any that are bulleted.
+HOISTABLE_KEYS = ("frecency", "seen", "title", "icon")
 PROP_BULLET_RE = re.compile(
     r"^\s*-?\s*(" + "|".join(HOISTABLE_KEYS) + r")::\s", re.IGNORECASE)
 

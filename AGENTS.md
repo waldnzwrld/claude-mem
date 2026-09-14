@@ -134,8 +134,9 @@ Depth is not fixed — add a level whenever one gets crowded.
   — nest as deep as the material needs; each just links its children with hooks. Add
   another level whenever a TOC's link list gets long.
 - **Leaf documents** (`type:: knowledge`, `parent:: [[<toc>]]`) — the actual subject matter.
-  Props `project::`, `updated::`, `summary::`, `tags::`, plus frecency `frecency::` (int) /
-  `seen::` (date). `pin:: true` protects a foundational leaf from pruning.
+  Props `project::`, `updated::`, `summary::`, `tags::`, plus the frecency pair `frecency::`
+  (int) / `seen::` (date) that **every** page now carries — leaves and TOCs alike (see
+  *Frecency & pruning*). There is no `pin::` exemption.
 - **Journals** — one per day, slug `YYYY-MM-DD`. Five fixed sections, in this order:
   `## Focus`, `## Key Decisions`, `## Discoveries`, `## Action Items`, `## Session Notes` —
   laid down **once** by the `journal` template (see `templates-journal`), then appended to
@@ -156,11 +157,14 @@ Two rules keep the tree lean:
   traverse a few tiny pages than load one huge one. This is **automatic**: the daily
   `memory-index maintain` sweep flags any page over budget (leaf or hub), and the SessionStart
   hook hands them to the headless `memory-consolidate` compaction agent (which also distils
-  journals and prunes dead leaves) — it carves them with no prompting. A `⚠ Split-on-growth
-  candidates` directive is only the fallback for when the agent CLI is unavailable.
-- **TOCs live with their children.** A TOC is structural — effectively pinned while it holds
-  ≥1 live child, and not itself frecency-decayed. When pruning removes its last child,
-  delete the now-empty TOC and its link in the parent too.
+  journals and prunes dead lines, leaves, and TOCs) — it carves them with no prompting. A `⚠
+  Split-on-growth candidates` directive is only the fallback for when the agent CLI is
+  unavailable.
+- **TOCs live with their children — via frecency, not exemption.** A TOC now carries and
+  decays frecency like any page, but every use of a descendant propagates credit *up* the
+  `parent::` chain (see *Frecency & pruning*), so a TOC stays warm as long as anything beneath
+  it is used and only ages to 0 once its whole subtree is cold — at which point `maintain`
+  trashes the TOC together with its subtree. You no longer prune empty TOCs by hand.
 
 ## Crosslinking conventions
 
@@ -373,61 +377,65 @@ current window.
 
 ## Frecency & pruning
 
-Leaf documents that stop earning their place are dropped, so the tree of TOCs never
-accretes dead pages. Frecency = frequency + recency, kept integer-simple (no exponentials)
-so it is maintainable by hand, and scaled to a **~1-month** window — long enough that
-real-but-occasional knowledge survives, short enough that stale detail clears out.
+Every node — every content **line**, every **leaf**, and every **TOC/MOC** — that stops
+earning its place is dropped, so the tree never accretes dead weight. Frecency = frequency +
+recency, kept integer-simple (no exponentials), scaled to a **~1-month** window: long enough
+that real-but-occasional knowledge survives, short enough that stale detail clears out. It is
+the **sole retention metric** for this decay-cache memory, and it runs at **three
+granularities**, all sharing the same seed **30** / cap **60** / **−1-per-day** decay:
 
-- **Only leaf documents** (`type:: knowledge`) carry and decay frecency. **TOCs are not
-  decayed** — they live while they hold ≥1 live child (see *The graph model*).
-- Each leaf carries `frecency::` (integer, seed **30**, cap **60**) and `seen::` (last date
-  the score changed).
-- **On material use** — a use credits `frecency` **+5** (cap 60) and sets `seen:: <today>`.
-  Opening a leaf with `outl_page_get` is now credited **automatically**: a
-  `PostToolUse` hook runs `memory-index touch <slug>` on every successful fetch (it
-  self-skips non-`knowledge` slugs and caps at 60), so a plain read needs **no** manual
-  bump — do not hand-bump on top of a fetch. Still bump by hand for a use that is *not* a
-  fetch — e.g. merging into a leaf during condensation — via `outl page prop set` or
-  `memory-index touch`.
-- **Daily sweep — now mechanized by the hook.** On the first session of a new day the
-  SessionStart hook runs `memory-index maintain`, which decays every non-pinned
-  `type:: knowledge` leaf whose `seen::` is not today by `frecency − 1` and sets
-  `seen:: <today>` (writes go through `outl page prop set`, so the `.outl` sidecar stays in
-  sync — the decay arithmetic is no longer yours to do by hand). **Pruning stays yours:**
-  the sweep does not delete anything; it surfaces any leaf that reached `0` as a *prune
-  candidate* in the injected context. For each candidate, decide whether to
-  `outl_page_delete <slug> confirm:true` (then remove its link from the parent TOC, and the
-  parent TOC too if that was its last child) or bump it if it's still relevant. Deletion
-  needs the link cleanup, which is why it is a reviewed action, not automatic.
-- `pin:: true` exempts a foundational leaf (project-critical or identity knowledge) from
-  decay and pruning entirely.
-- Optional: order each TOC's link list by `frecency` (high → low) so the most-used
-  pathways surface first.
+- **Page (leaf AND TOC).** *Every* page carries `frecency::` (integer) and `seen::` (last date
+  the score changed) as **hoisted frontmatter** — leaves and MOCs alike. There is **no `pin::`
+  exemption** any more; a foundational page is protected only by sitting on a warm access path
+  (see *Credit* below). Only **journals** are outside frecency — they have their own
+  count-based retention (see *Condensation*).
+- **Line (content block).** Each real content bullet decays independently, keyed by its
+  **stable outl block id**, so a stale line inside an otherwise-live page ages out on its own
+  while the file lives. Scores live in a ws-level ledger
+  `~/.claude/memory/.frecency/sections.json` keyed `{slug: {block_id: {f, seen}}}` —
+  **outside** `.outl/`, so a `rebuild` never wipes it. It is a usage signal, not knowledge: if
+  lost, lines just reseed at 30. **Never hand-edit it;** `memory-index` owns it. (Headings and
+  frontmatter props are not tracked lines.)
 
-**Section-level frecency (within a leaf).** Page frecency ages out a whole leaf; section
-frecency ages out an individual `## section` of a leaf, so a stale note inside an otherwise
-live leaf clears on its own instead of riding the leaf's score. Same model, one granularity
-down:
+**Credit — a use warms the whole access path.** Reinforcement is `touch`'s job (decay's
+counterpart), fired automatically by the `PostToolUse(outl_page_get)` hook on every successful
+fetch, any page type, and safe to run by hand (`memory-index touch <slug>`). One fetch credits:
 
-- **Unit & store.** Granularity is the `## section` (the unit the index chunks and a search
-  hit resolves to). Scores live in a ws-level ledger `~/.claude/memory/.frecency/sections.json`
-  keyed `{slug: {heading: {f, seen}}}` — **outside** `.outl/`, so `rebuild` never wipes it. It
-  is a usage signal, not knowledge: if lost, sections just reseed at 30. **Never hand-edit it**;
-  `memory-index` owns it.
-- **Credit (the attribution the whole-page fetch can't give).** A whole-page `outl_page_get`
-  is weak evidence, so it bumps *every* section of the page only **+2**. The precise signal is
-  the **search hit**: it resolves to an exact `slug › heading`, so the push-retrieval hook's
-  `memory-index search --credit` bumps just that section **+1** (seed 30, cap 60).
-- **Decay & prune.** The same daily `maintain` sweep decays each section **−1** in lockstep
-  with its leaf (pin/`seen`-guarded), GCs headings that no longer exist, and surfaces any
-  section that reached **0** as a *section prune candidate* (`slug › heading`). Pruning one
-  removes **just that section's subtree** (`outl_block_delete` the heading block + descendants),
-  never the whole leaf, preserving crosslinks into sibling sections — the background compaction
-  agent does this, or the injected `⚠` directive is the fallback. `doctor` shows a `sec-decay`
-  line; a rename reseeds that section (acceptable for a usage ledger).
+- the fetched page **+5** (cap 60);
+- **every ancestor MOC up the `parent::` chain +5** — using a memory means using the index that
+  led to it, so an index never dies while anything reached through it stays live. This upward
+  propagation is what makes MOC decay safe: a TOC only reaches 0 once its *entire subtree* has
+  gone cold.
+- every content line of the fetched page **+2** — a whole-page fetch is weak per-line evidence.
+  The precise line signal is the **search hit**: `memory-index search --credit` (the
+  push-retrieval hook) resolves to an exact `slug › heading` and bumps just the matched lines
+  **+1**.
 
-Scale: a fresh leaf (seed 30) survives ~30 idle days; each use adds ~5 days; a
-heavily-used leaf rides at the 60-day cap. Deletion here is intentional and unrecoverable,
+Because the fetch hook already credits reads, do **not** hand-bump on top of a fetch. Still
+bump by hand for a use that is *not* a fetch — e.g. merging into a leaf during condensation —
+via `outl page prop set` or `memory-index touch`. Optionally order a TOC's link list by
+`frecency` (high → low) so the most-used pathways surface first.
+
+**Decay & eviction — silent and mechanical, no longer yours to review.** On the first session
+of a new day the SessionStart hook runs `memory-index maintain`, which decays every page (leaf
+and MOC) and every content line whose `seen::` is not today by **−1**, writing through `outl`
+so the `.outl` sidecar stays in sync. Anything that reaches **0 is FORGOTTEN immediately** —
+no prompt, no injected `⚠` candidate list, no reviewed step:
+
+- **line → 0** — delete just that block (`outl block delete`); the file stays.
+- **leaf → 0** — soft-trash the page and scrub `[[it]]` out of every surviving block; the
+  parent TOC stays.
+- **MOC → 0** — soft-trash the MOC **and its whole subtree** (all descendants via `part-of`),
+  and scrub inbound refs. Upward credit propagation guarantees this only fires once the entire
+  subtree is cold, so the cascade is safe.
+
+The old "pruning stays yours / prune-candidate directive" step is **gone**: `maintain`
+performs all deletion itself through `outl`, then refreshes the index. `doctor` still reports
+`decay-risk` (page ≤5) and `sec-decay` (line ≤5) for visibility, and the ledger GCs block ids
+that no longer exist.
+
+Scale: a fresh node (seed 30) survives ~30 idle days; each use adds ~5 days; a
+heavily-used node rides at the 60-day cap. Deletion here is intentional and unrecoverable,
 exactly like journal burning.
 
 ## Research references (external live docs)
@@ -440,9 +448,11 @@ node, and the pruning sweep — `outl_page_delete` — could destroy it). Link t
 
 - **Kind.** `type:: reference`, slug `research-<topic>`. Props: `source:: <absolute path to
   the ~/Code/research/*.md file>`, `status:: active | complete`, `parent:: [[research]]`,
-  `summary::`, `updated::`. **No `frecency::` / `seen::` pair** — like a TOC, it is exempt
-  from the daily frecency sweep by construction (the sweep only decays `type:: knowledge`
-  leaves). Its lifecycle is governed by `status::`, not by access frequency.
+  `summary::`, `updated::`, plus the frecency pair `frecency::` / `seen::` like any page.
+  `maintain` decays every non-journal page, so a stub also ages out if it is never touched —
+  but its **primary lifecycle is `status::`**: it is deleted explicitly on `status:: complete`
+  (below), and while its research stays in use, fetching the stub (or the `[[research]]` walk
+  that lands on it) keeps it warm well ahead of decay.
 - **Pointer, not copy.** The stub stores the *path*, never the content, so it is always
   current — to read the research, open `source::` directly. Body = one-line hook + `[[...]]`
   links to the projects/topics it concerns + a "Live file: `<source>`" pointer line.
@@ -461,11 +471,10 @@ node, and the pruning sweep — `outl_page_delete` — could destroy it). Link t
 - **Every node is reachable from `index` by following links** — no orphans. Each TOC links
   its children with a one-line hook; each leaf sets `parent:: [[<toc>]]`. The
   `## Recent journals` list reflects the retention window.
-- Every TOC carries `type:: moc`; every leaf carries `type:: knowledge`, `project::`,
-  `parent::`, `updated::`, `summary::`, and the frecency pair `frecency::` / `seen::`
-  (foundational leaves add `pin:: true`). Reference stubs carry `type:: reference` +
-  `source::` + `status::` and deliberately omit the frecency pair (see *Research
-  references*).
+- **Every page carries the frecency pair `frecency::` / `seen::`** (see *Frecency & pruning*) —
+  TOCs (`type:: moc`), leaves (`type:: knowledge`, plus `project::`, `parent::`, `updated::`,
+  `summary::`), and reference stubs (`type:: reference` + `source::` + `status::`) alike. Only
+  journals are exempt, and there is no `pin::` exemption.
 - **Keep every page small.** ANY page — leaf or TOC — whose body exceeds ~1800 tokens (the
   `MEMORY_SPLIT_TOKENS` budget) is automatically split by the compaction agent: a leaf into a
   TOC + child leaves, an overgrown hub into grouped sub-TOCs (see *Split on growth* and *The
