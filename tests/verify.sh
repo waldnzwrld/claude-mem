@@ -137,6 +137,17 @@ R="$(evicted_json "$W")"
 check "no pages evicted" "$(printf '%s' "$R" | jq_py "len(d['evicted_pages'])")" "0"
 check "no blocks evicted" "$(printf '%s' "$R" | jq_py "len(d['evicted_blocks'])")" "0"
 
+echo "[10] body-bullet summary/updated are indexed (canonical leaf form)"
+W="$(setup s10)"
+"$OUTL" -w "$W" page create bullet-probe --title "Bullet probe" \
+  --content '[{"text":"type:: knowledge"},{"text":"parent:: [[index]]"},{"text":"updated:: 2020-02-02"},{"text":"summary:: probe notes with quarterly cadence token"},{"text":"## Body"},{"text":"a durable body line"}]' >/dev/null 2>&1
+"$MI" -w "$W" rebuild >/dev/null 2>&1
+pcol() { sqlite3 "$1/.outl/index.sqlite" "SELECT $3 FROM pages WHERE slug='$2'"; }
+check "summary captured from bullet" "$(pcol "$W" bullet-probe summary)" "probe notes with quarterly cadence token"
+check "updated captured from bullet" "$(pcol "$W" bullet-probe updated)"  "2020-02-02"
+FTS="$("$MI" -w "$W" search "quarterly" --no-graph --json 2>/dev/null | jq_py "any(r.get('slug')=='bullet-probe' for r in d['results'])")"
+check "summary text reached FTS"     "$FTS" "True"
+
 echo
 printf 'TOTAL: \033[32m%d passed\033[0m, ' "$PASS"
 if [ "$FAIL" -gt 0 ]; then printf '\033[31m%d failed\033[0m\n' "$FAIL"; exit 1; fi

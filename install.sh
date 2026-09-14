@@ -156,6 +156,11 @@ for sub in ('doctor', 'search', 'stats'):
 # `outl doctor --repair <other-workspace>` still prompts. Bare + rtk-rewritten.
 allow_wanted.append('Bash(outl doctor --repair %s:*)' % mem)
 allow_wanted.append('Bash(rtk outl doctor --repair %s:*)' % mem)
+# outl block/page delete on the memory workspace, only with --confirm in the invocation.
+allow_wanted.append('Bash(outl -w %s block delete --confirm:*)' % mem)
+allow_wanted.append('Bash(rtk outl -w %s block delete --confirm:*)' % mem)
+allow_wanted.append('Bash(outl -w %s page delete --confirm:*)' % mem)
+allow_wanted.append('Bash(rtk outl -w %s page delete --confirm:*)' % mem)
 
 perms = data.setdefault('permissions', {})
 allow = perms.get('allow')

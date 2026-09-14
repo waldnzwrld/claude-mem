@@ -251,6 +251,34 @@ def parse_md(path: str):
     return fm, body, raw
 
 
+BODY_PROP_RE = re.compile(r"^\s*-\s*([A-Za-z_][\w-]*)::\s?(.*)$")
+
+
+def body_props(body: list[str]) -> dict:
+    """Leading `- key:: value` property bullets. The canonical leaf/TOC form authors
+    type/project/parent/updated/summary/tags/status as body bullets (only frecency/seen/
+    title/icon are hoisted col-0 frontmatter — see HOISTABLE_KEYS), so summary/updated live
+    HERE, not in the parse_md frontmatter dict. Scanned only up to the first `## heading`
+    bullet, so a content bullet that happens to contain `::` is never mistaken for a prop."""
+    props: dict = {}
+    for ln in body:
+        if SECTION_RE.match(ln):
+            break
+        m = BODY_PROP_RE.match(ln)
+        if m:
+            props.setdefault(m.group(1), m.group(2).strip())
+    return props
+
+
+def page_meta(fm: dict, body: list[str]) -> dict:
+    """Effective page metadata: body-bullet props overlaid by col-0 frontmatter, so a
+    hoisted value (legacy pages that put summary/updated at col-0) still wins while the
+    canonical bulleted form is read from the body."""
+    meta = body_props(body)
+    meta.update({k: v for k, v in fm.items() if v not in (None, "")})
+    return meta
+
+
 def chunk_body(fm: dict, body: list[str]):
     """Split a page body into section-sized chunks: one per `## heading` bullet
     (with its descendants), plus a synthetic title+summary chunk. Coherent units
@@ -420,6 +448,7 @@ def _index_files(con, ws: str, files, full: bool):
         if not full:
             _delete_slug(con, slug)
         fm, body, raw = parse_md(path)
+        meta = page_meta(fm, body)
         con.execute(
             "INSERT INTO pages(slug,kind,path,page_hash,title,summary,updated,frecency) "
             "VALUES(?,?,?,?,?,?,?,?)",
@@ -428,14 +457,14 @@ def _index_files(con, ws: str, files, full: bool):
                 kind,
                 path,
                 sha256_text(raw),
-                fm.get("title"),
-                fm.get("summary"),
-                fm.get("updated"),
+                meta.get("title"),
+                meta.get("summary"),
+                meta.get("updated"),
                 _int_or_none(fm.get("frecency")),
             ),
         )
-        page_title = fm.get("title") or ""
-        for heading, text in chunk_body(fm, body):
+        page_title = meta.get("title") or ""
+        for heading, text in chunk_body(meta, body):
             # Title goes in the weighted `title` column only on the synthetic summary chunk;
             # on every chunk it would crush the title term's IDF.
             fts_title = page_title if heading == "(summary)" else ""
@@ -785,11 +814,14 @@ def _cap(items, n=8):
 
 
 def _unhoisted_props(ws: str) -> dict:
-    """Pages whose BODY contains a `key:: value` bullet for a hoistable key — i.e. props
-    authored as bullets instead of frontmatter, which parse_md cannot see. Returns
-    {slug: [keys]}. Read-only, from the source markdown. This is the guard against the
-    silent-untracked trap: a leaf whose `type:: knowledge` lives in the body is invisible
-    to the frecency sweep, so it never decays or gets credited."""
+    """Pages whose BODY contains a `key:: value` bullet for a HOISTABLE key (frecency,
+    seen, title, icon) — props authored as bullets instead of col-0 frontmatter, where
+    parse_md cannot see them. Returns {slug: [keys]}. Read-only, from the source markdown.
+    This is the guard against the silent-untracked trap: a bulleted `frecency::`/`seen::`
+    is invisible to parse_md, so the page drops out of the decay sweep; a bulleted
+    `title::`/`icon::` is lost from the index. Only these four are checked — every other
+    prop (type, project, parent, updated, summary, …) is a body bullet BY DESIGN and is
+    read from the body (see page_meta)."""
     out = {}
     for slug, kind, path in iter_source_files(ws):
         if kind != "page":
