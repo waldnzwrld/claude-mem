@@ -1,14 +1,12 @@
 # claude-mem — persistent memory for Claude Code
 
-A cross-session memory system for [Claude Code](https://claude.com/claude-code), built on
-an [outl](https://github.com/outlmd/outl) knowledge graph of linked markdown. It gives an
-agent durable, self-maintaining memory: recent context is injected at session start,
-older notes are automatically distilled into a knowledge tree, and recall is served by a
-dependency-free SQLite retrieval sidecar.
+Cross-session memory for [Claude Code](https://claude.com/claude-code), built on an
+[outl](https://github.com/outlmd/outl) markdown graph at `~/.claude/memory`. Recent context is
+injected at session start, aged journals are distilled into a knowledge tree, and recall is
+served by a stdlib-only SQLite sidecar.
 
-The **outl markdown graph at `~/.claude/memory` is the single source of truth.** Everything
-else — the SQLite index, the injected context, the daily housekeeping — is derived from it
-and can be rebuilt from the markdown on any machine.
+The outl markdown graph is the **single source of truth**. The SQLite index, the injected
+context, and the daily housekeeping are all derived from it and rebuildable from the markdown.
 
 ## How it works
 
@@ -37,98 +35,101 @@ and can be rebuilt from the markdown on any machine.
                         └──────────────────┘
 ```
 
-- **Journals** (`journals/YYYY-MM-DD.md`) capture the working narrative day by day. The
-  agent appends durable facts as it works; on session close the **SessionEnd** hook runs a
-  cheap headless agent (`claude-memory-dump`) that flushes anything still uncaptured — so
-  journaling never depends on a context compaction happening. The **5 most recent** journals
-  are kept in high resolution; anything older is **distilled** into the knowledge tree and
-  reaped — automatically.
-- **Knowledge pages** (`pages/*.md`) are the durable, deduplicated memory: a tree of
-  tables-of-contents linked by typed `[[wikilinks]]`, with `frecency` decay so stale
-  leaves surface as prune candidates.
-- **Retrieval auto-scales.** Below a node threshold the graph is small enough to read by
-  descending the TOC; at/above it, `memory-index search` becomes the search-first entry
-  point. The hook tells the agent which regime is active.
-- **Retrieval is also pushed, not only pulled.** A `UserPromptSubmit` hook runs the index
-  against each prompt and injects the strong hits as pointers before the agent acts — so
-  relevant memory surfaces even when the agent wouldn't have thought to look. It's gated
-  conservatively (bm25 ceiling, ≤3 pointers, deduped per session) so trivial prompts inject
-  nothing. Fetching a surfaced page (`outl_page_get`) then credits its frecency via a
-  `PostToolUse` hook, closing the loop the daily decay sweep opens.
+- **Journals** (`journals/YYYY-MM-DD.md`) hold the day's working notes. The agent appends
+  durable facts as it works; on session close the **SessionEnd** hook runs `claude-memory-dump`
+  to flush anything uncaptured. The **5 most recent** journals are kept; older ones are distilled
+  into the knowledge tree and reaped.
+- **Knowledge pages** (`pages/*.md`) are a TOC tree linked by typed `[[wikilinks]]`. Retention
+  is by **frecency**: `frecency::` is a checkpoint stamped at `seen::`, and effective frecency =
+  `frecency − days_since(seen)`. A leaf/line is evicted at effective ≤ 0 (mechanical, no review).
+  A fetch credits the page +5 (cap 60), stamps `seen = today`, and propagates +5 up the
+  `parent::` chain. The daily sweep writes only evictions.
+- **Retrieval auto-scales.** Below a node threshold, memory is read by TOC descent; at/above it,
+  `memory-index search` is the entry point. The hook reports which regime is active.
+- **Push-retrieval.** A `UserPromptSubmit` hook runs the index against each prompt and injects
+  strong hits as pointers. Gated: index active, bm25 ceiling, ≤3 pointers, per-session dedup.
+  Crediting runs in the background; `outl_page_get` also credits frecency via a `PostToolUse` hook.
+- **Tags** are a curated `#tag` facet layer, orthogonal to `[[links]]`. `memory-index search`
+  expands along shared `#topic/…` tags in parallel with the link walk. Numeric/off-vocabulary
+  tags are filtered out; PR/issue `#numbers` are excluded and normalized on install.
 
 ## Components
 
-Everything is deployed by `install.sh`:
+Deployed by `install.sh`:
 
 | File | Installed to | Role |
 |------|--------------|------|
-| `AGENTS.md` | `~/.claude/memory/AGENTS.md` | The full protocol the agent follows (graph model, crosslinking, writing, condensation, frecency, retrieval). |
-| `claude-memory-hook` | `~/.local/bin/` | SessionStart: inject TOC + recent-journal window, refresh the index, run daily chores. PreCompact: remind the agent to flush notes before compaction. SessionEnd: fire the on-close journaler. **UserPromptSubmit: push-retrieval** — surface memory relevant to the prompt as pointers (conservative bm25 gate, deduped per session). **PostToolUse(`outl_page_get`): frecency touch** — credit a fetched leaf's use. Designed to never fail a session. |
+| `AGENTS.md` | `~/.claude/memory/AGENTS.md` | The protocol the agent follows (graph model, crosslinking, writing, condensation, frecency, tags, retrieval). |
+| `claude-memory-hook` | `~/.local/bin/` | SessionStart: inject TOC + recent journals, refresh the index, run daily chores. PreCompact: remind to flush notes. SessionEnd: fire the journaler. UserPromptSubmit: push-retrieval (gated). PostToolUse(`outl_page_get`): frecency touch. Exits 0 on any error. |
 | `memory-index` | `~/.local/bin/` | Stdlib-only SQLite retrieval sidecar (see below). |
-| `memory-consolidate` | `~/.local/bin/` | Headless agent that distills aged journals into knowledge pages, then reaps them. Runs on **Sonnet 5** (override with `MEMORY_MODEL`). Single-instanced, safe to re-run. |
-| `claude-memory-dump` | `~/.local/bin/` | On-close journaler fired by the SessionEnd hook: a detached headless agent reads the session transcript and appends only the durable facts to today's journal, deduping against existing entries. Runs on **Sonnet 5**; never edits anything but the journal. |
-| `agents/memory-recall.md` | `~/.claude/agents/` | Read-only retrieval subagent (**Sonnet**) scoped to the outl read tools. The main thread delegates a deep memory lookup to it; it walks the graph in an isolated context and returns the conclusion + `[[slugs]]`, keeping page bodies out of the main thread's context. A page it fetches still credits frecency (the `PostToolUse` touch hook fires inside subagents too). |
-| `CLAUDE_TEMPLATE.md` | appended to `~/.claude/CLAUDE.md` | The `## Persistent memory` section that points the agent at the protocol. |
+| `memory-consolidate` | `~/.local/bin/` | Headless agent (Sonnet 5, override `MEMORY_MODEL`) that distills aged journals into knowledge pages, then reaps them. Single-instanced. |
+| `claude-memory-dump` | `~/.local/bin/` | SessionEnd journaler: a detached headless agent (Sonnet 5) that appends durable facts to today's journal, deduped. Skips sessions with no tool use; head/tail-truncates long transcripts. Edits only the journal. |
+| `agents/memory-recall.md` | `~/.claude/agents/` | Read-only retrieval subagent (Sonnet, outl read tools only). Returns a conclusion + `[[slugs]]`, keeping page bodies out of the main thread. Its fetches still credit frecency. |
+| `CLAUDE_TEMPLATE.md` | appended to `~/.claude/CLAUDE.md` | The `## Persistent memory` section pointing at the protocol. |
 
 ## `memory-index` — the retrieval sidecar
 
-A single Python file that builds a **derived, disposable** SQLite index over the markdown
-graph so recall lands on the right band in one shot, then walks outward along `[[links]]`.
+A single Python file that builds a derived, disposable SQLite index over the markdown graph.
+Stdlib only — `sqlite3`/FTS5 from CPython 3.9+; no packages, venv, build step, model, or
+network. Delete the index and `rebuild` reconstructs it from the markdown.
 
-**No dependencies.** Stdlib only — the `sqlite3`/FTS5 that ship with CPython 3.9+. No
-third-party packages, no virtualenv, no build step, **no model and no network.** Delete
-the index and `rebuild` reconstructs it from the markdown anywhere.
-
-**Lexical recall** is Porter-stemmed (so `consolidate` matches `consolidation`),
-diacritic-folded, and prefix-matched (`consol*` → `consolidation`), ranked by
-**field-weighted bm25** across three columns — page **title ≫ heading ≫ body** — so a
-title hit outranks an incidental body mention.
-
-**Graph expansion** walks the typed, weighted `[[link]]` edge table outward from the
-keyword hits via a recursive query — seeded by the keyword hits, it reaches associatively
-related nodes the query never matched lexically (spreading-activation style recall). Edge
-*type* (`refs` / `supersedes` / `contradicts` / `part-of`) is inferred from the wording
-around each link — the markdown is never annotated, so the source stays clean. Hop depth
-scales with graph size (1 → 2 → 3).
+- **Lexical recall:** Porter-stemmed, diacritic-folded, prefix-matched; field-weighted bm25
+  across three columns (title ≫ heading ≫ body).
+- **Graph expansion:** a recursive walk of the typed, weighted `[[link]]` edge table outward
+  from the keyword hits. Edge type (`refs` / `supersedes` / `contradicts` / `part-of`) is
+  inferred from the wording around each link; the markdown is never annotated. Hop depth scales
+  with graph size (1 → 2 → 3).
+- **Tag expansion:** a parallel axis from the same seeds (and any `#topic/…` named in the query)
+  that pulls pages sharing a curated `#tag` via an indexed join. Numeric/off-vocabulary tags are
+  filtered; `[[links]]` keep ranking primacy (tags are additive, never structural).
 
 ```
 memory-index rebuild        # full reindex from markdown (idempotent)
 memory-index refresh        # incremental: reindex only pages whose content changed
-memory-index search "q"     # field-weighted bm25 hits + typed [[link]] graph walk
+memory-index search "q"     # field-weighted bm25 hits + [[link]] graph walk + tag expansion
                             #   (--json for machine output; consumed by the push hook)
-memory-index touch <slug>…  # credit a use: frecency +5 (cap 60), seen=today, on the named
-                            #   knowledge leaves (fired by the PostToolUse page-get hook)
+memory-index touch <slug>…  # credit a use: frecency +5 (cap 60), seen=today, up the parent chain
 memory-index stats          # node/chunk/edge counts, freshness, active/inactive
-memory-index doctor         # read-only link-graph health report (--json)
+memory-index doctor         # read-only health report: link graph + tag-noise (--json)
 memory-index medic          # prune pathological edges from the index (--dry-run, --off)
-memory-index maintain       # daily frecency decay sweep (reports prune candidates)
-memory-index consolidate    # report the journal-consolidation backlog; --reap deletes
-                            #   aged journals the distiller marked `consolidated::`
+memory-index maintain       # daily lazy-decay sweep: evict at effective 0, stamp seen on first
+                            #   sight; reports split candidates
+memory-index consolidate    # journal-consolidation backlog; --reap deletes aged journals
+                            #   the distiller marked `consolidated::`
+memory-index normalize      # migrate the graph to the current standard (versioned, idempotent):
+                            #   --status | --apply | --force
 ```
 
-`search` flags: `-k N` (result count), `--no-graph` (keyword only).
-Workspace is `-w <dir>` (default `~/.claude/memory`, or `$MEMORY_WS`).
+`search` flags: `-k N` (result count), `--no-graph` (keyword only). Workspace: `-w <dir>`
+(default `~/.claude/memory`, or `$MEMORY_WS`).
 
-### Graph health: `doctor` and `medic`
+### `doctor` and `medic`
 
-Associative recall is only as good as the link graph, so two commands keep it honest —
-both operate on the **derived index only and never edit your markdown**:
+Both operate on the derived index only and never edit the markdown.
 
-- **`doctor`** — a read-only health report: orphans, dangling links (`[[links]]` to
-  non-existent pages), connected components (fragmentation), the hub node, superseded
-  targets, and frecency decay-risk, with a performance-first verdict. `--json` for scripts.
-- **`medic`** — prunes pathological edges from the index for performance/precision:
-  **dangling links** and **self-loops** by default, with opt-in `--cap-hubs N` (cap a
-  node's out-edges to the top-N by weight) and `--prune-superseded`. The heal set is
-  persisted as a policy, so every `refresh` (including the SessionStart hook's) keeps the
-  graph healthy. `--dry-run` previews; `--off` disables and restores edges from markdown.
+- **`doctor`** — read-only report: orphans, dangling `[[links]]`, connected components, hub node,
+  superseded targets, effective-frecency decay-risk, and **tag-noise** (numeric/off-vocabulary
+  `#tags`). Performance-first verdict; `--json` for scripts.
+- **`medic`** — prunes pathological edges from the index: dangling links and self-loops by
+  default; opt-in `--cap-hubs N` and `--prune-superseded`. The heal set is persisted as a policy
+  and re-applied on every `refresh`. `--dry-run` previews; `--off` restores edges from markdown.
+  Dead `[[links]]` stay in the source (they may be intentional placeholders); the medic only
+  stops the graph walk from traversing them.
 
-A dead `[[link]]` is often an intentional placeholder for a page yet to be written, so the
-medic leaves it in the source and merely stops the graph walk from wasting hops on it.
+### `normalize` — migrate to the current standard
+
+Conventions apply retroactively. `memory-index normalize` brings the existing graph up to the
+current standard, versioned by a `.standard-version` marker (idempotent; a no-op once current).
+`install.sh` runs it after an `outl backup`. Flags: `--status`, `--apply`, `--force`.
+
+Migration v1 strips PR/issue `#`-number tags: drop the `#`, adding `PR` only when not already
+labeled (`closed #450` → `closed PR 450`, `PR #272` → `PR 272`, `PR#273` → `PR 273`). Markdown
+links `[#272](url)` and non-references like `C#9` are left untouched. A block `outl` refuses to
+rewrite (e.g. a journal whose `.md` is ahead of the op log) is skipped and flagged by `doctor`.
 
 ## Installation
 
-**Prerequisites** (do these yourself — `install.sh` does not):
+Prerequisites (`install.sh` does not do these):
 
 ```bash
 brew tap outlmd/outl https://github.com/outlmd/outl
@@ -138,18 +139,18 @@ outl init ~/.claude/memory
 claude mcp add outl --scope user -- outl --workspace ~/.claude/memory mcp serve
 ```
 
-**Then deploy the memory system:**
+Deploy:
 
 ```bash
 ./install.sh
 ```
 
 `install.sh` copies the files into place, patches the hook's `outl` path for this machine's
-Homebrew, wires the SessionStart + PreCompact + SessionEnd hooks into
-`~/.claude/settings.json`, appends the `## Persistent memory` section to
-`~/.claude/CLAUDE.md` (idempotently), and builds the initial index if the workspace exists.
-
-Start a **new** Claude Code session to load the memory system.
+Homebrew, wires the SessionStart + PreCompact + SessionEnd + UserPromptSubmit +
+PostToolUse(`outl_page_get`) hooks into `~/.claude/settings.json`, allows the outl MCP server,
+appends the `## Persistent memory` section to `~/.claude/CLAUDE.md` (idempotent), builds the
+index, and (after an `outl backup`) normalizes the graph to the current standard. Start a new
+Claude Code session to load the system.
 
 ## Uninstalling
 
@@ -157,39 +158,33 @@ Start a **new** Claude Code session to load the memory system.
 ./uninstall.sh
 ```
 
-Reverses `install.sh`'s three coupling actions: removes the SessionStart + PreCompact +
-SessionEnd hooks from `~/.claude/settings.json` (leaving any other hooks intact), deletes the
-deployed binaries from `~/.local/bin`, and strips the `## Persistent memory` section from
-`~/.claude/CLAUDE.md`.
-
-It **deliberately leaves `~/.claude/memory` and everything in it untouched** — your
-`pages/`, `journals/`, `AGENTS.md`, and the derived index all remain. This decouples the
-agent from the memory system without deleting any memory, so a later `./install.sh`
-re-couples everything with nothing lost. Safe to re-run (it no-ops on anything already
-removed); the change takes effect in a new session.
+Removes the SessionStart + PreCompact + SessionEnd + UserPromptSubmit + PostToolUse hooks from
+`~/.claude/settings.json` (other hooks intact), deletes the binaries from `~/.local/bin`, and
+strips the `## Persistent memory` section from `~/.claude/CLAUDE.md`. It leaves
+`~/.claude/memory` untouched, so a later `./install.sh` re-couples with nothing lost. Safe to
+re-run; effective in a new session.
 
 ## Requirements
 
 - **Claude Code** and the **outl** CLI + MCP server.
-- **Python 3.9+** (standard library only — used by `memory-index` and the hook).
+- **Python 3.9+** (standard library only).
 - **macOS** — the hook resolves `outl` via Homebrew; override with `OUTL_BIN` elsewhere.
 
 ## Design principles
 
-- **One source of truth.** The markdown graph is authoritative; the SQLite index is a pure,
-  rebuildable projection — never migrated in place, just rebuilt when the schema changes.
-- **Zero dependencies for retrieval.** `memory-index` is stdlib-only: no packages, no build,
-  no model, no network. It works on any machine that has Python.
-- **Degrade gracefully.** If the index or its tooling is missing, memory still works via
-  TOC traversal. The hooks are best-effort and exit 0 — a broken helper never fails a
-  session.
-- **Self-maintaining.** Journal consolidation and frecency decay run automatically from the
-  SessionStart hook, with a headless agent doing the LLM distillation in the background.
+- **One source of truth.** The markdown graph is authoritative; the SQLite index is a
+  rebuildable projection, rebuilt (never migrated in place) when its schema changes.
+- **Zero dependencies for retrieval.** `memory-index` is stdlib-only: no packages, build, model,
+  or network.
+- **Degrade gracefully.** If the index or its tooling is missing, memory still works via TOC
+  traversal; the hooks are best-effort and exit 0.
+- **Self-maintaining.** Consolidation and frecency decay run automatically from the SessionStart
+  hook; LLM distillation runs in a background headless agent.
+- **Standards apply retroactively.** Conventions are versioned; `install.sh` migrates the
+  existing graph up to a changed standard (backed up, idempotent).
 
 ## License
 
-`claude-mem` is released under the [MIT License](LICENSE).
-
-It depends on external tools it does not bundle or redistribute — notably
-[outl](https://github.com/outlmd/outl) (MIT), which you install yourself. See
-[THIRD_PARTY.md](THIRD_PARTY.md) for the dependency and licensing notes.
+`claude-mem` is released under the [MIT License](LICENSE). It depends on external tools it does
+not bundle — notably [outl](https://github.com/outlmd/outl) (MIT), which you install yourself.
+See [THIRD_PARTY.md](THIRD_PARTY.md) for dependency and licensing notes.

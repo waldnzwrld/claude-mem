@@ -26,6 +26,8 @@ WS="$HOME/.claude/memory"
 LOCKDIR="$WS/.dump.lock.d"
 LOG="$WS/.dump.log"
 MIN_LINES="${MEMORY_DUMP_MIN_LINES:-8}"   # skip trivial sessions
+MIN_TOOLUSE="${MEMORY_DUMP_MIN_TOOLUSE:-1}"   # skip sessions with no assistant tool-use at all
+MAX_TRANSCRIPT_LINES="${MEMORY_DUMP_MAX_TRANSCRIPT_LINES:-1200}"   # head+tail-slice beyond this
 TRANSCRIPT="${MEMORY_DUMP_TRANSCRIPT:-${1:-}}"
 
 # Never recurse: the spawned agent's SessionEnd must not refire this. The hook guards this too.
@@ -42,25 +44,46 @@ lines="$(wc -l < "$TRANSCRIPT" 2>/dev/null | tr -d ' ')"
 case "$lines" in ''|*[!0-9]*) lines=0 ;; esac
 [ "$lines" -ge "$MIN_LINES" ] || exit 0
 
+# Skip read-only/trivial sessions: no assistant tool-use at all means nothing durable
+# happened (a pure chat). Conservative on purpose — when unsure, proceed.
+tooluses="$(grep -c '"type":"tool_use"' "$TRANSCRIPT" 2>/dev/null | tr -d ' ')"
+case "$tooluses" in ''|*[!0-9]*) tooluses=0 ;; esac
+[ "$tooluses" -ge "$MIN_TOOLUSE" ] || exit 0
+
 # Single instance (portable, no flock). mkdir is atomic; clear a stale lock from a
 # crashed run (>60 min old) first.
 if [ -d "$LOCKDIR" ] && [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
   rmdir "$LOCKDIR" 2>/dev/null || true
 fi
 mkdir "$LOCKDIR" 2>/dev/null || exit 0
-trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
+trap 'rmdir "$LOCKDIR" 2>/dev/null; [ -n "${SLICE_FILE:-}" ] && rm -f "$SLICE_FILE"' EXIT
+
+# Very long transcripts are expensive to hand the agent whole; slice to head+tail
+# instead so it still sees session start and end. Below the bound, behave exactly
+# as before (full transcript, no note).
+TRANSCRIPT_FOR_AGENT="$TRANSCRIPT"
+SLICE_NOTE=""
+if [ "$lines" -gt "$MAX_TRANSCRIPT_LINES" ]; then
+  SLICE_FILE="$(mktemp "${TMPDIR:-/tmp}/memory-dump-slice.XXXXXX" 2>/dev/null)" || SLICE_FILE=""
+  if [ -n "$SLICE_FILE" ] && { head -n 400 "$TRANSCRIPT"; tail -n 800 "$TRANSCRIPT"; } >"$SLICE_FILE" 2>/dev/null; then
+    TRANSCRIPT_FOR_AGENT="$SLICE_FILE"
+    SLICE_NOTE=" (HEAD+TAIL slice of a $lines-line transcript: first 400 + last 800 lines; the middle was elided to save cost)"
+  else
+    SLICE_FILE=""
+  fi
+fi
 
 prompt="You are running headless as the memory-system session journaler. Do ONLY the task below, then stop — ignore everything else.
 
-A Claude Code session just ended. Its full transcript (JSONL, one message per line) is at:
-  $TRANSCRIPT
+A Claude Code session just ended. Its transcript (JSONL, one message per line) is at:
+  $TRANSCRIPT_FOR_AGENT$SLICE_NOTE
 
 Read that transcript, then record the session's DURABLE facts via the outl MCP tools, following the 'Two-tier writes', 'Writing to memory', 'What long-term memory is for', and 'Condensation' sections of ~/.claude/memory/AGENTS.md.
 
 Rules:
   1. FIRST call outl_daily_today to read today's journal. It may already contain entries the interactive agent wrote at checkpoints — you are ADDING to it, not replacing it.
   2. Extract ONLY what is worth remembering across sessions: decisions + their why, discoveries/gotchas, long-running plan state, cross-repo relationships, durable user facts. DROP chit-chat, transient tool output, and anything the code / its git log / its CLAUDE.md already records.
-  3. Append each new fact as a CHILD BULLET under the right existing section. The five sections are EXACTLY: ## Focus / ## Key Decisions / ## Discoveries / ## Action Items / ## Session Notes — they already exist in today's journal (the template laid them down). To append: from the outline you read in step 1, take the block id of the matching ## Section, then call outl_block_append with parent = that block id and text = just the bullet, with NO '## ' header inside the text. Do NOT use outl_daily_append for section content — it appends a FLAT top-level block and cannot nest, so it produces duplicate '## Focus'/'## Discoveries' headers and unsectioned bullets. NEVER emit a '## Section' header that already exists. Link each bullet outward to the [[project-...]] or [[topic]] it concerns. Be concise — one bullet per fact.
+  3. Append each new fact as a CHILD BULLET under the right existing section. The five sections are EXACTLY: ## Focus / ## Key Decisions / ## Discoveries / ## Action Items / ## Session Notes — they already exist in today's journal (the template laid them down). To append: from the outline you read in step 1, take the block id of the matching ## Section, then call outl_block_append with parent = that block id and text = just the bullet, with NO '## ' header inside the text. Do NOT use outl_daily_append for section content — it appends a FLAT top-level block and cannot nest, so it produces duplicate '## Focus'/'## Discoveries' headers and unsectioned bullets. NEVER emit a '## Section' header that already exists. Link each bullet outward to the [[project-...]] or [[topic]] it concerns. Be concise — one bullet per fact. When you have more than one bullet to add, batch them with outl_batch or outl_block_append_tree instead of one outl_block_append call per bullet.
   4. Do NOT duplicate anything already in today's journal — compare against what you read in step 1 and add only what is missing. Skip any item already marked #in-deep (it is already in deep memory).
   5. TIER each durable fact and act accordingly:
      - IMPACTFUL — a fact that (a) makes a current knowledge page inaccurate or incomplete, (b) reverses or supersedes a prior durable decision, or (c) introduces a new architectural component, cross-project relationship, or durable user fact — must be WRITTEN THROUGH to deep memory now, not left in the journal. Procedure: descend from the injected index / TOC to the target knowledge leaf (outl_page_get it; create a new leaf under the right TOC, splitting a crowded one, only if none fits); MERGE the distilled fact by editing or appending to that leaf — synthesise, do not paste, and never duplicate a point it already states; refresh its properties (updated to today; summary if it changed; ensure parent, project, and back-links; frecency +5 capped at 60, or seed 30 for a new leaf; seen to today); if a new leaf or TOC, add its one-line [[link]] + hook to the parent TOC (and the parent to index if it is a new top-level topic). THEN mark the journal breadcrumb for that fact with a trailing  #in-deep [[target-leaf]]  so condensation verifies rather than re-merges it.
@@ -68,7 +91,9 @@ Rules:
      - Everything else — journal only; condensation promotes or drops it later.
   6. EDIT-MERGE, NEVER CLOBBER. Always read a page (outl_page_get) before you write to it, and ADD to it. NEVER delete, rewrite, or reword an existing journal entry or existing leaf content. Whenever you change a page body, bump its updated to today. (An autonomous agent that pastes instead of merging duplicates pages — do not.)
   7. If the session produced nothing durable, do nothing at all.
-  8. Do NOT touch code, git, or anything outside the memory graph."
+  8. Do NOT touch code, git, or anything outside the memory graph.
+  9. Never write a bare '#272' for a PR/issue — use '[#272](url)' or 'PR 272'; a bare #-number pollutes the tag index.
+  10. Prefer outl_page_render over outl_page_get when you only need to read a page's rendered content, not edit it."
 
 MEMORY_DUMP_ACTIVE=1 "$CLAUDE" -p "$prompt" \
   --model "$MODEL" \

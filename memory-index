@@ -45,7 +45,12 @@ import sys
 import time
 
 WS_DEFAULT = os.path.expanduser("~/.claude/memory")
-SCHEMA_VERSION = 3  # stemmed/field-weighted FTS (title/heading/body columns)
+SCHEMA_VERSION = 4  # +pages.mtime (refresh mtime short-circuit) +page_tags (facet layer)
+# The memory STANDARD (content conventions), separate from the derived-index SCHEMA_VERSION.
+# `normalize` migrates a live graph up to this; the recorded level lives in a workspace marker
+# (`.standard-version`) so it survives index deletion. Bump when a convention changes and add a
+# migration to _MIGRATIONS. v1: strip PR/issue #-number tags (curated tag layer).
+STANDARD_VERSION = 1
 DEFAULT_THRESHOLD = 150  # node count at/above which the index is considered "active"
 
 # Field weights for bm25 over the (title, heading, text) FTS columns. A hit in the page
@@ -55,6 +60,25 @@ BM25_WEIGHTS = (10.0, 4.0, 1.0)
 FRECENCY_SEED = 30  # per AGENTS.md: a fresh leaf seeds at 30
 FRECENCY_CAP = 60   # per AGENTS.md: frecency saturates at 60
 FRECENCY_BUMP = 5   # per AGENTS.md: a material use credits +5 (see `touch`)
+
+
+def _days_since(seen: str, today: str):
+    """Whole days between `seen` and `today` (both YYYY-MM-DD), floored at 0. None if `seen`
+    is missing/unparseable — the caller treats that as 'no checkpoint yet' (stamp seen=today)."""
+    try:
+        s = datetime.date.fromisoformat((seen or "").strip())
+        t = datetime.date.fromisoformat(today)
+    except ValueError:
+        return None
+    return max(0, (t - s).days)
+
+
+def _effective(stored: int, seen: str, today: str) -> int:
+    """Lazy decay (4.1): effective frecency = checkpoint − days_since(seen). With no parseable
+    `seen`, no elapsed decay is applied here (the caller stamps seen=today as a one-time
+    migration). Decay is thus COMPUTED, never written day by day."""
+    d = _days_since(seen, today)
+    return stored if d is None else stored - d
 RETENTION_COUNT = 5  # keep the 5 most recent journal files; anything older is aged out
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -105,6 +129,64 @@ HOISTABLE_KEYS = ("frecency", "seen", "title", "icon")
 PROP_BULLET_RE = re.compile(
     r"^\s*-?\s*(" + "|".join(HOISTABLE_KEYS) + r")::\s", re.IGNORECASE)
 
+# --- tag facet layer -------------------------------------------------------
+# A `#tag` token (not a `## heading`). outl treats any `#token` in a page's subtree as a
+# facet tag classifying that page; we mirror that from the markdown for the search surface.
+TAG_RE = re.compile(r"(?<!#)#([A-Za-z0-9][A-Za-z0-9_/-]*)")
+
+
+def _keep_tag(tag: str) -> bool:
+    """Curated, numeric-free facet filter. Drops PR/issue-number pollution — ANY tag whose
+    first char is a digit (`272`, `248/`, `443-open`) — and empties. Namespaced `topic/x`,
+    `status/x`, and lifecycle tags (`active`, `in-deep`, `stale`, …) pass. Keeps the tag
+    search axis clean without depending on outl (perf-research 12.1 Layer 2)."""
+    t = (tag or "").strip().lower()
+    return bool(t) and not t[0].isdigit()
+
+
+def tags_in(body: list[str]) -> set:
+    """Curated `#tags` authored in a page body. Skips `- ## heading` bullets; keeps only
+    `_keep_tag` survivors."""
+    out = set()
+    for ln in body:
+        if SECTION_RE.match(ln):
+            continue
+        for m in TAG_RE.finditer(ln):
+            t = m.group(1).strip().lower()
+            if _keep_tag(t):
+                out.add(t)
+    return out
+
+
+# A bare PR/issue #-number tag occurrence in text (token-boundary #, digit-first). These are
+# noise in memory — only meaningful inside GitHub/GitLab (see the tag layer in AGENTS.md).
+_NUMTAG_RE = re.compile(r"(?<!\w)#(\d[\w./-]*)")
+# A PR/issue label sitting right before the `#`, so `PR #272` is already labeled.
+_LABEL_BEFORE_RE = re.compile(r"(?:pull\s*request|pulls?|prs?|issues?|tickets?|gh)\s*$", re.IGNORECASE)
+# A label GLUED to the `#` with no space (`PR#273`, `issue#5`). Handled first, and only when the
+# preceding word is a real PR/issue label — so a bare `C#9` is never touched.
+_GLUED_LABEL_RE = re.compile(r"\b(pull\s*request|pulls?|prs?|issues?|tickets?|gh)#(\d[\w./-]*)",
+                             re.IGNORECASE)
+
+
+def _strip_numtags(text: str) -> str:
+    """Smart-strip PR/issue #-number tags so they stop polluting outl's tag index, per the
+    memory standard: drop the `#`, and prefix `PR ` only when the text isn't already labeled.
+      `resolved PR #272` → `resolved PR 272`      (already labeled: just drop `#`)
+      `closed #450`      → `closed PR 450`        (bare: prefix `PR`)
+      `PR#273`           → `PR 273`               (label glued, no space)
+    Leaves an existing markdown link `[#272](url)` untouched (that form carries no tag), and a
+    bare `#`-token that starts mid-word (e.g. `C#9`) untouched (only token-boundary `#`)."""
+    text = _GLUED_LABEL_RE.sub(r"\1 \2", text)
+
+    def repl(m):
+        pre = text[:m.start()]
+        if pre.endswith("["):
+            return m.group(0)
+        num = m.group(1)
+        return num if _LABEL_BEFORE_RE.search(pre) else "PR " + num
+    return _NUMTAG_RE.sub(repl, text)
+
 
 # --------------------------------------------------------------------------- db
 def db_path(ws: str) -> str:
@@ -129,10 +211,12 @@ def init_schema(con):
             kind        TEXT NOT NULL,          -- 'page' | 'journal'
             path        TEXT NOT NULL,
             page_hash   TEXT,                   -- sha256 of the .md, for incremental refresh
+            mtime       REAL,                   -- file mtime, cheap pre-check before hashing (5.1)
             title       TEXT,
             summary     TEXT,
             updated     TEXT,
-            frecency    INTEGER
+            frecency    INTEGER,                -- checkpoint value written at `seen` (lazy decay)
+            seen        TEXT                    -- date of that checkpoint; effective = frecency - days_since(seen)
         );
         CREATE TABLE IF NOT EXISTS chunks (
             id          INTEGER PRIMARY KEY,
@@ -151,6 +235,16 @@ def init_schema(con):
             UNIQUE(src, dst, type)
         );
         CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
+        CREATE INDEX IF NOT EXISTS edges_src ON edges(src);
+        -- Curated facet layer: a page's #tags, minus numeric/off-vocabulary noise (see
+        -- _keep_tag). Not structural (that is edges), not frecency-bearing — a parallel
+        -- retrieval axis: `search` expands along shared tags in addition to the [[link]] walk.
+        CREATE TABLE IF NOT EXISTS page_tags (
+            slug   TEXT NOT NULL,
+            tag    TEXT NOT NULL,
+            UNIQUE(slug, tag)
+        );
+        CREATE INDEX IF NOT EXISTS page_tags_tag ON page_tags(tag);
         -- Stemmed (Porter) + diacritic-folded FTS with three weighted columns. External
         -- content over `chunks`, so column names MUST match chunks(title,heading,text).
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
@@ -389,7 +483,7 @@ def cmd_rebuild(ws: str, threshold: int | None, quiet: bool = False):
     )
     con.execute("DROP TABLE IF EXISTS chunks_fts")
     con.execute("DROP TABLE IF EXISTS vectors")  # legacy table; drop if present
-    for t in ("pages", "chunks", "edges"):
+    for t in ("pages", "chunks", "edges", "page_tags"):
         con.execute(f"DROP TABLE IF EXISTS {t}")
     init_schema(con)
     set_meta(con, "threshold", str(resolved))
@@ -401,24 +495,35 @@ def cmd_rebuild(ws: str, threshold: int | None, quiet: bool = False):
 
 
 def cmd_refresh(ws: str, threshold: int | None, quiet: bool = False):
-    con = _open_current(ws)
-    init_schema(con)
+    con = _open_current(ws)  # schema guaranteed by _open_current
     if get_meta(con, "threshold") is None:
         set_meta(con, "threshold", str(threshold if threshold is not None else DEFAULT_THRESHOLD))
-    known = dict(con.execute("SELECT slug, page_hash FROM pages").fetchall())
+    known = {slug: (h, mt) for slug, h, mt in
+             con.execute("SELECT slug, page_hash, mtime FROM pages").fetchall()}
     files = list(iter_source_files(ws))
     live = {slug for slug, _, _ in files}
     # Drop pages that no longer exist.
     for slug in list(known):
         if slug not in live:
             _delete_slug(con, slug)
-    # Reindex only changed/new pages.
+    # mtime short-circuit (5.1): a file whose mtime matches the stored one is unchanged — skip
+    # the read+sha256 entirely. Hash stays authoritative when mtime moved (a same-hash file
+    # whose mtime changed only gets its stored mtime bumped, not a reindex).
     changed = []
     for slug, kind, path in files:
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            mt = None
+        prior = known.get(slug)
+        if prior is not None and mt is not None and prior[1] is not None and mt == prior[1]:
+            continue  # unchanged
         with open(path, "r", encoding="utf-8") as f:
             h = sha256_text(f.read())
-        if known.get(slug) != h:
+        if prior is None or prior[0] != h:
             changed.append((slug, kind, path))
+        elif mt is not None:
+            con.execute("UPDATE pages SET mtime=? WHERE slug=?", (mt, slug))  # touch-only
     _index_files(con, ws, changed, full=False)
     con.commit()
     if not quiet:
@@ -440,6 +545,7 @@ def _delete_slug(con, slug: str):
         )
     con.execute("DELETE FROM chunks WHERE slug=?", (slug,))
     con.execute("DELETE FROM edges WHERE src=?", (slug,))
+    con.execute("DELETE FROM page_tags WHERE slug=?", (slug,))
     con.execute("DELETE FROM pages WHERE slug=?", (slug,))
 
 
@@ -449,20 +555,28 @@ def _index_files(con, ws: str, files, full: bool):
             _delete_slug(con, slug)
         fm, body, raw = parse_md(path)
         meta = page_meta(fm, body)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
         con.execute(
-            "INSERT INTO pages(slug,kind,path,page_hash,title,summary,updated,frecency) "
-            "VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO pages(slug,kind,path,page_hash,mtime,title,summary,updated,frecency,seen) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
             (
                 slug,
                 kind,
                 path,
                 sha256_text(raw),
+                mtime,
                 meta.get("title"),
                 meta.get("summary"),
                 meta.get("updated"),
                 _int_or_none(fm.get("frecency")),
+                (fm.get("seen") or None),
             ),
         )
+        for tag in tags_in(body):
+            con.execute("INSERT OR IGNORE INTO page_tags(slug,tag) VALUES(?,?)", (slug, tag))
         page_title = meta.get("title") or ""
         for heading, text in chunk_body(meta, body):
             # Title goes in the weighted `title` column only on the synthetic summary chunk;
@@ -537,6 +651,39 @@ def _graph_expand(con, seeds, depth: int, limit: int):
     return con.execute(sql, list(seeds) + [depth, limit]).fetchall()
 
 
+def _tag_expand(con, seeds, query: str, limit: int):
+    """Facet-layer expansion (12.3): pages sharing a curated `#tag` with the seeds, or
+    carrying a tag named in the query. A retrieval axis PARALLEL to the [[link]] walk — it
+    reaches same-facet pages in unrelated subtrees that no edge connects. Ranked by shared-tag
+    count. Returns [(slug, [shared_tags])], seeds and dupes excluded by the caller."""
+    if limit < 1:
+        return []
+    seed_set = set(seeds)
+    seed_tags: set = set()
+    if seed_set:
+        qm = ",".join("?" for _ in seed_set)
+        seed_tags.update(t for (t,) in con.execute(
+            f"SELECT DISTINCT tag FROM page_tags WHERE slug IN ({qm})", list(seed_set)))
+    # A query term equal to a known tag (or its last path segment) also seeds the facet set,
+    # so "security" pulls in #topic/security pages even with no [[link]] seed.
+    qterms = {t.lower() for t in re.findall(r"[A-Za-z0-9_/-]+", query) if len(t) > 1}
+    if qterms:
+        for (t,) in con.execute("SELECT DISTINCT tag FROM page_tags"):
+            if t in qterms or t.split("/")[-1] in qterms:
+                seed_tags.add(t)
+    if not seed_tags:
+        return []
+    qm = ",".join("?" for _ in seed_tags)
+    shared: dict = {}
+    for slug, tag in con.execute(
+            f"SELECT slug, tag FROM page_tags WHERE tag IN ({qm})", list(seed_tags)):
+        if slug in seed_set:
+            continue
+        shared.setdefault(slug, []).append(tag)
+    ranked = sorted(shared.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    return [(slug, sorted(tags)) for slug, tags in ranked[:limit]]
+
+
 def _auto_depth(con) -> int:
     """Hop depth as a function of graph size, relative to the active threshold t:
     1 hop below 3t, 2 at 3t, 3 at 10t."""
@@ -567,8 +714,10 @@ def _keyword_hits(con, query: str, k: int):
 
 def cmd_search(ws: str, query: str, k: int, no_graph: bool, as_json: bool = False,
                credit: bool = False):
+    # _open_current guarantees a current, populated schema (it rebuilds on stale/empty), so
+    # read paths skip init_schema — that call's set_meta+commit was a needless WAL write on
+    # every push-retrieval search (perf-research 5.2).
     con = _open_current(ws)
-    init_schema(con)
     depth = _auto_depth(con)
     # --- field-weighted bm25 (title ≫ heading ≫ body); lower bm25 == better match ---
     results = []
@@ -587,6 +736,17 @@ def cmd_search(ws: str, query: str, k: int, no_graph: bool, as_json: bool = Fals
             summary = (row[0] if row and row[0] else "(no summary)")
             label = f"(via {via} · {etype} · {d}h ·w{weight})"
             results.append(("link", cand, label, summary, 0.0))
+
+    # --- tag expansion: curated #tag co-membership, a parallel axis to the [[link]] walk ---
+    if not no_graph:
+        already = {r[1] for r in results}
+        for cand, shared in _tag_expand(con, seeds, query, k):
+            if cand in already:
+                continue
+            already.add(cand)
+            row = con.execute("SELECT summary FROM pages WHERE slug=?", (cand,)).fetchone()
+            summary = (row[0] if row and row[0] else "(no summary)")
+            results.append(("tag", cand, f"(tag {' · '.join(shared)})", summary, 0.0))
 
     # Block-frecency credit: a keyword hit resolves to `slug › heading`; credit the matched
     # content lines under that heading (line-level recall). Opt-in (push-retrieval passes
@@ -622,7 +782,7 @@ def cmd_search(ws: str, query: str, k: int, no_graph: bool, as_json: bool = Fals
         out = {"query": query, "depth": depth, "results": [
             {"kind": kind, "slug": slug, "heading": heading,
              "snippet": " ".join(text.split())[:200],
-             "score": (None if kind == "link" else round(score, 4))}
+             "score": (None if kind in ("link", "tag") else round(score, 4))}
             for kind, slug, heading, text, score in results
         ]}
         print(json.dumps(out))
@@ -786,10 +946,15 @@ def _graph_health(con) -> dict:
 
     superseded = sorted({r[0] for r in
                          con.execute("SELECT DISTINCT dst FROM edges WHERE type='supersedes'")})
-    frisk = con.execute(
-        "SELECT slug, frecency FROM pages WHERE frecency IS NOT NULL AND frecency <= ? "
-        "ORDER BY frecency, slug", (FRECENCY_RISK,)
-    ).fetchall()
+    # Decay-risk reads EFFECTIVE frecency (checkpoint − days_since(seen)), per lazy decay (4.1).
+    today = datetime.date.today().isoformat()
+    frisk = sorted(
+        ((slug, _effective(fr, seen or "", today))
+         for slug, fr, seen in
+         con.execute("SELECT slug, frecency, seen FROM pages WHERE frecency IS NOT NULL")
+         if _effective(fr, seen or "", today) <= FRECENCY_RISK),
+        key=lambda sf: (sf[1], sf[0]),
+    )
 
     return {
         "pages": npages, "journals": njournals, "nodes": len(allslugs), "edges": nedges,
@@ -839,12 +1004,40 @@ def _unhoisted_props(ws: str) -> dict:
     return out
 
 
+def _polluting_tags(ws: str) -> dict:
+    """Pages whose body carries a numeric/off-vocabulary `#tag` (PR/issue-number pollution —
+    e.g. `#272` from a `PR #272` mention). The facet layer drops these at index time, but they
+    still sit in the source and outl's own tag index; this reports the SOURCE so they can be
+    rewritten (`[#272](url)` / `PR 272`). Read-only. {slug: [tags]}. See _keep_tag / 12.1."""
+    out = {}
+    for slug, _kind, path in iter_source_files(ws):
+        try:
+            _fm, body, _raw = parse_md(path)
+        except Exception:
+            continue
+        bad = set()
+        for ln in body:
+            if SECTION_RE.match(ln):
+                continue
+            for m in TAG_RE.finditer(ln):
+                t = m.group(1).strip().lower()
+                # A `[#272](url)` markdown link carries no outl tag and is the DESIRED form —
+                # don't flag it (matches _strip_numtags, which leaves it untouched).
+                if m.start() > 0 and ln[m.start() - 1] == "[":
+                    continue
+                if t and not _keep_tag(t):
+                    bad.add(t)
+        if bad:
+            out[slug] = sorted(bad)
+    return out
+
+
 def cmd_doctor(ws: str, as_json: bool):
-    con = _open_current(ws)
-    init_schema(con)
+    con = _open_current(ws)  # read-only report; schema guaranteed by _open_current (5.2)
     h = _graph_health(con)
     con.close()
     h["unhoisted_props"] = _unhoisted_props(ws)
+    h["polluting_tags"] = _polluting_tags(ws)
     if as_json:
         print(json.dumps(h))
         return
@@ -862,14 +1055,19 @@ def cmd_doctor(ws: str, as_json: bool):
     print(f"superseded: {len(h['superseded_targets'])} target(s)  {_cap(h['superseded_targets'])}")
     fr = [f"{d['slug']}({d['frecency']})" for d in h["frecency_risk"]]
     print(f"decay-risk: {len(fr)} leaf/leaves ≤{FRECENCY_RISK}  {_cap(fr)}")
-    srisk = sorted(f"{slug}›{hdg}({int(rec.get('f', SECTION_SEED))})"
-                   for slug, secs in _load_sfrec(ws).items()
-                   for hdg, rec in secs.items()
-                   if int(rec.get("f", SECTION_SEED)) <= FRECENCY_RISK)
+    _dtoday = datetime.date.today().isoformat()
+    srisk = sorted(
+        f"{slug}›{bid}({_effective(int(rec.get('f', SECTION_SEED)), rec.get('seen') or '', _dtoday)})"
+        for slug, secs in _load_sfrec(ws).items()
+        for bid, rec in secs.items()
+        if _effective(int(rec.get("f", SECTION_SEED)), rec.get("seen") or "", _dtoday) <= FRECENCY_RISK)
     print(f"sec-decay : {len(srisk)} section(s) ≤{FRECENCY_RISK}  {_cap(srisk)}")
     up = h["unhoisted_props"]
     up_disp = [f"{s}({','.join(k)})" for s, k in up.items()]
     print(f"unhoisted : {len(up)} page(s) with props as body bullets  {_cap(up_disp)}")
+    pt = h["polluting_tags"]
+    pt_disp = [f"{s}({','.join(t)})" for s, t in pt.items()]
+    print(f"tag-noise : {len(pt)} page(s) with numeric/off-vocab #tags  {_cap(pt_disp)}")
     print(f"heals     : {h['heal_policy'] or '(none active — run `memory-index medic`)'}")
     # Verdict: name the actionable pathologies, performance-first.
     flags = []
@@ -884,6 +1082,9 @@ def cmd_doctor(ws: str, as_json: bool):
     if up:
         flags.append(f"{len(up)} page(s) have props as body bullets (invisible to the parser — "
                      f"hoist to frontmatter via `outl page prop set`, or the page falls out of tracking)")
+    if pt:
+        flags.append(f"{len(pt)} page(s) carry numeric/off-vocab #tags (PR/issue-number noise — "
+                     f"rewrite as `[#272](url)` or `PR 272`; they pollute outl's tag index)")
     print("\nverdict   : " + ("healthy — nothing to prune" if not flags
                               else "; ".join(flags) + "  →  `memory-index medic`"))
 
@@ -902,8 +1103,7 @@ def cmd_medic(ws: str, dry_run: bool, cap_hubs, prune_superseded: bool,
         desired = ",".join(ops)
 
     if dry_run:
-        con = _open_current(ws)
-        init_schema(con)
+        con = _open_current(ws)  # read-only preview; schema guaranteed by _open_current (5.2)
         plan = _heal_plan(con, _parse_policy(desired))
         cur = get_meta(con, "heal_policy")
         con.close()
@@ -949,8 +1149,7 @@ def cmd_medic(ws: str, dry_run: bool, cap_hubs, prune_superseded: bool,
 
 
 def cmd_stats(ws: str, threshold_arg: int, as_json: bool):
-    con = _open_current(ws)
-    init_schema(con)
+    con = _open_current(ws)  # guarantees schema; no init_schema write on this read path (5.2)
     _print_stats(con, ws, threshold_arg, as_json)
     con.close()
 
@@ -1219,19 +1418,27 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
         if est_tok > SPLIT_TOKENS:
             split_cands.append({"slug": slug, "tokens": est_tok, "type": typ or "?"})
 
-        # Page-level decay: EVERY page (leaf or moc), no pin exemption. Once/day (seen guard).
-        if (fm.get("seen") or "") != today:
-            old = _int_or_none(fm.get("frecency"))
-            old = FRECENCY_SEED if old is None else old
-            new = old - 1
+        # Page-level LAZY decay (4.1): frecency:: is a checkpoint at seen::; effective =
+        # checkpoint − days_since(seen). EVERY page (leaf or moc), no pin exemption. The sweep
+        # writes NOTHING here except a one-time seen=today migration for a page that has a
+        # frecency but no parseable seen (so its decay window starts now). No daily -1 write —
+        # that op was the op-log's main growth driver (see perf-research §2/§4.1).
+        stored = _int_or_none(fm.get("frecency"))
+        stored = FRECENCY_SEED if stored is None else stored
+        seen = (fm.get("seen") or "").strip()
+        if _days_since(seen, today) is None:
             if not dry_run:
-                _outl_prop(outl, ws, slug, "frecency", str(new))
-                _outl_prop(outl, ws, slug, "seen", today)
-            decayed.append({"slug": slug, "from": old, "to": new})
-            if new <= 0:
-                dead.append(slug)
+                _outl_prop(outl, ws, slug, "seen", today)  # migration stamp
+            eff = stored
+        else:
+            eff = _effective(stored, seen, today)
+        decayed.append({"slug": slug, "from": stored, "to": eff})
+        if eff <= 0:
+            dead.append(slug)
 
-        # Block-level decay (real content lines only). Read-only outl calls, skipped in dry-run.
+        # Block-level LAZY decay (real content lines only). Read-only outl calls, skipped in
+        # dry-run. Same model as pages: effective = f − days_since(seen); the ledger is written
+        # only to migrate a new/unseen block (checkpoint at today), never a daily -1.
         if not dry_run and outl:
             blocks = _outl_outline(outl, ws, slug)
             all_blocks[slug] = blocks
@@ -1239,14 +1446,16 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
             live_ids = set()
             for b in _content_blocks(blocks):
                 live_ids.add(b["id"])
-                rec = page_led.get(b["id"]) or {"f": SECTION_SEED, "seen": ""}
-                if rec.get("seen") == today:
+                rec = page_led.get(b["id"])
+                if rec is None:  # first sighting: seed the checkpoint at today
+                    page_led[b["id"]] = {"f": SECTION_SEED, "seen": today}
+                    continue
+                d = _days_since(rec.get("seen") or "", today)
+                if d is None:  # migrate a block whose seen is missing/bad
+                    rec["seen"] = today
                     page_led[b["id"]] = rec
                     continue
-                rec["f"] = int(rec.get("f", SECTION_SEED)) - 1
-                rec["seen"] = today
-                page_led[b["id"]] = rec
-                if rec["f"] <= SECTION_PRUNE:
+                if int(rec.get("f", SECTION_SEED)) - d <= SECTION_PRUNE:
                     block_evict.setdefault(slug, set()).add(b["id"])
             for bid in list(page_led.keys()):  # GC ledger ids no longer present in the page
                 if bid not in live_ids:
@@ -1454,6 +1663,107 @@ def cmd_consolidate(ws: str, today: str, reap: bool, as_json: bool):
     return 0
 
 
+# ------------------------------------------------ standard normalization (migrate)
+# When a memory CONVENTION changes, `normalize` brings the existing graph up to the current
+# STANDARD_VERSION. Idempotent + versioned: the recorded level lives in `<ws>/.standard-version`
+# (outside .outl/, so it survives an index rebuild/delete). install.sh runs it (backup first).
+def _std_ver_path(ws: str) -> str:
+    return os.path.join(ws, ".standard-version")
+
+
+def _read_std_ver(ws: str) -> int:
+    try:
+        with open(_std_ver_path(ws)) as f:
+            return int(f.read().strip() or "0")
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_std_ver(ws: str, ver: int):
+    tmp = _std_ver_path(ws) + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(ver))
+    os.replace(tmp, _std_ver_path(ws))
+
+
+def _migrate_strip_numtags(ws: str, outl, apply: bool):
+    """v1: strip PR/issue #-number tags from page/journal bodies (see _strip_numtags). Dry-run
+    reports per-line from the markdown (no outl calls, so a clean graph is cheap); apply rewrites
+    the real blocks through outl (block ids)."""
+    changes = []
+    for slug, _kind, path in iter_source_files(ws):
+        try:
+            _fm, body, _raw = parse_md(path)
+        except Exception:
+            continue
+        if not any(_NUMTAG_RE.search(ln) for ln in body):
+            continue
+        if not apply:
+            for ln in body:
+                nl = _strip_numtags(ln)
+                if nl != ln:
+                    changes.append({"slug": slug, "old": ln.strip(), "new": nl.strip()})
+            continue
+        if outl is None:
+            continue
+        for b in _outl_outline(outl, ws, slug):
+            # Skip only headings and empty blocks. Prop bullets ARE processed: a free-text prop
+            # (e.g. `summary:: … issue #430 …`) can carry the pollution, and _strip_numtags only
+            # rewrites `#<digit>` tokens, leaving the `key::` prefix and every other prop intact.
+            if b["is_head"] or not b["id"] or not (b["text"] or "").strip():
+                continue
+            nt = _strip_numtags(b["text"])
+            if nt != b["text"] and _outl_run(outl, ws, ["block", "update", b["id"], "--text", nt]):
+                changes.append({"slug": slug, "id": b["id"], "old": b["text"], "new": nt})
+    return changes
+
+
+_MIGRATIONS = [(1, "strip PR/issue #-number tags", _migrate_strip_numtags)]
+
+
+def cmd_normalize(ws: str, apply: bool, status: bool, force: bool, as_json: bool):
+    cur = _read_std_ver(ws)
+    target = STANDARD_VERSION
+    if status:
+        data = {"standard_version": cur, "target": target, "pending": cur < target}
+        print(json.dumps(data) if as_json else
+              f"standard : v{cur} → v{target}  ({'pending' if cur < target else 'up to date'})")
+        return 0
+
+    migs = _MIGRATIONS if force else [m for m in _MIGRATIONS if m[0] > cur]
+    if apply and not migs:
+        msg = {"applied": True, "standard_version": cur, "changes": [], "count": 0,
+               "note": f"already at standard v{cur}"}
+        print(json.dumps(msg) if as_json else f"normalize: already at standard v{cur}; nothing to do.")
+        return 0
+
+    outl = _outl_bin()
+    if apply and outl is None:
+        print("memory-index normalize: outl binary not found; cannot rewrite", file=sys.stderr)
+        return 3
+
+    changes = []
+    for _ver, _desc, fn in migs:
+        changes.extend(fn(ws, outl, apply))
+    if apply:
+        _write_std_ver(ws, target)
+        cmd_refresh(ws, None, quiet=True)  # reflect the cleaned source in the index
+
+    result = {"applied": apply, "standard_version": (target if apply else cur),
+              "changes": changes, "count": len(changes)}
+    if as_json:
+        print(json.dumps(result))
+    else:
+        verb = "rewrote" if apply else "would rewrite"
+        print(f"normalize ({'apply' if apply else 'dry-run'}): {verb} {len(changes)} block(s)"
+              + (f" → standard v{target}" if apply else f" (standard v{cur} → v{target})"))
+        for c in changes[:20]:
+            print(f"  {c['slug']}: {c['old'][:70]}  →  {c['new'][:70]}")
+        if len(changes) > 20:
+            print(f"  … (+{len(changes) - 20} more)")
+    return 0
+
+
 # ------------------------------------------------------------------------ main
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="memory-index", description=__doc__)
@@ -1500,6 +1810,11 @@ def main(argv=None):
                      help="also drop plain refs into superseded pages (aggressive)")
     smd.add_argument("--off", action="store_true", help="disable heals and restore edges from markdown")
     smd.add_argument("--json", action="store_true")
+    sn = sub.add_parser("normalize", help="bring the live graph up to the current memory STANDARD_VERSION")
+    sn.add_argument("--apply", action="store_true", help="rewrite (default is a dry-run report)")
+    sn.add_argument("--status", action="store_true", help="just report the recorded vs current standard")
+    sn.add_argument("--force", action="store_true", help="re-run every migration regardless of recorded version")
+    sn.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
     ws = os.path.expanduser(args.workspace)
@@ -1528,6 +1843,8 @@ def main(argv=None):
         cmd_doctor(ws, args.json)
     elif args.cmd == "medic":
         cmd_medic(ws, args.dry_run, args.cap_hubs, args.prune_superseded, args.off, args.json)
+    elif args.cmd == "normalize":
+        return cmd_normalize(ws, args.apply, args.status, args.force, args.json) or 0
     return 0
 
 

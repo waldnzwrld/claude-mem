@@ -119,6 +119,26 @@ You never choose the regime; it's gated on node count.
 - Writing is unchanged: you still author markdown/journals normally. The hook keeps the
   index fresh (`memory-index refresh`, incremental by page hash) with no action from you.
 
+## MCP call discipline
+
+A few rules keep MCP usage cheap, for both the interactive session and subagents:
+
+- **Read with `outl_page_render` (or export-md) for recall, not `outl_page_get`.**
+  `page_get`'s JSON return is ~2.5–3× the tokens of the rendered markdown. Reserve
+  `outl_page_get` for the moment you're about to *write* — you need its block ids to target an
+  append.
+- **Batch writes into one call.** Prefer `outl_batch`, `outl_page_create` with a `content`
+  forest, or `outl_block_append_tree` over a string of individual `outl_block_append` calls —
+  one per bullet burns one model turn each. This still has to respect journal-append
+  discipline (append under the existing section block id; never emit a duplicate `## Section`
+  header — see *Writing to memory*).
+- **Navigate to locate, then one render to read.** Use `outl_query` / `outl_search` /
+  `outl_backlinks` to find the right slug, then a single `outl_page_render` — not a sweep of
+  `outl_page_get` calls across candidates.
+- **Don't re-fetch what's already in context.** Don't `outl_page_get` a page already
+  fetched/rendered this session. Dispatch `memory-recall` only when the answer is genuinely
+  deeper than the injected index/journals — not for something you already hold.
+
 ## The graph model — a tree of TOCs
 
 Memory is a **tree of nested TOCs (MOCs) with real documents at the leaves**. Every node is
@@ -177,9 +197,42 @@ Crosslinks are what make this a graph instead of a pile of files. Use them liber
   finds what to distill and where.
 - **Knowledge pages link back** to their project via the `project::` property and to
   related pages via `[[...]]` in the body.
-- `#tag` — cross-cutting themes that span projects (`#security`, `#decision`, `#gotcha`).
+- `#tag` — cross-cutting themes that span projects (`#security`, `#decision`, `#gotcha`). See
+  *Tag layer* below for the controlled vocabulary and the PR/issue-number rule.
 - `((block-id))` — block reference/embed; use only to quote one specific decision across
   pages, not for ordinary links.
+
+## Tag layer
+
+`[[Link]]` and `#tag` are not interchangeable. `[[Link]]` is the sole **structural**,
+frecency-bearing citizen — a directed edge the retrieval graph walks (parent chains, credit
+propagation, backlinks all ride on it). `#Tag` is a flat, many-to-many **facet**: it labels the
+containing page's subtree, classifying it rather than pointing anywhere. A tag is not an edge
+and does not carry or propagate frecency.
+
+**Controlled, numeric-free vocabulary.** Two families only:
+
+- `#topic/<x>` — topical facets, many per page, cross-cutting the tree (a retrieval-expansion
+  surface for `memory-index search`, not a substitute for `[[link]]`ing the owning TOC).
+- `#status/<x>`, plus the lifecycle tags `#active`, `#in-deep`, `#stale` — state and
+  maintenance markers.
+
+Everything else — and especially a bare number — is off-vocabulary.
+
+**Never write a bare `#272` in memory.** `outl` turns any `#token` into a tag — including
+`#272`, `PR#273`, or one written inside backticks or with a backslash escape — which pollutes
+the tag index with one-off numeric tags. Neither backticks nor a backslash prevents this; only
+dropping the leading `#` before the digits does. Write a PR/issue reference instead as a
+markdown link, `[#272](https://github.com/owner/repo/pull/272)` (keeps the `#272` glyph, links
+to GitHub, creates no tag), or plainly as `PR 272`.
+
+**Standard migration.** These conventions apply retroactively: when the standard advances,
+`memory-index normalize` brings the existing graph up to it (versioned by a `.standard-version`
+marker, so it is idempotent and a no-op once current). `install.sh` runs it automatically after
+taking an `outl backup`. The first migration smart-strips PR/issue `#`-number tags (drop the
+`#`, prefix `PR` only when not already labeled); `memory-index doctor` reports any that remain
+under `tag-noise`. `normalize` skips a block `outl` refuses to rewrite (e.g. a journal whose
+`.md` is ahead of the op log) — reconcile that first, then re-run.
 
 ## What long-term memory is for (the signal filter)
 
@@ -382,7 +435,8 @@ earning its place is dropped, so the tree never accretes dead weight. Frecency =
 recency, kept integer-simple (no exponentials), scaled to a **~1-month** window: long enough
 that real-but-occasional knowledge survives, short enough that stale detail clears out. It is
 the **sole retention metric** for this decay-cache memory, and it runs at **three
-granularities**, all sharing the same seed **30** / cap **60** / **−1-per-day** decay:
+granularities**, all sharing the same seed **30** / cap **60**, decayed **lazily** (see *Lazy
+decay* below) rather than rewritten day by day:
 
 - **Page (leaf AND TOC).** *Every* page carries `frecency::` (integer) and `seen::` (last date
   the score changed) as **hoisted frontmatter** — leaves and MOCs alike. There is **no `pin::`
@@ -397,9 +451,21 @@ granularities**, all sharing the same seed **30** / cap **60** / **−1-per-day*
   lost, lines just reseed at 30. **Never hand-edit it;** `memory-index` owns it. (Headings and
   frontmatter props are not tracked lines.)
 
+**Lazy decay — `frecency::` is a checkpoint, not a running counter.** `frecency::` is written
+only at `seen::` (the date of last credit, or of creation) and is never rewritten day by day.
+The *effective* frecency at any moment is computed on the fly, not stored:
+
+> **effective = `frecency` − days_since(`seen`)**
+
+A page or block is evicted the moment its effective frecency is **≤ 0**. Seed on creation is
+still **30** with `seen:: <creation date>`; cap is still **60**; journals remain exempt.
+
 **Credit — a use warms the whole access path.** Reinforcement is `touch`'s job (decay's
 counterpart), fired automatically by the `PostToolUse(outl_page_get)` hook on every successful
-fetch, any page type, and safe to run by hand (`memory-index touch <slug>`). One fetch credits:
+fetch, any page type, and safe to run by hand (`memory-index touch <slug>`). Credit is the only
+thing that writes frecency at all, and it always writes the pair together — `frecency += bump`
+**and** `seen = today` (cap 60) — which re-bases the checkpoint so the decay window restarts
+from today. One fetch credits:
 
 - the fetched page **+5** (cap 60);
 - **every ancestor MOC up the `parent::` chain +5** — using a memory means using the index that
@@ -414,13 +480,21 @@ fetch, any page type, and safe to run by hand (`memory-index touch <slug>`). One
 Because the fetch hook already credits reads, do **not** hand-bump on top of a fetch. Still
 bump by hand for a use that is *not* a fetch — e.g. merging into a leaf during condensation —
 via `outl page prop set` or `memory-index touch`. Optionally order a TOC's link list by
-`frecency` (high → low) so the most-used pathways surface first.
+effective frecency (high → low) so the most-used pathways surface first.
 
 **Decay & eviction — silent and mechanical, no longer yours to review.** On the first session
-of a new day the SessionStart hook runs `memory-index maintain`, which decays every page (leaf
-and MOC) and every content line whose `seen::` is not today by **−1**, writing through `outl`
-so the `.outl` sidecar stays in sync. Anything that reaches **0 is FORGOTTEN immediately** —
-no prompt, no injected `⚠` candidate list, no reviewed step:
+of a new day the SessionStart hook runs `memory-index maintain`, which now *computes* effective
+frecency (`frecency − days_since(seen)`) for every page and line instead of decrementing a
+stored value, and writes through `outl` for almost nothing:
+
+- a **one-time migration stamp** — any page or block that already carries a `frecency::` but no
+  `seen::` gets `seen = today` written once, so it starts its decay window; and
+- an **eviction**, when effective frecency is **≤ 0**.
+
+No other write happens — the old daily `-1` per node is gone. (Every daily decay write was an
+`outl` op, and `outl` replays its whole op log on every boot, so cutting the daily write keeps
+every future `outl` call cheap.) Anything at effective **0 is FORGOTTEN immediately** — no
+prompt, no injected `⚠` candidate list, no reviewed step:
 
 - **line → 0** — delete just that block (`outl block delete`); the file stays.
 - **leaf → 0** — soft-trash the page and scrub `[[it]]` out of every surviving block; the
@@ -430,13 +504,14 @@ no prompt, no injected `⚠` candidate list, no reviewed step:
   subtree is cold, so the cascade is safe.
 
 The old "pruning stays yours / prune-candidate directive" step is **gone**: `maintain`
-performs all deletion itself through `outl`, then refreshes the index. `doctor` still reports
-`decay-risk` (page ≤5) and `sec-decay` (line ≤5) for visibility, and the ledger GCs block ids
-that no longer exist.
+performs all deletion itself through `outl`, then refreshes the index. There is still no
+`pin::` exemption. `doctor` still reports `decay-risk` (page ≤5) and `sec-decay` (line ≤5) for
+visibility (both now read off effective frecency), and the ledger GCs block ids that no longer
+exist.
 
-Scale: a fresh node (seed 30) survives ~30 idle days; each use adds ~5 days; a
-heavily-used node rides at the 60-day cap. Deletion here is intentional and unrecoverable,
-exactly like journal burning.
+Scale: a fresh node (seed 30) survives ~30 idle days; each use adds ~5 days and re-bases the
+checkpoint to today; a heavily-used node rides at the 60-day cap. Deletion here is intentional
+and unrecoverable, exactly like journal burning.
 
 ## Research references (external live docs)
 

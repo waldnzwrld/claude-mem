@@ -232,3 +232,27 @@ if [ -d "$MEM_DIR/pages" ]; then
     && echo "✔ memory-index   -> built initial index at $MEM_DIR/.outl/index.sqlite" \
     || echo "• memory-index   -> run '$MEMIDX rebuild' after 'outl init' to build the index"
 fi
+
+# ---- 6. normalize the live graph to the current memory standard -------------
+# When a memory CONVENTION changes (e.g. tags became a curated surface, so PR/issue #-numbers
+# must be stripped so they stop polluting the tag index), bring the EXISTING graph up to it.
+# Versioned + idempotent: a workspace already at the current standard is skipped, so this is a
+# no-op on repeat installs. Takes an `outl backup` snapshot first, so it is reversible.
+if [ -d "$MEM_DIR/pages" ] && [ -x "$MEMIDX" ] && [ -x "$OUTL_PATH" ]; then
+  pending="$("$MEMIDX" -w "$MEM_DIR" normalize --status --json 2>/dev/null | python3 -c '
+import sys, json
+try:
+    print("1" if json.load(sys.stdin).get("pending") else "0")
+except Exception:
+    print("0")' 2>/dev/null)"
+  if [ "$pending" = "1" ]; then
+    "$OUTL_PATH" -w "$MEM_DIR" backup >/dev/null 2>&1 || true
+    if "$MEMIDX" -w "$MEM_DIR" normalize --apply >/dev/null 2>&1; then
+      echo "✔ memory-index   -> normalized the graph to the current standard (backup taken first)"
+    else
+      echo "• memory-index   -> normalize pass failed; run '$MEMIDX normalize --apply' by hand"
+    fi
+  else
+    echo "• memory-index   -> graph already meets the current standard"
+  fi
+fi

@@ -95,7 +95,9 @@ PAGES TO SPLIT (any page — a content leaf OR a TOC/hub — whose body now cost
 prompt="You are running headless as the memory-system compaction agent. Do ONLY the tasks below, then stop — ignore everything else. Work entirely within the outl memory graph at ~/.claude/memory; do NOT touch code, git, or anything outside it. Read the named sections of ~/.claude/memory/AGENTS.md and follow them exactly. Do NOT prune, delete, or bump the frecency of any page or section — decay and eviction are handled mechanically elsewhere; touching them here would corrupt the retention signal.
 $tasks
 
-Priorities, in order: (1) never lose a durable fact while distilling; (2) keep the graph navigable — every page reachable from its parent TOC by a one-hop [[link]], no dangling links, no orphans; (3) keep every page small. Work silently."
+Priorities, in order: (1) never lose a durable fact while distilling; (2) keep the graph navigable — every page reachable from its parent TOC by a one-hop [[link]], no dangling links, no orphans; (3) keep every page small. Work silently.
+
+When writing multiple blocks under the same section, batch with outl_batch or outl_block_append_tree instead of one outl_block_append call per item. Never write a bare '#272' for a PR/issue — use '[#272](url)' or 'PR 272'. Prefer outl_page_render over outl_page_get when you only need to read a page's rendered content, not edit it."
 
 # Point the distiller's outl MCP at THIS workspace explicitly (so it operates on the
 # workspace we manage, not whatever ambient config happens to serve) and strict-scope it so

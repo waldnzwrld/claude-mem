@@ -34,7 +34,11 @@ setup() {
   "$MI" -w "$w" rebuild >/dev/null 2>&1
   printf '%s' "$w"
 }
-frec() { "$OUTL" -w "$1" page prop set "$2" "frecency=$3" >/dev/null 2>&1; }
+# Force a page toward eviction: set a low frecency checkpoint AND an old `seen`, so lazy
+# decay (effective = frecency − days_since(seen)) computes effective ≤ 0. Under lazy decay a
+# low frecency alone no longer evicts — staleness is elapsed time since `seen`.
+frec() { "$OUTL" -w "$1" page prop set "$2" "frecency=$3" >/dev/null 2>&1
+         "$OUTL" -w "$1" page prop set "$2" "seen=2000-01-01" >/dev/null 2>&1; }
 gone() { [ -f "$1/pages/$2.md" ] && echo no || echo yes; }        # yes = file removed
 here() { [ -f "$1/pages/$2.md" ] && echo yes || echo no; }        # yes = file present
 getf() { grep -m1 '^frecency::' "$1/pages/$2.md" 2>/dev/null | sed 's/^frecency:: *//'; }
@@ -147,6 +151,60 @@ check "summary captured from bullet" "$(pcol "$W" bullet-probe summary)" "probe 
 check "updated captured from bullet" "$(pcol "$W" bullet-probe updated)"  "2020-02-02"
 FTS="$("$MI" -w "$W" search "quarterly" --no-graph --json 2>/dev/null | jq_py "any(r.get('slug')=='bullet-probe' for r in d['results'])")"
 check "summary text reached FTS"     "$FTS" "True"
+
+echo "[11] lazy decay (recent seen survives; checkpoint not rewritten; missing seen migrates)"
+W="$(setup s11)"
+TODAY="$(date +%F)"
+"$OUTL" -w "$W" page prop set alpha-notes "frecency=2" >/dev/null 2>&1
+"$OUTL" -w "$W" page prop set alpha-notes "seen=$TODAY" >/dev/null 2>&1
+evicted_json "$W" >/dev/null
+check "recent-seen low-frecency page survives" "$(here "$W" alpha-notes)" "yes"
+check "checkpoint NOT rewritten by sweep (no daily -1)" "$(getf "$W" alpha-notes)" "2"
+W="$(setup s11b)"   # misc has frecency but no seen in the fixture
+"$OUTL" -w "$W" page prop set misc "frecency=3" >/dev/null 2>&1
+evicted_json "$W" >/dev/null
+check "missing-seen page survives (migrated, not evicted)" "$(here "$W" misc)" "yes"
+check "missing-seen page got a seen stamp" "$(grep -c '^seen::' "$W/pages/misc.md")" "1"
+
+echo "[12] tag facet layer (curated tags indexed, numeric filtered, doctor flags, search expands)"
+W="$(setup s12)"
+"$OUTL" -w "$W" page create taga --content \
+  '[{"text":"type:: knowledge"},{"text":"parent:: [[index]]"},{"text":"## B"},{"text":"frobnicator gadget notes #topic/zzz and PR #999"}]' >/dev/null 2>&1
+"$OUTL" -w "$W" page create tagb --content \
+  '[{"text":"type:: knowledge"},{"text":"parent:: [[index]]"},{"text":"## B"},{"text":"entirely separate prose #topic/zzz"}]' >/dev/null 2>&1
+"$MI" -w "$W" rebuild >/dev/null 2>&1
+check "curated topic/zzz indexed on 2 pages" \
+  "$(sqlite3 "$W/.outl/index.sqlite" "SELECT COUNT(*) FROM page_tags WHERE tag='topic/zzz'")" "2"
+check "numeric #999 filtered from index" \
+  "$(sqlite3 "$W/.outl/index.sqlite" "SELECT COUNT(*) FROM page_tags WHERE tag='999'")" "0"
+check "doctor flags numeric tag on taga" \
+  "$("$MI" -w "$W" doctor --json 2>/dev/null | jq_py "'taga' in d['polluting_tags']")" "True"
+# 'frobnicator' FTS-hits only taga; tagb (no such word) must surface via shared-tag expansion
+check "tag expansion surfaces co-tagged page (no FTS hit)" \
+  "$("$MI" -w "$W" search "frobnicator" --json 2>/dev/null | jq_py "any(r['slug']=='tagb' and r['kind']=='tag' for r in d['results'])")" "True"
+
+echo "[13] normalize: strips PR/issue #-number tags (smart), versioned + idempotent"
+W="$(setup s13)"
+"$OUTL" -w "$W" page create nrm --content \
+  '[{"text":"type:: knowledge"},{"text":"parent:: [[index]]"},{"text":"## B"},{"text":"resolved PR #450 and closed #272 today #topic/keep"},{"text":"merged PR#273 while coding in C#9 style"}]' >/dev/null 2>&1
+"$MI" -w "$W" rebuild >/dev/null 2>&1
+check "status pending before" \
+  "$("$MI" -w "$W" normalize --status --json 2>/dev/null | jq_py "d['pending']")" "True"
+"$MI" -w "$W" normalize --apply >/dev/null 2>&1
+BODY="$("$OUTL" -w "$W" export md nrm 2>/dev/null)"
+case "$BODY" in *"PR 450"*)        ok  "labeled '#450' -> 'PR 450'" ;; *) bad "labeled strip ($BODY)" ;; esac
+case "$BODY" in *"closed PR 272"*) ok  "bare '#272' -> 'PR 272'" ;;    *) bad "bare strip ($BODY)" ;; esac
+case "$BODY" in *"PR 273"*)        ok  "glued 'PR#273' -> 'PR 273'" ;; *) bad "glued-label strip ($BODY)" ;; esac
+case "$BODY" in *"#272"*|*"#273"*) bad "still carries a #number tag" ;; *) ok  "no #272/#273 tag remains" ;; esac
+case "$BODY" in *"C#9"*)           ok  "non-label 'C#9' preserved" ;;  *) bad "C#9 was mangled ($BODY)" ;; esac
+case "$BODY" in *"#topic/keep"*)   ok  "curated #topic/keep preserved" ;; *) bad "curated tag lost" ;; esac
+"$MI" -w "$W" rebuild >/dev/null 2>&1
+check "numeric tags gone from index" \
+  "$(sqlite3 "$W/.outl/index.sqlite" "SELECT COUNT(*) FROM page_tags WHERE tag IN ('272','450')")" "0"
+check "standard now up-to-date (idempotent)" \
+  "$("$MI" -w "$W" normalize --status --json 2>/dev/null | jq_py "d['pending']")" "False"
+check "re-apply is a no-op" \
+  "$("$MI" -w "$W" normalize --apply --json 2>/dev/null | jq_py "d['count']")" "0"
 
 echo
 printf 'TOTAL: \033[32m%d passed\033[0m, ' "$PASS"

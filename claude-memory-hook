@@ -53,10 +53,16 @@ fi
 
 # ---- UserPromptSubmit: push-retrieval ----
 # Run the FTS/graph index on the prompt; inject top strong keyword hits as pointers.
-# Gated (bm25 ceiling + >=2 content terms + per-session dedupe). Skipped in headless agents.
+# Gated (index active + bm25 ceiling + >=2 content terms + per-session dedupe). Skipped in
+# headless agents. The sync search runs WITHOUT --credit (pointers only, ~44ms cheaper); the
+# section-frecency credit is DETACHED to the background so it stays off the critical path
+# (perf-research 3.1/3.2). One python call does the search AND emits the hook JSON (3.3).
 if [ "$event" = "UserPromptSubmit" ]; then
-  if [ -x "$MEMIDX" ] && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] && [ -z "${MEMORY_DUMP_ACTIVE:-}" ]; then
-    ctx="$(MEMORY_PUSH_MAXSCORE="${MEMORY_PUSH_MAXSCORE:--8.0}" \
+  # 3.1: skip entirely when the index is inactive (small graph — the whole TOC is already
+  # injected at SessionStart). The flag is published by SessionStart; missing/empty = enabled.
+  if [ -x "$MEMIDX" ] && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] && [ -z "${MEMORY_DUMP_ACTIVE:-}" ] \
+     && [ "$(cat "$WS/.push-active" 2>/dev/null)" != "0" ]; then
+    out="$(MEMORY_PUSH_MAXSCORE="${MEMORY_PUSH_MAXSCORE:--8.0}" \
            MEMORY_PUSH_K="${MEMORY_PUSH_K:-3}" MEMIDX="$MEMIDX" WS="$WS" \
            python3 - "$input" <<'PY'
 import os, sys, json, subprocess, re, glob, time
@@ -77,9 +83,17 @@ if len(terms) < 2:
     sys.exit(0)
 memidx, ws = os.environ["MEMIDX"], os.environ["WS"]
 maxscore, k = float(os.environ["MEMORY_PUSH_MAXSCORE"]), int(os.environ["MEMORY_PUSH_K"])
+# Detach the section-frecency credit so it never blocks the turn (3.2). Same query, --credit,
+# fire-and-forget in its own session; its output is discarded.
 try:
-    # --credit: each keyword hit credits its slug/heading section frecency. Capped at SECTION_CAP; decayed daily.
-    out = subprocess.run([memidx, "-w", ws, "search", "--json", "--credit", prompt, "-k", str(k)],
+    subprocess.Popen([memidx, "-w", ws, "search", "--json", "--credit", "--no-graph", prompt,
+                      "-k", str(k)],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+except Exception:
+    pass
+try:
+    # Sync search for the POINTERS only (no --credit): pointers need the hits, not the write.
+    out = subprocess.run([memidx, "-w", ws, "search", "--json", prompt, "-k", str(k)],
                          capture_output=True, text=True, timeout=10).stdout
     results = json.loads(out)["results"]
 except Exception:
@@ -122,10 +136,12 @@ lines = ["Relevant memory (auto-surfaced from your prompt — POINTERS only; "
          "`outl_page_get <slug>` to read the full page before relying on it):"]
 for r in fresh:
     lines.append(f"- {r['slug']} › {r['heading']} — {r['snippet'][:140]}")
-print("\n".join(lines))
+# Emit the hook JSON directly (3.3: no separate emit python spawn).
+print(json.dumps({"hookSpecificOutput": {
+    "hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(lines)}}))
 PY
 )"
-    [ -n "$ctx" ] && CTX="$ctx" emit "UserPromptSubmit"
+    [ -n "$out" ] && printf '%s' "$out"
   fi
   exit 0
 fi
@@ -219,6 +235,9 @@ try:
     print("1" if json.load(sys.stdin).get("active") else "0")
 except Exception:
     print("")' 2>/dev/null)"
+  # Publish the active flag so UserPromptSubmit can cheaply gate push-retrieval (3.1) without
+  # its own stats subprocess. Fail-open: an empty value (stats error) leaves push enabled.
+  printf '%s' "$active" > "$WS/.push-active" 2>/dev/null || true
   if [ "$active" = "1" ]; then
     ctx+="Retrieval: the memory-index is ACTIVE. To recall, run \`memory-index search \"<terms>\"\` FIRST (FTS5 + a walk of the typed [[link]] graph out from the hits), then \`outl_page_get\` the slugs it names; fall back to TOC descent if it returns nothing. Per AGENTS.md 'Retrieval regime auto-scales'."$'\n\n'
   fi
@@ -295,6 +314,11 @@ if [ "$last" != "$TODAY" ]; then
     (
       "$MEMIDX" -w "$WS" maintain >/dev/null 2>&1
       "$MEMIDX" -w "$WS" refresh >/dev/null 2>&1
+      # Daily op-log compaction (4.3): drops provably-inert ops so the log the workspace
+      # replays on every boot stops growing unbounded. Runs after maintain/refresh (their
+      # outl subprocesses have exited) and BEFORE the consolidation agent grabs the workspace;
+      # `compact` refuses while another outl process holds it and backs up before rewriting.
+      "$OUTL" -w "$WS" compact --apply >/dev/null 2>&1 || true
       if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1 && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ]; then
         "$CONS" >/dev/null 2>&1
       fi
