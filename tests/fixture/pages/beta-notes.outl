@@ -1,0 +1,41 @@
+{
+  "version": 2,
+  "page_id": "4NK9BKMTA8BYPMHBBMCZ0Y8JP5",
+  "last_synced_hash": "sha256:2e37526c19f9b2cdd73b7afd88b6443d010fca0fe58a20cd82c740082ea09c72",
+  "last_synced_at": "2026-09-13T22:32:56.171271+02:00",
+  "blocks": [
+    {
+      "id": "01M2E7J57F358WZVCHWQC473JZ",
+      "line": 1,
+      "indent": 0,
+      "content_hash": "sha256:260520b0dcf3f658c8a30a9ccb5cc30b5f21fa9843d873bc6b3167fbcd3973e9",
+      "ref_handle": "blk-c473jz",
+      "text": "type:: knowledge"
+    },
+    {
+      "id": "01M2E7J57FH7DM2WRGF9FTJFV7",
+      "line": 2,
+      "indent": 0,
+      "content_hash": "sha256:3403d9b8f2b7a1381561db8ee8d5c2a306dfb980af60a151dfb8436247e781e7",
+      "ref_handle": "blk-ftjfv7",
+      "text": "parent:: [[proj-beta]]"
+    },
+    {
+      "id": "01M2E7J57FMCYQ97EHKQP00P42",
+      "line": 3,
+      "indent": 0,
+      "content_hash": "sha256:63e13e87b378d1e85f838ead267db9020c1457b1118a37e0af9fb5f976144f4b",
+      "ref_handle": "blk-p00p42",
+      "text": "## Notes"
+    },
+    {
+      "id": "01M2E7J57FTSG9YK0PAABWEZMW",
+      "line": 4,
+      "indent": 0,
+      "content_hash": "sha256:a89db5cd9c5fe51c5f1580ff1d86adb173161d1b65732bfc379b86e92fefda0f",
+      "ref_handle": "blk-bwezmw",
+      "text": "the only beta fact"
+    }
+  ],
+  "pipeline_version": 4
+}

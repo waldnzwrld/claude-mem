@@ -1,0 +1,49 @@
+{
+  "version": 2,
+  "page_id": "24NT3Y1GW061VPMMMQ75DTDRPE",
+  "last_synced_hash": "sha256:dd24592c64b900462ded13a5fc2c7f2649a7e247fc7d4fa0de9c71dc2e6a9d3d",
+  "last_synced_at": "2026-09-13T22:32:55.455440+02:00",
+  "blocks": [
+    {
+      "id": "01M2E7J4G8YK08MQDMP3JPYBT0",
+      "line": 1,
+      "indent": 0,
+      "content_hash": "sha256:82dfc94e73d7f1f84d2e682611c05238b098241be3f0a88b65285aedbbad5cb7",
+      "ref_handle": "blk-jpybt0",
+      "text": "type:: moc"
+    },
+    {
+      "id": "01M2E7J4G9V79XA0P9DBCYXEWE",
+      "line": 2,
+      "indent": 0,
+      "content_hash": "sha256:532bbf90c505b9134985e07264dd31274debe0725fb0846be1e9704c16823c95",
+      "ref_handle": "blk-cyxewe",
+      "text": "parent:: [[index]]"
+    },
+    {
+      "id": "01M2E7J4G9T23TK00P421A2YZ6",
+      "line": 3,
+      "indent": 0,
+      "content_hash": "sha256:68ae27f25b6cc1b561ab0be5f104403a65bcdb1dabb398e6684d2e06bf7348b1",
+      "ref_handle": "blk-1a2yz6",
+      "text": "## Children"
+    },
+    {
+      "id": "01M2E7J4G9367D2JRA0DBVRB9S",
+      "line": 4,
+      "indent": 0,
+      "content_hash": "sha256:bd73ee2ed310c1c9d36a56b6b6841e6b7a15048eb9dc7a4fa446a5b67288326b",
+      "ref_handle": "blk-bvrb9s",
+      "text": "[[pinned-note]] — pinned"
+    },
+    {
+      "id": "01M2E7J4G9NP5HGKGRH5332PM8",
+      "line": 5,
+      "indent": 0,
+      "content_hash": "sha256:a78ac28efdace110594e1f669d2f91f6a42b7eef90e0a5b97690fea638d407ee",
+      "ref_handle": "blk-332pm8",
+      "text": "[[big-leaf]] — oversized"
+    }
+  ],
+  "pipeline_version": 4
+}

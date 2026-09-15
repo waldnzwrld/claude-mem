@@ -1,0 +1,13 @@
+# Derived / runtime — rebuilt by outl or per test run, never committed.
+.outl/index.sqlite
+.outl/index.sqlite-wal
+.outl/index.sqlite-shm
+.frecency/
+.last-session-date
+.consolidate.log
+.consolidate.lock.d/
+.push-cache/
+*.lock
+.lock-*
+*.idx
+orphans.log

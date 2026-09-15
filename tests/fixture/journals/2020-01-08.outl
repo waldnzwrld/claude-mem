@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "page_id": "3NAQ6TVB2TP5PTRB5JSC6NYPVW",
+  "last_synced_hash": "sha256:e0d550f0176138a21316114b03b5e570f337202e57ba2d58eccb559056316f3e",
+  "last_synced_at": "2026-09-13T22:32:57.370460+02:00",
+  "blocks": [
+    {
+      "id": "01M2E7J6EQR7W42YK7T7DB1SVB",
+      "line": 1,
+      "indent": 0,
+      "content_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "ref_handle": "blk-db1svb",
+      "text": ""
+    },
+    {
+      "id": "01M2E7J6EVNB2X9VR15Q7XAK1D",
+      "line": 2,
+      "indent": 0,
+      "content_hash": "sha256:1d0d345c6517ba409eff6ab4ea585aaa43b6744d4913d728e2709c9bdaa6b96f",
+      "ref_handle": "blk-7xak1d",
+      "text": "## Focus"
+    },
+    {
+      "id": "01M2E7J6GAWCPQ6RTPFW0WFFZ8",
+      "line": 3,
+      "indent": 0,
+      "content_hash": "sha256:3318d7ebf9cc5e22a607a8f4f8fc68c24e67165ad338ef36265667c0beba9f93",
+      "ref_handle": "blk-0wffz8",
+      "text": "worked on alpha on 2020-01-08"
+    }
+  ],
+  "pipeline_version": 4
+}

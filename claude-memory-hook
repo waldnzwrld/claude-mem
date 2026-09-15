@@ -18,7 +18,7 @@ DUMP="${MEMORY_DUMP_BIN:-$HOME/.local/bin/claude-memory-dump}"
 CLAUDE="${CLAUDE_BIN:-claude}"
 # Hooks can run with a minimal PATH; fall back to the usual install location.
 command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE="$HOME/.local/bin/claude"
-WS="$HOME/.claude/memory"
+WS="${MEMORY_WS:-$HOME/.claude/memory}"   # override targets an isolated workspace (tests)
 MARKER="$WS/.last-session-date"
 ATTEMPTS="$WS/.consolidate-attempts"    # per-journal count of consecutive auto-consolidation attempts
 MAX_CONSOLIDATE_ATTEMPTS=2              # auto-retry a stuck journal this many times, then surface it
@@ -287,46 +287,19 @@ fi
 last=""
 [ -f "$MARKER" ] && last="$(cat "$MARKER" 2>/dev/null)"
 if [ "$last" != "$TODAY" ]; then
-  # Frecency sweep: decay non-pinned knowledge leaves by 1 via `outl page prop set`, then
-  # compute prune candidates (reached 0) and split-on-growth candidates (over
-  # MEMORY_SPLIT_TOKENS). Detached agent does the work; ⚠ directives are the fallback.
+  # Frecency sweep (silent, mechanical): decay every page + content line by 1 and EVICT
+  # anything that reached 0 — soft-trash + reference scrub, no prompt and no message. Then
+  # hand only the two generative jobs (journal distill + oversized split) to the detached
+  # agent. Everything is backgrounded so SessionStart never blocks and nothing is surfaced.
   if [ -x "$MEMIDX" ]; then
-    sweep="$("$MEMIDX" -w "$WS" maintain --json 2>/dev/null)"
-    "$MEMIDX" -w "$WS" refresh >/dev/null 2>&1 || true   # re-index the decayed frontmatter
-    cands="$(printf '%s' "$sweep" | python3 -c 'import sys, json
-try:
-    print(" ".join(json.load(sys.stdin).get("prune_candidates", [])))
-except Exception:
-    print("")' 2>/dev/null)"
-    split="$(printf '%s' "$sweep" | python3 -c 'import sys, json
-try:
-    c = json.load(sys.stdin).get("split_candidates", [])
-    print(", ".join(d["slug"] + " (~" + str(d["tokens"]) + " tok)" for d in c))
-except Exception:
-    print("")' 2>/dev/null)"
-    secprune="$(printf '%s' "$sweep" | python3 -c 'import sys, json
-try:
-    print(", ".join(json.load(sys.stdin).get("section_prune_candidates", [])))
-except Exception:
-    print("")' 2>/dev/null)"
-    if [ -n "$cands" ] || [ -n "$split" ] || [ -n "$secprune" ]; then
+    (
+      "$MEMIDX" -w "$WS" maintain >/dev/null 2>&1
+      "$MEMIDX" -w "$WS" refresh >/dev/null 2>&1
       if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1 && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ]; then
-        # memory-consolidate also compacts the tree. Pass the authoritative sweep JSON through
-        # (this run already decayed frecency + seen, so a re-computed list would be empty).
-        MEMORY_CONSOLIDATE_SWEEP="$sweep" nohup "$CONS" >/dev/null 2>&1 &
-        disown 2>/dev/null || true
-        note=""
-        [ -n "$split" ] && note="splitting oversized leaves ($split)"
-        [ -n "$cands" ] && { [ -n "$note" ] && note="$note; "; note="${note}pruning dead leaves ($cands)"; }
-        [ -n "$secprune" ] && { [ -n "$note" ] && note="$note; "; note="${note}removing dead sections ($secprune)"; }
-        ctx+="Memory compaction is running automatically in a background agent — $note. Do NOT split, prune, or restructure memory pages yourself this session."$'\n\n'
-      else
-        # Fallback (script/CLI unavailable): surface work as directives.
-        [ -n "$cands" ] && ctx+="⚠ Frecency prune candidates (reached 0 in today's sweep): $cands — per the Frecency & pruning section of AGENTS.md, decide for each whether to delete it (outl_page_delete, then remove its parent-TOC link) or bump its frecency if it's still relevant."$'\n\n'
-        [ -n "$secprune" ] && ctx+="⚠ Section prune candidates (a single ## section whose section-frecency reached 0, though its leaf is still live): $secprune — per the Frecency & pruning section of AGENTS.md at section granularity, for each 'slug › heading' either keep it (reseeds on next use) or remove JUST that section's subtree (outl_block_delete the heading block + descendants), never the whole leaf, preserving crosslinks into sibling sections."$'\n\n'
-        [ -n "$split" ] && ctx+="⚠ Split-on-growth candidates (leaf body over the token budget): $split — per the 'Split on growth' rule in AGENTS.md, convert each into a TOC: extract its sections into <slug>-<section> child leaves, leave one-line [[links]] + hooks behind, and update the parent TOC. Skip only a leaf that is genuinely one atomic topic with no split seam."$'\n\n'
+        "$CONS" >/dev/null 2>&1
       fi
-    fi
+    ) >/dev/null 2>&1 &
+    disown 2>/dev/null || true
   fi
 
   printf '%s' "$TODAY" > "$MARKER" 2>/dev/null || true

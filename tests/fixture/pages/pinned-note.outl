@@ -1,0 +1,41 @@
+{
+  "version": 2,
+  "page_id": "006VZE0Z7W602JPHA4JYWZ24EX",
+  "last_synced_hash": "sha256:c47458127fcb8f65605db082fd543cd2cb8e0ca4c0a426ec011876876b70d3d0",
+  "last_synced_at": "2026-09-13T22:32:56.377272+02:00",
+  "blocks": [
+    {
+      "id": "01M2E7J5CFZ7RX98TS86HFS4H9",
+      "line": 1,
+      "indent": 0,
+      "content_hash": "sha256:260520b0dcf3f658c8a30a9ccb5cc30b5f21fa9843d873bc6b3167fbcd3973e9",
+      "ref_handle": "blk-hfs4h9",
+      "text": "type:: knowledge"
+    },
+    {
+      "id": "01M2E7J5CFMXMJAFXW8P1GGB2P",
+      "line": 2,
+      "indent": 0,
+      "content_hash": "sha256:1ad73fa61f4860826aabfe64fe91e1d238b3737115fbc23ce93634c86f32612a",
+      "ref_handle": "blk-1ggb2p",
+      "text": "parent:: [[misc]]"
+    },
+    {
+      "id": "01M2E7J5CFS30ESRKBF0KKP8Q9",
+      "line": 3,
+      "indent": 0,
+      "content_hash": "sha256:8b37c1bdd99e55af460f2c25e757ec0a63dc160bca4a13851fee11cc49a221d0",
+      "ref_handle": "blk-kkp8q9",
+      "text": "## Pinned"
+    },
+    {
+      "id": "01M2E7J5CFCDCJM2B1QCN1YXCY",
+      "line": 4,
+      "indent": 0,
+      "content_hash": "sha256:c4fae1d2b5db629e7f3acd32ce2b9525477d21e1db6ab60988e8726bae8a3d25",
+      "ref_handle": "blk-n1yxcy",
+      "text": "a pinned fact — pins are no longer exempt from decay"
+    }
+  ],
+  "pipeline_version": 4
+}
