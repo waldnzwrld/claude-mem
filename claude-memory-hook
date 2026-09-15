@@ -318,7 +318,13 @@ if [ "$last" != "$TODAY" ]; then
       # replays on every boot stops growing unbounded. Runs after maintain/refresh (their
       # outl subprocesses have exited) and BEFORE the consolidation agent grabs the workspace;
       # `compact` refuses while another outl process holds it and backs up before rewriting.
-      "$OUTL" -w "$WS" compact --apply >/dev/null 2>&1 || true
+      # --no-horizon also reclaims inert ops from the last 30 days; safe ONLY with no
+      # paired peers (no peer can hold undelivered ops), so gate on an empty peer list.
+      if "$OUTL" -w "$WS" peer list 2>/dev/null | grep -q "No paired devices"; then
+        "$OUTL" -w "$WS" compact --apply --no-horizon >/dev/null 2>&1 || true
+      else
+        "$OUTL" -w "$WS" compact --apply >/dev/null 2>&1 || true
+      fi
       if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1 && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ]; then
         "$CONS" >/dev/null 2>&1
       fi
