@@ -256,3 +256,22 @@ except Exception:
     echo "• memory-index   -> graph already meets the current standard"
   fi
 fi
+
+# ---- 7. migrate the op log to per-page layout (one-time, reversible) ---------
+# Global layout (ops-<actor>.jsonl) forces a full-graph op replay on every cold boot; per-page
+# layout (ops-<actor>-<page>.jsonl) scopes replay to the pages actually touched (RFC #137 Phase B).
+# Reversible: the legacy log is kept as ops-<actor>.jsonl.v0.bak, whose presence also marks that
+# the migration already ran, so this is a no-op on repeat installs. Needs exclusive workspace
+# access; skips with a hint if a session holds the lock.
+if [ -d "$MEM_DIR/ops" ] && [ -x "$OUTL_PATH" ]; then
+  if ls "$MEM_DIR"/ops/*.jsonl.v0.bak >/dev/null 2>&1; then
+    echo "• outl           -> op log already on per-page layout"
+  else
+    "$OUTL_PATH" -w "$MEM_DIR" backup now >/dev/null 2>&1 || true
+    if "$OUTL_PATH" -w "$MEM_DIR" migrate-to-per-page-ops >/dev/null 2>&1; then
+      echo "✔ outl           -> migrated op log to per-page layout (legacy kept as *.v0.bak)"
+    else
+      echo "• outl           -> per-page migration skipped (workspace busy); run '$OUTL_PATH -w $MEM_DIR migrate-to-per-page-ops' with no sessions open"
+    fi
+  fi
+fi
