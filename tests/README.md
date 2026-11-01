@@ -6,15 +6,17 @@ the fixture is never mutated and nothing touches live memory.
 
 - **`verify.sh`** — fast, deterministic. Drives `memory-index` directly (no LLM) and asserts
   the mechanical outcomes.
-- **`verify-agent.sh`** — the agent-in-the-loop proof. Points a **real running Claude agent**
-  at the fixture (real outl MCP, real PostToolUse hook, real `claude -p` consolidation agent)
-  and asserts the end-to-end runtime behaves as expected. Slower; consumes model quota.
+- **`verify-agent.sh`** — the agent-in-the-loop proof. Points a **real running agent** at the
+  fixture (real outl MCP, real PostToolUse hook, real headless consolidation agent) and asserts
+  the end-to-end runtime behaves as expected. `HARNESS=claude` (default) or `HARNESS=omp`.
+  Slower; consumes model quota.
 
 ## Run
 
 ```bash
 tests/verify.sh                                 # mechanical layer (this branch's ./memory-index)
 tests/verify-agent.sh                           # agent-in-the-loop proof (launches Claude)
+HARNESS=omp tests/verify-agent.sh               # same proof through omp + omp/claude-memory.ts
 SKIP_CONSOLIDATION=1 tests/verify-agent.sh      # only the cheap propagation scenario
 MI=~/.local/bin/memory-index tests/verify.sh    # test the installed binary instead
 ```
@@ -23,11 +25,13 @@ Exit status is non-zero if any assertion fails. Reuse on every branch as we work
 
 ## How the agent runner isolates live memory
 
-`verify-agent.sh` launches `claude -p` (and the `memory-consolidate` distiller) with:
-`--mcp-config` pointing the **outl MCP at the throwaway workspace**, `--strict-mcp-config` so
-no other MCP loads, `--settings` wiring the repo's PostToolUse hook, and `MEMORY_WS=<copy>`
-so every hook/script targets the copy. The scripts gained a `MEMORY_WS` override for exactly
-this (and `memory-consolidate` now scopes its distiller's outl MCP to the workspace it manages).
+With `HARNESS=claude`, `verify-agent.sh` launches `claude -p` with `--mcp-config` pointing the
+**outl MCP at the throwaway workspace**, `--strict-mcp-config` so no other MCP loads, and
+`--settings` wiring the repo's PostToolUse hook. With `HARNESS=omp`, it launches `omp -p` in a
+scratch project whose `.omp/mcp.json` points outl at the copy, loading only the repo's
+`omp/claude-memory.ts` (`--no-extensions -e`). Either way `MEMORY_WS=<copy>` makes every
+hook/script target the copy, and `memory-consolidate` scopes its distiller's outl MCP to the
+workspace it manages (`memory-agent --ws`).
 
 ## What it covers
 
@@ -48,7 +52,7 @@ this (and `memory-consolidate` now scopes its distiller's outl MCP to the worksp
 | # | Scenario | Proves |
 |---|----------|--------|
 | 1 | live agent recall | a real agent calling `outl_page_get` fires the PostToolUse hook → `touch` → frecency propagates leaf → moc → root |
-| 2 | consolidation agent | a real `claude -p` distiller consumes the one pending journal, writes it into a knowledge leaf, marks it `consolidated::`, and it is reaped |
+| 2 | consolidation agent | a real headless distiller (`claude -p` / `omp -p`) consumes the one pending journal, writes it into a knowledge leaf, marks it `consolidated::`, and it is reaped |
 
 ## Fixture
 

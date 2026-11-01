@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
-# Claude Code persistent-memory hook.
+# Persistent-memory hook. Speaks the Claude Code hook protocol; the omp extension
+# (omp/claude-memory.ts) translates omp lifecycle events into the same protocol and
+# sets MEMORY_HARNESS=omp, which background agents inherit.
 #   SessionStart -> inject the memory index (TOC) + recent journals as context,
 #                   and, on the first session of a new day, flag journals that
 #                   have aged out of the retention window for condensation.
@@ -8,16 +10,17 @@
 #                   before the context is compacted.
 #
 # Reads the hook JSON on stdin, writes a hookSpecificOutput JSON on stdout.
-# Wired via ~/.claude/settings.json. Designed to never fail a session (exit 0).
+# Wired via ~/.claude/settings.json (Claude Code) or the omp extension.
+# Designed to never fail a session (exit 0).
 # See ~/.claude/memory/AGENTS.md for the protocol this supports.
 
 OUTL="${OUTL_BIN:-/opt/homebrew/bin/outl}"
 MEMIDX="${MEMORY_INDEX_BIN:-$HOME/.local/bin/memory-index}"
 CONS="${MEMORY_CONSOLIDATE_BIN:-$HOME/.local/bin/memory-consolidate}"
 DUMP="${MEMORY_DUMP_BIN:-$HOME/.local/bin/claude-memory-dump}"
-CLAUDE="${CLAUDE_BIN:-claude}"
-# Hooks can run with a minimal PATH; fall back to the usual install location.
-command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE="$HOME/.local/bin/claude"
+AGENT="${MEMORY_AGENT_BIN:-$(dirname "${BASH_SOURCE[0]}")/memory-agent}"
+# agent_ok: a headless agent CLI exists for the current harness (memory-agent decides).
+agent_ok() { [ -x "$AGENT" ] && "$AGENT" --available; }
 WS="${MEMORY_WS:-$HOME/.claude/memory}"   # override targets an isolated workspace (tests)
 MARKER="$WS/.last-session-date"
 ATTEMPTS="$WS/.consolidate-attempts"    # per-journal count of consecutive auto-consolidation attempts
@@ -138,7 +141,7 @@ if [ "$event" = "PostToolUse" ]; then
     slug="$(printf '%s' "$input" | python3 -c 'import sys, json
 try:
     d = json.load(sys.stdin)
-    if d.get("tool_name") == "mcp__outl__outl_page_get":
+    if d.get("tool_name") in ("mcp__outl__outl_page_get", "mcp__outl_page_get"):
         print(((d.get("tool_input") or {}).get("slug") or "").strip())
 except Exception:
     pass' 2>/dev/null)"
@@ -155,7 +158,7 @@ fi
 # already inside a spawned agent (its own SessionEnd must not re-trigger us).
 if [ "$event" = "SessionEnd" ]; then
   if [ -z "${MEMORY_DUMP_ACTIVE:-}" ] && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] \
-     && [ -x "$DUMP" ] && command -v "$CLAUDE" >/dev/null 2>&1; then
+     && [ -x "$DUMP" ] && agent_ok; then
     tpath="$(printf '%s' "$input" | python3 -c 'import sys, json
 try:
     print(json.load(sys.stdin).get("transcript_path", ""))
@@ -263,7 +266,7 @@ except Exception:
     # Rewrite with only the still-pending journals, so a cleared one drops its counter.
     printf '%s' "$newstate" > "$ATTEMPTS" 2>/dev/null || true
 
-    if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1 \
+    if [ -x "$CONS" ] && agent_ok \
        && [ "$maxtries" -le "$MAX_CONSOLIDATE_ATTEMPTS" ]; then
       # Automatic path: distill + reap in a detached agent.
       nohup "$CONS" >/dev/null 2>&1 &
@@ -272,7 +275,7 @@ except Exception:
     else
       # Fallback: tooling missing, or background agent failed MAX_CONSOLIDATE_ATTEMPTS times.
       # Pause auto-retry; have THIS session do the distillation.
-      if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1; then
+      if [ -x "$CONS" ] && agent_ok; then
         ctx+="⚠ Automatic background consolidation has not cleared these journals after $MAX_CONSOLIDATE_ATTEMPTS attempt(s) ($pend); auto-retry is paused to avoid a silent, re-billing loop. Do the consolidation in THIS session instead, as below."$'\n\n'
       fi
       ctx+="⚠ CONSOLIDATION REQUIRED before other work this session — these journals are older than the 5 most recent and are NOT yet distilled: $pend. For EACH date, per the Condensation section of AGENTS.md: cluster its items by the [[page]] they concern, merge the distilled points into the right knowledge leaf (create/split as needed; set each such leaf's \`updated:: $TODAY\` plus summary::/frecency). Then, as the LAST actions for that date: (1) record evidence — \`outl_page_prop_set <date> distilled-into='[[slug-a]] [[slug-b]]'\` listing every leaf you wrote to, or \`distilled-into=none\` if nothing was durable; (2) \`outl_page_prop_set <date> consolidated=$TODAY\`. The reap deletes any aged journal carrying a \`consolidated::\` mark, so marking it done is what removes it — do NOT delete journals yourself. Do this now, then address the user's request."$'\n\n'
@@ -295,7 +298,7 @@ if [ "$last" != "$TODAY" ]; then
     (
       "$MEMIDX" -w "$WS" maintain >/dev/null 2>&1
       "$MEMIDX" -w "$WS" refresh >/dev/null 2>&1
-      if [ -x "$CONS" ] && command -v "$CLAUDE" >/dev/null 2>&1 && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ]; then
+      if [ -x "$CONS" ] && agent_ok && [ -z "${MEMORY_CONSOLIDATE_ACTIVE:-}" ]; then
         "$CONS" >/dev/null 2>&1
       fi
     ) >/dev/null 2>&1 &

@@ -11,8 +11,9 @@
 #     after cleaning up its parent-TOC link, or bump it if it still earns a place.
 # Reaping and candidate detection are mechanical (`memory-index`); the distil,
 # split, and keep-vs-delete calls need an LLM, so this spawns a detached, headless
-# `claude -p` agent per ~/.claude/memory/AGENTS.md. The SessionStart hook backgrounds
-# this whenever any backlog exists.
+# agent via `memory-agent` (claude -p or omp -p, per MEMORY_HARNESS) per
+# ~/.claude/memory/AGENTS.md. The SessionStart hook backgrounds this whenever any
+# backlog exists.
 #
 # Safe to run any time and repeatedly: it no-ops when nothing is pending,
 # single-instances via a lock, and refuses to recurse into the agent it spawns.
@@ -20,12 +21,7 @@
 set -u
 
 MEMIDX="${MEMORY_INDEX_BIN:-$HOME/.local/bin/memory-index}"
-OUTL="${OUTL_BIN:-/opt/homebrew/bin/outl}"
-CLAUDE="${CLAUDE_BIN:-claude}"
-# Hooks can run with a minimal PATH; fall back to the usual install location.
-command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE="$HOME/.local/bin/claude"
-# Distillation runs on a capable model. Override with MEMORY_MODEL.
-MODEL="${MEMORY_MODEL:-claude-sonnet-5}"
+AGENT="${MEMORY_AGENT_BIN:-$(dirname "${BASH_SOURCE[0]}")/memory-agent}"
 WS="${MEMORY_WS:-$HOME/.claude/memory}"   # override targets an isolated workspace (tests)
 LOCKDIR="$WS/.consolidate.lock.d"
 LOG="$WS/.consolidate.log"
@@ -74,8 +70,8 @@ if [ -z "$pend" ] && [ -z "$split_slugs" ]; then
   exit 0
 fi
 
-# LLM work below needs the CLI. If absent, reap what's marked and leave the rest to the hook's fallback.
-if ! command -v "$CLAUDE" >/dev/null 2>&1; then
+# LLM work below needs a headless agent CLI. If absent, reap what's marked and leave the rest to the hook's fallback.
+if ! { [ -x "$AGENT" ] && "$AGENT" --available; }; then
   "$MEMIDX" -w "$WS" consolidate --reap >/dev/null 2>&1 || true
   exit 0
 fi
@@ -97,19 +93,9 @@ $tasks
 
 Priorities, in order: (1) never lose a durable fact while distilling; (2) keep the graph navigable — every page reachable from its parent TOC by a one-hop [[link]], no dangling links, no orphans; (3) keep every page small. Work silently."
 
-# Point the distiller's outl MCP at THIS workspace explicitly (so it operates on the
-# workspace we manage, not whatever ambient config happens to serve) and strict-scope it so
-# no unrelated MCP servers load. This is what also lets the test harness run the real
-# distiller against an isolated fixture via MEMORY_WS.
-_MCP_CFG="$(mktemp)"
-printf '{"mcpServers":{"outl":{"command":"%s","args":["mcp","serve","-w","%s"]}}}' "$OUTL" "$WS" > "$_MCP_CFG"
-MEMORY_CONSOLIDATE_ACTIVE=1 "$CLAUDE" -p "$prompt" \
-  --model "$MODEL" \
-  --mcp-config "$_MCP_CFG" \
-  --strict-mcp-config \
-  --dangerously-skip-permissions \
-  >>"$LOG" 2>&1 || true
-rm -f "$_MCP_CFG"
+# Scope the distiller's outl MCP to THIS workspace (not whatever ambient config serves),
+# which also lets the test harness run the real distiller against a fixture via MEMORY_WS.
+MEMORY_CONSOLIDATE_ACTIVE=1 "$AGENT" --ws "$WS" "$prompt" >>"$LOG" 2>&1 || true
 
 # Reap journals the agent marked consolidated::, then reindex the restructured tree.
 "$MEMIDX" -w "$WS" consolidate --reap >>"$LOG" 2>&1 || true

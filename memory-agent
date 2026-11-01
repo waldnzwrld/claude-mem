@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+#
+# memory-agent — run one headless memory-maintenance agent on the selected harness.
+#
+#   memory-agent --available          exit 0 iff the harness CLI is runnable
+#   memory-agent [--ws DIR] PROMPT    run PROMPT headless with full tool permissions;
+#                                     --ws scopes the agent's outl MCP server to DIR
+#
+# Harness: MEMORY_HARNESS = claude (default) | omp. The hook inherits it from the harness
+# that fired it, so background agents run on the same CLI as the interactive session.
+# Model: MEMORY_MODEL (default: Sonnet 5 on either harness).
+# CLI overrides: CLAUDE_BIN, OMP_BIN. stdout/stderr pass through; callers redirect to a log.
+
+set -u
+
+HARNESS="${MEMORY_HARNESS:-claude}"
+OUTL="${OUTL_BIN:-/opt/homebrew/bin/outl}"
+
+# Hooks can run with a minimal PATH; fall back to the usual install locations.
+resolve() {
+  local c
+  for c in "$@"; do
+    [ -n "$c" ] || continue
+    if command -v "$c" >/dev/null 2>&1; then command -v "$c"; return 0; fi
+  done
+  return 1
+}
+
+case "$HARNESS" in
+  claude)
+    CLI="$(resolve "${CLAUDE_BIN:-}" claude "$HOME/.local/bin/claude")"
+    MODEL="${MEMORY_MODEL:-claude-sonnet-5}" ;;
+  omp)
+    CLI="$(resolve "${OMP_BIN:-}" omp /opt/homebrew/bin/omp /usr/local/bin/omp "$HOME/.bun/bin/omp")"
+    MODEL="${MEMORY_MODEL:-claude-sonnet-5}" ;;
+  *)
+    echo "memory-agent: unknown MEMORY_HARNESS '$HARNESS' (want claude|omp)" >&2
+    exit 2 ;;
+esac
+
+if [ "${1:-}" = "--available" ]; then
+  [ -n "$CLI" ]
+  exit $?
+fi
+[ -n "$CLI" ] || { echo "memory-agent: $HARNESS CLI not found" >&2; exit 127; }
+
+WS=""
+if [ "${1:-}" = "--ws" ]; then
+  WS="${2:-}"
+  shift 2
+fi
+PROMPT="${1:-}"
+[ -n "$PROMPT" ] || { echo "memory-agent: empty prompt" >&2; exit 2; }
+
+TMP=""
+trap '[ -n "$TMP" ] && rm -rf "$TMP"' EXIT
+mcp_json() {
+  printf '{"mcpServers":{"outl":{"type":"stdio","command":"%s","args":["mcp","serve","-w","%s"]}}}' "$OUTL" "$1"
+}
+
+case "$HARNESS" in
+  claude)
+    set -- -p "$PROMPT" --model "$MODEL" --dangerously-skip-permissions
+    if [ -n "$WS" ]; then
+      TMP="$(mktemp -d)"
+      mcp_json "$WS" > "$TMP/mcp.json"
+      set -- "$@" --mcp-config "$TMP/mcp.json" --strict-mcp-config
+    fi
+    "$CLI" "$@"
+    ;;
+  omp)
+    # omp has no per-run MCP flag; a project-scoped .omp/mcp.json in a scratch cwd shadows
+    # the same-named user `outl` server, pointing the agent at WS.
+    set -- -p --model "$MODEL" --approval-mode yolo --no-session --no-title
+    if [ -n "$WS" ]; then
+      TMP="$(mktemp -d)"
+      mkdir -p "$TMP/.omp"
+      mcp_json "$WS" > "$TMP/.omp/mcp.json"
+      set -- "$@" --cwd "$TMP"
+    fi
+    "$CLI" "$@" -- "$PROMPT"
+    ;;
+esac
