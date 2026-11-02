@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
 # install.sh — put the llm-harness-memory system files into place for one or more
-# agent harnesses (Claude Code, omp).
+# agent harnesses (Claude Code, omp, pi).
 #
 # Run this AS YOUR NORMAL USER on the target Mac (not sudo):
 #
 #     ./install.sh                      # Claude Code (default)
 #     ./install.sh --harness omp        # oh-my-pi (omp)
-#     ./install.sh --harness all        # both; also: --harness claude,omp
+#     ./install.sh --harness pi         # pi
+#     ./install.sh --harness all        # every harness; also: --harness claude,omp,pi
 #
 # Every harness shares one memory workspace (~/.llm-harness-memory), one hook, one index,
 # and the same helper binaries in ~/.local/bin; each harness only adds its own wiring.
@@ -21,6 +22,10 @@
 # from omp lifecycle events, the memory-recall task agent, and the memory section in
 # ~/.omp/agent/AGENTS.md. Override the agent dir with OMP_AGENT_DIR.
 #
+# pi: installs the adapter extension (pi/llm-harness-memory.ts) and the memory section in
+# ~/.pi/agent/AGENTS.md. pi has no subagents, so there is no memory-recall agent. Override the
+# agent dir with PI_AGENT_DIR (falls back to PI_CODING_AGENT_DIR).
+#
 # It does NOT initialize the outl workspace or register the outl MCP server — do those
 # yourself:
 #
@@ -30,6 +35,7 @@
 #     outl init ~/.llm-harness-memory
 #     claude mcp add outl --scope user -- outl --workspace ~/.llm-harness-memory mcp serve   # Claude Code
 #     # omp: add the `outl` server to ~/.omp/agent/mcp.json (snippet printed below)
+#     # pi:  add the `outl` server to ~/.pi/agent/mcp.json (snippet printed below)
 #
 set -euo pipefail
 
@@ -37,14 +43,16 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 WANT_CLAUDE=0
 WANT_OMP=0
+WANT_PI=0
 want() {
   local h
   for h in ${1//,/ }; do
     case "$h" in
       claude) WANT_CLAUDE=1 ;;
       omp)    WANT_OMP=1 ;;
-      all)    WANT_CLAUDE=1; WANT_OMP=1 ;;
-      *) echo "unknown harness '$h' (want claude|omp|all)" >&2; exit 2 ;;
+      pi)     WANT_PI=1 ;;
+      all)    WANT_CLAUDE=1; WANT_OMP=1; WANT_PI=1 ;;
+      *) echo "unknown harness '$h' (want claude|omp|pi|all)" >&2; exit 2 ;;
     esac
   done
 }
@@ -52,11 +60,11 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --harness) [ $# -ge 2 ] || { echo "--harness needs a value" >&2; exit 2; }; want "$2"; shift 2 ;;
     --harness=*) want "${1#--harness=}"; shift ;;
-    -h|--help) sed -n '3,10p' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,11p' "$0"; exit 0 ;;
     *) echo "unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
-[ "$WANT_CLAUDE" = 1 ] || [ "$WANT_OMP" = 1 ] || WANT_CLAUDE=1
+[ "$WANT_CLAUDE" = 1 ] || [ "$WANT_OMP" = 1 ] || [ "$WANT_PI" = 1 ] || WANT_CLAUDE=1
 
 CLAUDE_DIR="$HOME/.claude"
 MEM_DIR="$HOME/.llm-harness-memory"
@@ -67,6 +75,7 @@ HOOK="$BIN_DIR/memory-hook"
 MEMIDX="$BIN_DIR/memory-index"
 AGENTS_DIR="$CLAUDE_DIR/agents"
 OMP_DIR="${OMP_AGENT_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}}"
+PI_DIR="${PI_AGENT_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}}"
 
 if [ -d "$HOME/.claude/memory/.outl" ] && ! [ -e "$MEM_DIR" ]; then
   echo "✖ found a workspace at ~/.claude/memory; run ./upgrade.sh to move it to $MEM_DIR" >&2
@@ -99,6 +108,18 @@ append_memory_section() {
   fi
 }
 
+# serves_outl <mcp.json>  — exit 0 iff the file's mcpServers already has an `outl` entry.
+serves_outl() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    servers = json.load(open(sys.argv[1])).get("mcpServers") or {}
+except Exception:
+    sys.exit(1)
+sys.exit(0 if "outl" in servers else 1)
+PY
+}
+
 # ======================= shared: workspace protocol + binaries =======================
 
 # ---- 1. protocol doc --------------------------------------------------------
@@ -112,7 +133,7 @@ else
   OUTL_PATH="/opt/homebrew/bin/outl"   # Apple-Silicon default; Intel is /usr/local/bin/outl
 fi
 # memory-hook: every harness's lifecycle events; memory-agent: headless runner
-# (claude -p | omp -p) for the background agents.
+# (claude -p | omp -p | pi -p) for the background agents.
 for f in memory-hook memory-agent; do
   tmp="$(mktemp)"
   sed "s|^OUTL=.*|OUTL=\"\${OUTL_BIN:-$OUTL_PATH}\"|" "$SRC/$f" > "$tmp"
@@ -292,21 +313,34 @@ done
 append_memory_section "$OMP_DIR/AGENTS.md" no
 
 # ---- 9. outl MCP server: report whether omp already serves it ---------------
-if python3 - "$OMP_DIR/mcp.json" <<'PY' 2>/dev/null
-import json, sys
-try:
-    servers = json.load(open(sys.argv[1])).get("mcpServers") or {}
-except Exception:
-    sys.exit(1)
-sys.exit(0 if "outl" in servers else 1)
-PY
-then
+if serves_outl "$OMP_DIR/mcp.json"; then
   echo "• omp mcp.json already serves outl; left as-is"
 else
   OMP_MCP_TODO=1
 fi
 
 fi # WANT_OMP
+
+# ====================================== pi ==========================================
+PI_MCP_TODO=0
+if [ "$WANT_PI" = 1 ]; then
+
+# ---- 10. adapter extension: pi lifecycle events -> memory-hook --------
+mkdir -p "$PI_DIR/extensions"
+cp "$SRC/pi/llm-harness-memory.ts" "$PI_DIR/extensions/llm-harness-memory.ts"
+echo "✔ pi extension   -> $PI_DIR/extensions/llm-harness-memory.ts"
+
+# ---- 11. user context: pi's ~/.pi/agent/AGENTS.md ----------------------------
+append_memory_section "$PI_DIR/AGENTS.md" no
+
+# ---- 12. outl MCP server: report whether pi already serves it ---------------
+if serves_outl "$PI_DIR/mcp.json"; then
+  echo "• pi mcp.json already serves outl; left as-is"
+else
+  PI_MCP_TODO=1
+fi
+
+fi # WANT_PI
 
 cat <<EOF
 
@@ -321,6 +355,14 @@ if [ "$OMP_MCP_TODO" = 1 ]; then
   cat <<EOF
   - omp: add the outl server to $OMP_DIR/mcp.json:
       { "mcpServers": { "outl": { "type": "stdio", "command": "$OUTL_PATH",
+          "args": ["--workspace", "$MEM_DIR", "mcp", "serve"] } } }
+EOF
+fi
+if [ "$PI_MCP_TODO" = 1 ]; then
+  cat <<EOF
+  - pi: add the outl server to $PI_DIR/mcp.json ("direct" declares the outl tools to the
+    model; pi's default exposure leaves them reachable only from codemode scripts):
+      { "mcpServers": { "outl": { "command": "$OUTL_PATH", "exposure": "direct",
           "args": ["--workspace", "$MEM_DIR", "mcp", "serve"] } } }
 EOF
 fi

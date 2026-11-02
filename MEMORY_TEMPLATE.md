@@ -1,7 +1,7 @@
 # memory — persistent-memory system for LLM coding harnesses
 
 This repo (llm-harness-memory) is the installer + source for the outl-backed persistent memory
-system, shared by every supported harness (Claude Code, omp). `install.sh` deploys
+system, shared by every supported harness (Claude Code, omp, pi). `install.sh` deploys
 `memory-hook` (the shared lifecycle hook), `memory-index` (stdlib-only SQLite retrieval
 sidecar: FTS5 keyword + a typed/weighted `[[link]]` edge table with a recursive multi-hop
 `search` whose depth follows graph size), `memory-consolidate` (headless distillation agent,
@@ -9,8 +9,9 @@ run on the harness that fired the hook via `memory-agent`), and `AGENTS.md` →
 `~/.llm-harness-memory/`.
 
 The section below is the template `install.sh` appends to each harness's global user-context
-file — `~/.claude/CLAUDE.md` for Claude Code, `~/.omp/agent/AGENTS.md` for omp. Global hard
-rules live in those files and are **not** repeated here. Keep this section in sync with the
+file — `~/.claude/CLAUDE.md` for Claude Code, `~/.omp/agent/AGENTS.md` for omp,
+`~/.pi/agent/AGENTS.md` for pi. Global hard rules live in those files and are **not** repeated
+here. Keep this section in sync with the
 slim installed version (it references the full protocol docs by path for on-demand reading,
 never via `@import`).
 

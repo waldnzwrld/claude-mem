@@ -11,7 +11,7 @@
 #     after cleaning up its parent-TOC link, or bump it if it still earns a place.
 # Reaping and candidate detection are mechanical (`memory-index`); the distil,
 # split, and keep-vs-delete calls need an LLM, so this spawns a detached, headless
-# agent via `memory-agent` (claude -p or omp -p, per MEMORY_HARNESS) per
+# agent via `memory-agent` (claude -p, omp -p, or pi -p, per MEMORY_HARNESS) per
 # ~/.llm-harness-memory/AGENTS.md. The SessionStart hook backgrounds this whenever any
 # backlog exists.
 #

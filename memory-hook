@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
 # Persistent-memory hook shared by every harness. Speaks Claude Code's hook JSON schema,
-# which Claude Code emits natively; the omp extension (omp/llm-harness-memory.ts)
-# translates omp lifecycle events into it and sets MEMORY_HARNESS=omp, which background
-# agents inherit.
+# which Claude Code emits natively; the omp and pi extensions (omp/llm-harness-memory.ts,
+# pi/llm-harness-memory.ts) translate their lifecycle events into it and set
+# MEMORY_HARNESS=omp|pi, which background agents inherit.
 #   SessionStart -> inject the memory index (TOC) + recent journals as context,
 #                   and, on the first session of a new day, flag journals that
 #                   have aged out of the retention window for condensation.
@@ -11,7 +11,7 @@
 #                   before the context is compacted.
 #
 # Reads the hook JSON on stdin, writes a hookSpecificOutput JSON on stdout.
-# Wired via ~/.claude/settings.json (Claude Code) or the omp extension.
+# Wired via ~/.claude/settings.json (Claude Code) or the omp / pi extension.
 # Designed to never fail a session (exit 0).
 # See ~/.llm-harness-memory/AGENTS.md for the protocol this supports.
 
