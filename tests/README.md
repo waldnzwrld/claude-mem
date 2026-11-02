@@ -8,7 +8,8 @@ the fixture is never mutated and nothing touches live memory.
   the mechanical outcomes.
 - **`verify-agent.sh`** — the agent-in-the-loop proof. Points a **real running agent** at the
   fixture (real outl MCP, real PostToolUse hook, real headless consolidation agent) and asserts
-  the end-to-end runtime behaves as expected. `HARNESS=claude` (default) or `HARNESS=omp`.
+  the end-to-end runtime behaves as expected. `HARNESS=claude` (default), `HARNESS=omp`, or
+  `HARNESS=pi`.
   Slower; consumes model quota.
 
 ## Run
@@ -17,6 +18,7 @@ the fixture is never mutated and nothing touches live memory.
 tests/verify.sh                                 # mechanical layer (this branch's ./memory-index)
 tests/verify-agent.sh                           # agent-in-the-loop proof (launches Claude)
 HARNESS=omp tests/verify-agent.sh               # same proof through omp + omp/llm-harness-memory.ts
+HARNESS=pi tests/verify-agent.sh                # same proof through pi + pi/llm-harness-memory.ts
 SKIP_CONSOLIDATION=1 tests/verify-agent.sh      # only the cheap propagation scenario
 MI=~/.local/bin/memory-index tests/verify.sh    # test the installed binary instead
 ```
@@ -29,9 +31,16 @@ With `HARNESS=claude`, `verify-agent.sh` launches `claude -p` with `--mcp-config
 **outl MCP at the throwaway workspace**, `--strict-mcp-config` so no other MCP loads, and
 `--settings` wiring the repo's PostToolUse hook. With `HARNESS=omp`, it launches `omp -p` in a
 scratch project whose `.omp/mcp.json` points outl at the copy, loading only the repo's
-`omp/llm-harness-memory.ts` (`--no-extensions -e`). Either way `MEMORY_WS=<copy>` makes every
-hook/script target the copy, and `memory-consolidate` scopes its distiller's outl MCP to the
-workspace it manages (`memory-agent --ws`).
+`omp/llm-harness-memory.ts` (`--no-extensions -e`). With `HARNESS=pi`, it points
+`PI_CODING_AGENT_DIR` at a throwaway agent dir holding only your `auth.json`, `models.json`, and
+`settings.json` (minus `packages`), so no installed extension or user MCP server loads;
+`--no-extensions` can't be used, since it also disables pi's MCP support. It then launches
+`pi -p` in a scratch project whose `.pi/mcp.json` (trusted by `--approve`) points outl at the
+copy with `direct` exposure, adding the repo's `pi/llm-harness-memory.ts` with `-e`. pi uses its
+own default
+model unless `MEMORY_MODEL` is set. Every way, `MEMORY_WS=<copy>` makes every hook/script target
+the copy, and `memory-consolidate` scopes its distiller's outl MCP to the workspace it manages
+(`memory-agent --ws`).
 
 ## What it covers
 
@@ -52,7 +61,7 @@ workspace it manages (`memory-agent --ws`).
 | # | Scenario | Proves |
 |---|----------|--------|
 | 1 | live agent recall | a real agent calling `outl_page_get` fires the PostToolUse hook → `touch` → frecency propagates leaf → moc → root |
-| 2 | consolidation agent | a real headless distiller (`claude -p` / `omp -p`) consumes the one pending journal, writes it into a knowledge leaf, marks it `consolidated::`, and it is reaped |
+| 2 | consolidation agent | a real headless distiller (`claude -p` / `omp -p` / `pi -p`) consumes the one pending journal, writes it into a knowledge leaf, marks it `consolidated::`, and it is reaped |
 
 ## Fixture
 

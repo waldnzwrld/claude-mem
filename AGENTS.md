@@ -2,14 +2,15 @@
 
 You (the agent) have persistent, cross-session memory. It lives in an **outl** outliner graph
 at `~/.llm-harness-memory` and is reachable through the `outl` MCP tools (also the `outl` CLI).
-The same graph is shared by every harness this system is installed into (Claude Code, omp), so
+The same graph is shared by every harness this system is installed into (Claude Code, omp, pi), so
 what you write in one is recalled in the others.
 It is your **active, vivid persistence layer** — always loaded, and the **first place you
 look** before reaching for code, a file/dir search, or the web, not a reference archive you
 consult last. Keep it curated continuously, not just at maintenance time.
 This document is the source of truth for how that memory works. Your harness's user-context
-file (`~/.claude/CLAUDE.md` for Claude Code, `~/.omp/agent/AGENTS.md` for omp) points at it and
-the SessionStart hook injects the live memory state every session, so you never need to be
+file (`~/.claude/CLAUDE.md` for Claude Code, `~/.omp/agent/AGENTS.md` for omp,
+`~/.pi/agent/AGENTS.md` for pi) points at it and the SessionStart hook injects the live memory
+state every session, so you never need to be
 told that you have memory — but this full protocol is **not** loaded every session; read it
 only when doing memory maintenance.
 
@@ -321,7 +322,7 @@ aged journal (every journal older than the 5 most recent) two ways and acts acco
 - **pending** = aged and **not** yet `consolidated::` → distillation is synthesis, so it needs
   an LLM — but it is **not left to whatever interactive session happens to notice a directive**.
   The hook launches **`memory-consolidate`**, a detached, headless agent, in the background —
-  run via `memory-agent` on the same harness that fired the hook (`claude -p` or `omp -p`): it
+  run via `memory-agent` on the same harness that fired the hook (`claude -p`, `omp -p`, or `pi -p`): it
   distills every pending journal per this section, marks each `consolidated:: <today>`, and
   reaps — automatically, with no prompting, on every install whose harness CLI is available.
   Your interactive session is only *told* it is running (so you don't do it by hand). The

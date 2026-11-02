@@ -12,6 +12,7 @@
 #
 #   tests/verify-agent.sh                 # both scenarios, Claude Code
 #   HARNESS=omp tests/verify-agent.sh     # both scenarios, omp (via omp/llm-harness-memory.ts)
+#   HARNESS=pi tests/verify-agent.sh      # both scenarios, pi (via pi/llm-harness-memory.ts)
 #   SKIP_CONSOLIDATION=1 tests/verify-agent.sh   # only the cheap propagation scenario
 set -u
 
@@ -28,9 +29,32 @@ TMPROOT="$(mktemp -d)"
 trap 'rm -rf "$TMPROOT"' EXIT
 
 case "$HARNESS" in
-  claude|omp) command -v "$HARNESS" >/dev/null 2>&1 || { echo "$HARNESS CLI not found"; exit 1; } ;;
-  *) echo "unknown HARNESS '$HARNESS' (want claude|omp)"; exit 1 ;;
+  claude|omp|pi) command -v "$HARNESS" >/dev/null 2>&1 || { echo "$HARNESS CLI not found"; exit 1; } ;;
+  *) echo "unknown HARNESS '$HARNESS' (want claude|omp|pi)"; exit 1 ;;
 esac
+# pi runs on its own default model unless MEMORY_MODEL is set; claude/omp default to Sonnet 5.
+[ "$HARNESS" = pi ] || MEMORY_MODEL="${MEMORY_MODEL:-claude-sonnet-5}"
+# pi: run from a throwaway agent dir holding only the user's credentials, models, and settings
+# (minus packages), so installed extensions — this repo's included — and user MCP servers
+# never load beside the branch's extension. --no-extensions can't do this: it also disables
+# pi's built-in MCP support.
+if [ "$HARNESS" = pi ]; then
+  PI_USER_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+  export PI_CODING_AGENT_DIR="$TMPROOT/pi-agent"
+  mkdir -p "$PI_CODING_AGENT_DIR"
+  for f in auth.json models.json; do
+    [ -f "$PI_USER_DIR/$f" ] && cp "$PI_USER_DIR/$f" "$PI_CODING_AGENT_DIR/"
+  done
+  python3 - "$PI_USER_DIR/settings.json" "$PI_CODING_AGENT_DIR/settings.json" <<'PY'
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    s = {}
+s.pop("packages", None)
+json.dump(s, open(sys.argv[2], "w"))
+PY
+fi
 [ -d "$FX" ] || { echo "fixture missing — run tests/build-fixture.sh"; exit 1; }
 
 PASS=0; FAIL=0; SKIP=0
@@ -79,7 +103,7 @@ if [ "$HARNESS" = claude ]; then
       --allowedTools "mcp__outl__outl_page_get" \
       --dangerously-skip-permissions \
       >"$TMPROOT/ag1.out" 2>"$TMPROOT/ag1.err"
-else
+elif [ "$HARNESS" = omp ]; then
   # omp: the adapter extension drives every hook event, so SessionStart fires too. A no-op
   # consolidator makes the hook report background consolidation instead of asking this
   # agent to distil the fixture's aged journals; the project .omp/mcp.json scopes outl to W.
@@ -88,9 +112,19 @@ else
   MEMORY_WS="$W" MEMORY_INDEX_BIN="$MI" OUTL_BIN="$OUTL" MEMORY_HOOK_BIN="$HOOK" \
     MEMORY_CONSOLIDATE_BIN=/usr/bin/true MEMORY_DUMP_BIN=/usr/bin/true \
     omp -p --cwd "$P" --no-extensions -e "$REPO/omp/llm-harness-memory.ts" \
-      --model "${MEMORY_MODEL:-claude-sonnet-5}" --approval-mode yolo --no-session --no-title -- \
+      --model "$MEMORY_MODEL" --approval-mode yolo --no-session --no-title -- \
       'Use the outl page_get tool with slug "alpha-notes" to read that memory page. After it returns, reply with just: DONE.' \
       >"$TMPROOT/ag1.out" 2>"$TMPROOT/ag1.err"
+else
+  # pi: like omp, the extension drives every hook event. The project .pi/mcp.json (trusted by
+  # --approve) scopes outl to W with direct exposure.
+  P="$TMPROOT/proj1"; mkdir -p "$P/.pi"
+  printf '{"mcpServers":{"outl":{"command":"%s","args":["mcp","serve","-w","%s"],"exposure":"direct"}}}' "$OUTL" "$W" > "$P/.pi/mcp.json"
+  ( cd "$P" && MEMORY_WS="$W" MEMORY_INDEX_BIN="$MI" OUTL_BIN="$OUTL" MEMORY_HOOK_BIN="$HOOK" \
+    MEMORY_CONSOLIDATE_BIN=/usr/bin/true MEMORY_DUMP_BIN=/usr/bin/true \
+    pi -p --approve --no-session -e "$REPO/pi/llm-harness-memory.ts" ${MEMORY_MODEL:+--model "$MEMORY_MODEL"} \
+      'Use the outl page_get tool with slug "alpha-notes" to read that memory page. After it returns, reply with just: DONE.' \
+      >"$TMPROOT/ag1.out" 2>"$TMPROOT/ag1.err" )
 fi
 # the PostToolUse touch is fire-and-forget; wait for the propagated write to land
 for _ in $(seq 1 60); do [ "$(getf "$W" alpha-notes)" != "30" ] && break; sleep 0.5; done
@@ -115,7 +149,7 @@ else
   check "pending journal present before"  "$(jhere "$W" 2020-01-04)" "yes"
 
   MEMORY_WS="$W" MEMORY_INDEX_BIN="$MI" MEMORY_CONSOLIDATE_BIN="$CONS" OUTL_BIN="$OUTL" \
-    MEMORY_HARNESS="$HARNESS" MEMORY_MODEL="${MEMORY_MODEL:-claude-sonnet-5}" \
+    MEMORY_HARNESS="$HARNESS" MEMORY_MODEL="${MEMORY_MODEL:-}" \
     bash "$CONS" >"$TMPROOT/ag2.out" 2>"$TMPROOT/ag2.err" || true
 
   # The distiller's own output goes to the workspace consolidate log. If the agent could not

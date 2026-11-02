@@ -6,10 +6,10 @@
 #   memory-agent [--ws DIR] PROMPT    run PROMPT headless with full tool permissions;
 #                                     --ws scopes the agent's outl MCP server to DIR
 #
-# Harness: MEMORY_HARNESS = claude (default) | omp. The hook inherits it from the harness
+# Harness: MEMORY_HARNESS = claude (default) | omp | pi. The hook inherits it from the harness
 # that fired it, so background agents run on the same CLI as the interactive session.
-# Model: MEMORY_MODEL (default: Sonnet 5 on either harness).
-# CLI overrides: CLAUDE_BIN, OMP_BIN. stdout/stderr pass through; callers redirect to a log.
+# Model: MEMORY_MODEL (default: Sonnet 5 on claude/omp; pi's own configured default on pi).
+# CLI overrides: CLAUDE_BIN, OMP_BIN, PI_BIN. stdout/stderr pass through; callers redirect to a log.
 
 set -u
 
@@ -33,8 +33,11 @@ case "$HARNESS" in
   omp)
     CLI="$(resolve "${OMP_BIN:-}" omp /opt/homebrew/bin/omp /usr/local/bin/omp "$HOME/.bun/bin/omp")"
     MODEL="${MEMORY_MODEL:-claude-sonnet-5}" ;;
+  pi)
+    CLI="$(resolve "${PI_BIN:-}" pi /opt/homebrew/bin/pi /usr/local/bin/pi)"
+    MODEL="${MEMORY_MODEL:-}" ;;
   *)
-    echo "memory-agent: unknown MEMORY_HARNESS '$HARNESS' (want claude|omp)" >&2
+    echo "memory-agent: unknown MEMORY_HARNESS '$HARNESS' (want claude|omp|pi)" >&2
     exit 2 ;;
 esac
 
@@ -54,8 +57,10 @@ PROMPT="${1:-}"
 
 TMP=""
 trap '[ -n "$TMP" ] && rm -rf "$TMP"' EXIT
+# mcp_json <ws> [exposure]  — an mcpServers config serving outl on <ws>.
 mcp_json() {
-  printf '{"mcpServers":{"outl":{"type":"stdio","command":"%s","args":["mcp","serve","-w","%s"]}}}' "$OUTL" "$1"
+  printf '{"mcpServers":{"outl":{"type":"stdio","command":"%s","args":["mcp","serve","-w","%s"]%s}}}' \
+    "$OUTL" "$1" "${2:+,\"exposure\":\"$2\"}"
 }
 
 case "$HARNESS" in
@@ -79,5 +84,16 @@ case "$HARNESS" in
       set -- "$@" --cwd "$TMP"
     fi
     "$CLI" "$@" -- "$PROMPT"
+    ;;
+  pi)
+    # pi: like omp, a project .pi/mcp.json in a scratch cwd replaces the user `outl` entry
+    # (--approve trusts it for this run). Always written, defaulting to the live workspace,
+    # because "direct" exposure is what declares the outl tools to the model; the user's own
+    # entry may leave them behind codemode.
+    TMP="$(mktemp -d)"
+    mkdir -p "$TMP/.pi"
+    mcp_json "${WS:-${MEMORY_WS:-$HOME/.llm-harness-memory}}" direct > "$TMP/.pi/mcp.json"
+    cd "$TMP" || exit 1
+    "$CLI" -p --no-session --approve ${MODEL:+--model "$MODEL"} -- "$PROMPT"
     ;;
 esac

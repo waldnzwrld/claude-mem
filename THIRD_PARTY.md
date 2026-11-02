@@ -42,6 +42,14 @@ arm's length — its hooks/extension run `memory-hook` as a subprocess, and
   is loaded by omp and imports omp's extension types from `@oh-my-pi/pi-coding-agent`;
   background agents run as `omp -p`. No omp source or binary is included in this repository.
 
+### pi
+
+- **License:** MIT
+- **Upstream:** https://github.com/earendil-works/pi
+- **How it's used:** the adapter extension `pi/llm-harness-memory.ts` (this repo's own source)
+  is loaded by pi and imports pi's extension types from `@earendil-works/pi-coding-agent`;
+  background agents run as `pi -p`. No pi source or binary is included in this repository.
+
 ## Python standard library
 
 - `memory-index` and the hook use only the Python 3.9+ standard library (`sqlite3`/FTS5,

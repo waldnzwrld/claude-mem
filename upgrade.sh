@@ -50,7 +50,7 @@ CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
 CLAUDE_JSON="$HOME/.claude.json"
 BIN_DIR="$HOME/.local/bin"
-OMP_DIR="${OMP_AGENT_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}}"
+OMP_DIR="${OMP_AGENT_DIR:-$HOME/.omp/agent}"
 OLD_OMP_EXT="$OMP_DIR/extensions/claude-memory.ts"
 NEW_OMP_EXT="$OMP_DIR/extensions/llm-harness-memory.ts"
 

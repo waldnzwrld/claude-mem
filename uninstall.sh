@@ -4,13 +4,15 @@
 # agent harnesses.
 #
 #     ./uninstall.sh                    # every harness (default)
-#     ./uninstall.sh --harness claude   # Claude Code only; also: omp, claude,omp, all
+#     ./uninstall.sh --harness claude   # Claude Code only; also: omp, pi, claude,omp, all
 #
 # Claude Code: removes the SessionStart + PreCompact + SessionEnd + UserPromptSubmit +
 #   PostToolUse hooks from settings.json, the memory-recall agent definition, and the
 #   "## Persistent memory" section from ~/.claude/CLAUDE.md.
 # omp: removes the adapter extension, the memory-recall task agent, and the
 #   "## Persistent memory" section from ~/.omp/agent/AGENTS.md (OMP_AGENT_DIR overrides).
+# pi: removes the adapter extension and the "## Persistent memory" section from
+#   ~/.pi/agent/AGENTS.md (PI_AGENT_DIR overrides).
 # Shared binaries (memory-hook, memory-index, memory-consolidate,
 #   memory-dump, memory-agent) are deleted from ~/.local/bin only once no
 #   harness is still wired to them.
@@ -21,7 +23,8 @@
 # later ./install.sh re-couples everything with nothing lost.
 #
 # Run as your normal user (not sudo). Safe to re-run; it no-ops on anything already
-# removed. Paths can be overridden via CLAUDE_DIR / BIN_DIR / OMP_AGENT_DIR (testing).
+# removed. Paths can be overridden via CLAUDE_DIR / BIN_DIR / OMP_AGENT_DIR / PI_AGENT_DIR
+# (testing).
 #
 set -euo pipefail
 
@@ -31,14 +34,16 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 WANT_CLAUDE=0
 WANT_OMP=0
+WANT_PI=0
 want() {
   local h
   for h in ${1//,/ }; do
     case "$h" in
       claude) WANT_CLAUDE=1 ;;
       omp)    WANT_OMP=1 ;;
-      all)    WANT_CLAUDE=1; WANT_OMP=1 ;;
-      *) echo "unknown harness '$h' (want claude|omp|all)" >&2; exit 2 ;;
+      pi)     WANT_PI=1 ;;
+      all)    WANT_CLAUDE=1; WANT_OMP=1; WANT_PI=1 ;;
+      *) echo "unknown harness '$h' (want claude|omp|pi|all)" >&2; exit 2 ;;
     esac
   done
 }
@@ -50,16 +55,22 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
-[ "$WANT_CLAUDE" = 1 ] || [ "$WANT_OMP" = 1 ] || { WANT_CLAUDE=1; WANT_OMP=1; }
+[ "$WANT_CLAUDE" = 1 ] || [ "$WANT_OMP" = 1 ] || [ "$WANT_PI" = 1 ] || { WANT_CLAUDE=1; WANT_OMP=1; WANT_PI=1; }
 
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
-OMP_DIR="${OMP_AGENT_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}}"
+OMP_DIR="${OMP_AGENT_DIR:-$HOME/.omp/agent}"
+PI_DIR="${PI_AGENT_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}}"
+if [ "$OMP_DIR" -ef "$PI_DIR" ] || [ "$OMP_DIR" = "$PI_DIR" ]; then
+  echo "✖ omp and pi resolve to the same agent dir ($OMP_DIR); set OMP_AGENT_DIR / PI_AGENT_DIR apart" >&2
+  exit 2
+fi
 MEM_DIR="$HOME/.llm-harness-memory"
 SETTINGS="$CLAUDE_DIR/settings.json"
 CLAUDEMD="$CLAUDE_DIR/CLAUDE.md"
 HOOK="$BIN_DIR/memory-hook"
 OMP_EXT="$OMP_DIR/extensions/llm-harness-memory.ts"
+PI_EXT="$PI_DIR/extensions/llm-harness-memory.ts"
 
 # ================================= Claude Code ======================================
 if [ "$WANT_CLAUDE" = 1 ]; then
@@ -158,10 +169,20 @@ strip_memory_section "$OMP_DIR/AGENTS.md"
 
 fi # WANT_OMP
 
-# ---- 6. shared binaries: only once no harness is still wired ---------------
+# ====================================== pi ==========================================
+if [ "$WANT_PI" = 1 ]; then
+
+# ---- 6. adapter extension + "## Persistent memory" section in pi's AGENTS.md ----
+remove_file "$PI_EXT"
+strip_memory_section "$PI_DIR/AGENTS.md"
+
+fi # WANT_PI
+
+# ---- 7. shared binaries: only once no harness is still wired ---------------
 still=""
 [ -f "$SETTINGS" ] && grep -q 'memory-hook' "$SETTINGS" && still="${still} claude"
 [ -e "$OMP_EXT" ] && still="${still} omp"
+[ -e "$PI_EXT" ] && still="${still} pi"
 if [ -n "$still" ]; then
   echo "• binaries kept in $BIN_DIR — still wired for:${still}"
 else
@@ -170,7 +191,7 @@ else
   done
 fi
 
-# ---- 4. done ---------------------------------------------------------------
+# ---- 8. done ---------------------------------------------------------------
 cat <<EOF
 
 Done — the agent is decoupled from the memory system.

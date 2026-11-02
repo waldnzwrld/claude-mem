@@ -12,6 +12,7 @@ Supported harnesses:
 |---------|-------------|----------------|
 | [Claude Code](https://claude.com/claude-code) | native shell hooks in `~/.claude/settings.json` | `claude -p` |
 | [omp (oh-my-pi)](https://github.com/can1357/oh-my-pi) | adapter extension `omp/llm-harness-memory.ts` | `omp -p` |
+| [pi](https://github.com/earendil-works/pi) | adapter extension `pi/llm-harness-memory.ts` | `pi -p` |
 
 The core — the outl graph, `memory-index`, the protocol in `AGENTS.md`, and the hook logic — is
 harness-agnostic. A harness plugs in by delivering its lifecycle events to the hook in the
@@ -25,8 +26,8 @@ context, and the daily housekeeping are all derived from it and rebuildable from
 
 ```
   Claude Code hooks ─┐
-                     ├──► ┌──────────────────────────────────────────────────────┐
-  omp extension ─────┘     |  memory-hook  (SessionStart / UserPromptSubmit /      │
+  omp extension ─────┼──► ┌──────────────────────────────────────────────────────┐
+  pi extension ──────┘     |  memory-hook  (SessionStart / UserPromptSubmit /      │
                            │               PostToolUse / PreCompact / SessionEnd) │
                            │   start: inject index TOC + recent journals,         │
                            │          refresh the index, run daily chores         │
@@ -76,17 +77,17 @@ Deployed by `install.sh`. Shared by every harness:
 | `AGENTS.md` | `~/.llm-harness-memory/AGENTS.md` | The protocol the agent follows (graph model, crosslinking, writing, condensation, frecency, tags, retrieval). |
 | `memory-hook` | `~/.local/bin/` | Shared by every harness. SessionStart: inject TOC + recent journals, refresh the index, run daily chores. PreCompact: remind to flush notes. SessionEnd: fire the journaler. UserPromptSubmit: push-retrieval (gated). PostToolUse(`outl_page_get`): frecency touch. Speaks the [hook protocol](#hook-protocol). Exits 0 on any error. |
 | `memory-index` | `~/.local/bin/` | Stdlib-only SQLite retrieval sidecar (see below). |
-| `memory-agent` | `~/.local/bin/` | Runs one headless maintenance agent on the harness that fired the hook (`MEMORY_HARNESS`: `claude -p` or `omp -p`), Sonnet 5 by default (`MEMORY_MODEL`). `--ws DIR` scopes its outl MCP server to a workspace. |
+| `memory-agent` | `~/.local/bin/` | Runs one headless maintenance agent on the harness that fired the hook (`MEMORY_HARNESS`: `claude -p`, `omp -p`, or `pi -p`), Sonnet 5 by default on claude/omp and pi's configured default model on pi (`MEMORY_MODEL` overrides). `--ws DIR` scopes its outl MCP server to a workspace. |
 | `memory-consolidate` | `~/.local/bin/` | Headless agent (via `memory-agent`) that distills aged journals into knowledge pages, then reaps them. Single-instanced. |
 | `memory-dump` | `~/.local/bin/` | SessionEnd journaler: a detached headless agent (via `memory-agent`) that appends durable facts to today's journal, deduped. Skips sessions with no tool use; head/tail-truncates long transcripts. Edits only the journal. |
 
 Per harness:
 
-| File | Claude Code | omp | Role |
-|------|-------------|-----|------|
-| `agents/memory-recall.md` | `~/.claude/agents/` | `~/.omp/agent/agents/` (tools/model rewritten to omp names) | Read-only retrieval subagent (Sonnet). Returns a conclusion + `[[slugs]]`, keeping page bodies out of the main thread. Its fetches still credit frecency. |
-| `MEMORY_TEMPLATE.md` | `## Persistent memory` appended to `~/.claude/CLAUDE.md` | same section appended to `~/.omp/agent/AGENTS.md` | Points the agent at the protocol. |
-| hook wiring | `~/.claude/settings.json` hooks + outl allow rules | `omp/llm-harness-memory.ts` → `~/.omp/agent/extensions/` | Delivers lifecycle events to `memory-hook`. |
+| File | Claude Code | omp | pi | Role |
+|------|-------------|-----|----|------|
+| `agents/memory-recall.md` | `~/.claude/agents/` | `~/.omp/agent/agents/` (tools/model rewritten to omp names) | — (pi has no subagents) | Read-only retrieval subagent (Sonnet). Returns a conclusion + `[[slugs]]`, keeping page bodies out of the main thread. Its fetches still credit frecency. |
+| `MEMORY_TEMPLATE.md` | `## Persistent memory` appended to `~/.claude/CLAUDE.md` | same section appended to `~/.omp/agent/AGENTS.md` | same section appended to `~/.pi/agent/AGENTS.md` | Points the agent at the protocol. |
+| hook wiring | `~/.claude/settings.json` hooks + outl allow rules | `omp/llm-harness-memory.ts` → `~/.omp/agent/extensions/` | `pi/llm-harness-memory.ts` → `~/.pi/agent/extensions/` | Delivers lifecycle events to `memory-hook`. |
 
 ## `memory-index` — the retrieval sidecar
 
@@ -162,6 +163,9 @@ claude mcp add outl --scope user -- outl --workspace ~/.llm-harness-memory mcp s
 # omp: add to ~/.omp/agent/mcp.json (or `/mcp add` → User level)
 #   { "mcpServers": { "outl": { "type": "stdio", "command": "/opt/homebrew/bin/outl",
 #       "args": ["--workspace", "/Users/<you>/.llm-harness-memory", "mcp", "serve"] } } }
+# pi: add to ~/.pi/agent/mcp.json ("direct" declares the tools to the model instead of codemode)
+#   { "mcpServers": { "outl": { "command": "/opt/homebrew/bin/outl", "exposure": "direct",
+#       "args": ["--workspace", "/Users/<you>/.llm-harness-memory", "mcp", "serve"] } } }
 ```
 
 Deploy:
@@ -169,7 +173,8 @@ Deploy:
 ```bash
 ./install.sh                    # Claude Code (default)
 ./install.sh --harness omp      # omp only
-./install.sh --harness all      # both (also: --harness claude,omp)
+./install.sh --harness pi       # pi only
+./install.sh --harness all      # every harness (also: --harness claude,omp,pi)
 ```
 
 Shared for every harness, `install.sh` copies `AGENTS.md` into the workspace and the binaries
@@ -184,6 +189,12 @@ machine's Homebrew, and builds the index.
   `memory-recall` task agent to `~/.omp/agent/agents/`, and appends the `## Persistent memory`
   section to `~/.omp/agent/AGENTS.md` (idempotent). Reports whether `~/.omp/agent/mcp.json`
   already serves `outl`. `OMP_AGENT_DIR` targets another agent dir (e.g. a profile).
+- **pi:** installs the adapter extension to `~/.pi/agent/extensions/llm-harness-memory.ts` and
+  appends the `## Persistent memory` section to `~/.pi/agent/AGENTS.md` (idempotent). Reports
+  whether `~/.pi/agent/mcp.json` already serves `outl`. `PI_AGENT_DIR` (else
+  `PI_CODING_AGENT_DIR`) targets another agent dir. omp also reads `PI_CODING_AGENT_DIR`, but
+  the scripts use it only for pi, and refuse to run if the omp and pi dirs resolve to the same
+  place (both extensions share a filename).
 
 Start a new session to load the system.
 
@@ -256,17 +267,44 @@ Behaviour that differs from Claude Code (the native-hook reference integration):
 - `~/.omp/agent/AGENTS.md` shadows `~/.claude/CLAUDE.md` as user context, so the memory section
   is appended there.
 
+## pi
+
+`pi/llm-harness-memory.ts` is the pi counterpart of the omp extension; it runs `memory-hook`
+with `MEMORY_HARNESS=pi`:
+
+| pi event | Hook event | Effect |
+|----------|------------|--------|
+| `session_start` (`startup`, `new`, `resume`, `fork`) | SessionStart | Context is computed at session start and delivered as a hidden custom message with the first prompt. |
+| `before_agent_start` (`messageType: "user"`) | UserPromptSubmit | Push-retrieval pointers joined into the same hidden message. |
+| `tool_result` (`mcp__outl__outl_page_get`) | PostToolUse | Frecency touch, including calls made from codemode scripts. |
+| `session_before_compact` | PreCompact | Reminder fetched before compaction, sent as a hidden message on the next turn. |
+| `session_shutdown` (not `reload`) | SessionEnd | Detached `memory-dump` on the session's JSONL transcript. |
+
+Behaviour that differs from Claude Code:
+
+- Background agents run as `pi -p --no-session --approve` in a scratch cwd whose project
+  `.pi/mcp.json` serves outl with `direct` exposure: on the `--ws` workspace, else
+  `~/.llm-harness-memory`. `MEMORY_MODEL` takes a pi `--model` pattern; unset, pi's own default
+  model is used (there is no Sonnet default, since a pi install may have no Anthropic
+  credentials).
+- pi has no subagents, so `memory-recall` is not installed; recall happens in the main thread.
+- pi's default MCP exposure (`codemode`) hides outl's tools from direct calls; serve outl with
+  `"exposure": "direct"`. pi does not prompt for tool approval.
+- `/reload` swaps the extension runtime within one conversation, so it neither re-injects
+  SessionStart context nor fires SessionEnd.
+
 ## Uninstalling
 
 ```bash
 ./uninstall.sh                    # every harness (default)
-./uninstall.sh --harness omp      # one harness; the other keeps working
+./uninstall.sh --harness omp      # one harness; the others keep working
 ```
 
 Claude Code: removes the SessionStart + PreCompact + SessionEnd + UserPromptSubmit +
 PostToolUse hooks from `~/.claude/settings.json` (other hooks intact), the agent definition, and
 the `## Persistent memory` section from `~/.claude/CLAUDE.md`. omp: removes the extension, the
-task agent, and the section from `~/.omp/agent/AGENTS.md`. The shared binaries in
+task agent, and the section from `~/.omp/agent/AGENTS.md`. pi: removes the extension and the
+section from `~/.pi/agent/AGENTS.md`. The shared binaries in
 `~/.local/bin` are deleted only once no harness is still wired. It leaves `~/.llm-harness-memory`
 untouched, so a later `./install.sh` re-couples with nothing lost. Safe to re-run; effective in
 a new session.
