@@ -185,3 +185,10 @@ case "$HARNESS" in
     "$CLI" -p --no-session --approve ${MODEL:+--model "$MODEL"} -- "$PROMPT"
     ;;
 esac
+rc=$?
+# A failed run on a user-chosen model is likely a bad model; the logs callers redirect this to
+# are rarely read, so say how to check and undo the choice there.
+if [ "$rc" -ne 0 ] && [ -z "${MEMORY_MODEL:-}" ] && [ -n "$STORED_MODEL" ]; then
+  echo "memory-agent: $HARNESS run exited $rc on stored model '$STORED_MODEL' ($MODELS_FILE); if the model is the cause: memory-agent --harness $HARNESS --list-models, then --set-model or --unset-model" >&2
+fi
+exit "$rc"

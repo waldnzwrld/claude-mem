@@ -176,7 +176,8 @@ Deploy:
 ./install.sh --harness omp      # omp only
 ./install.sh --harness pi       # pi only
 ./install.sh --harness all      # every harness (also: --harness claude,omp,pi)
-./install.sh --model omp=MODEL  # also set a memory model; implies --harness omp (repeatable)
+./install.sh --harness omp --model omp=MODEL   # also set that harness's memory model (repeatable)
+./install.sh --no-prompt        # never ask questions
 ```
 
 Shared for every harness, `install.sh` copies `AGENTS.md` into the workspace and the binaries
@@ -209,8 +210,10 @@ claude/omp; pi's own default model on pi, since a pi install may have no Anthrop
 
 - **At install:** on a terminal, `install.sh` asks for each selected harness: Enter keeps the
   current model, `?` lists what the harness can run, and a name it cannot run is refused and
-  asked again. `--model HARNESS=MODEL` answers without asking; with no terminal and no flag,
-  nothing is asked and nothing changes.
+  asked again. `--model HARNESS=MODEL` answers without asking; the harness must also be
+  selected with `--harness`, and every `--model` is checked before anything is copied, so a typo
+  installs nothing. With no terminal and no flag, or with `--no-prompt` (which `upgrade.sh`
+  passes), nothing is asked and nothing changes.
 - **Later:** the installed `memory-model` skill walks an agent through checking the current
   model, listing the choices, and setting one. The same thing by hand:
 
@@ -226,6 +229,9 @@ claude/omp; pi's own default model on pi, since a pi install may have no Anthrop
   harness lists nothing, such as before login, the name is stored unchecked with a warning.
   Claude Code has no model listing, so any model ID is accepted.
 - Takes effect on the next background run; uninstall leaves the file in place with the workspace.
+- A run that exits non-zero on a stored model logs a hint naming the model and the commands to
+  list or unset it. There is no automatic fallback to the default: a failed run is not known to
+  be the model's fault, and a retry doubles the cost of a long one.
 
 ## Upgrading from claude-mem
 
