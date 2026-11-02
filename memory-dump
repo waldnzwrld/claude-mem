@@ -9,8 +9,8 @@
 # page wrong, reverse a prior decision, or add a new component / cross-project
 # relationship / durable user fact) are additionally written through to the right
 # deep-memory leaf, merged and back-marked #in-deep in the journal. Runs headless via
-# `memory-agent` on the harness that fired the hook (MEMORY_HARNESS) and a capable model
-# (Sonnet 5 by default; override with MEMORY_MODEL). The agent reads the transcript,
+# `memory-agent` on the harness that fired the hook (MEMORY_HARNESS), on that harness's memory
+# model (see `memory-agent --get-model`; Sonnet 5 by default). The agent reads the transcript,
 # extracts what is worth remembering across sessions, and writes it via the outl MCP
 # tools, deduping and never rewriting or deleting existing entries.
 #

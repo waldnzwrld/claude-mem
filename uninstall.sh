@@ -151,6 +151,7 @@ done
 
 # ---- 3. strip the "## Persistent memory" section from CLAUDE.md -------------
 strip_memory_section "$CLAUDEMD"
+remove_skill "$CLAUDE_DIR/skills/memory-model"
 
 fi # WANT_CLAUDE
 
@@ -166,6 +167,7 @@ done
 
 # ---- 5. strip the "## Persistent memory" section from omp's AGENTS.md -------
 strip_memory_section "$OMP_DIR/AGENTS.md"
+remove_skill "$OMP_DIR/skills/memory-model"
 
 fi # WANT_OMP
 
@@ -175,6 +177,7 @@ if [ "$WANT_PI" = 1 ]; then
 # ---- 6. adapter extension + "## Persistent memory" section in pi's AGENTS.md ----
 remove_file "$PI_EXT"
 strip_memory_section "$PI_DIR/AGENTS.md"
+remove_skill "$PI_DIR/skills/memory-model"
 
 fi # WANT_PI
 

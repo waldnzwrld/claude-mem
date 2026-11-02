@@ -9,6 +9,12 @@ remove_file() {
   fi
 }
 
+# remove_skill <skill-dir>: remove the installer's SKILL.md, then the directory if now empty.
+remove_skill() {
+  remove_file "$1/SKILL.md"
+  rmdir "$1" 2>/dev/null || true
+}
+
 # strip_memory_section <file>: drop the installer's "## Persistent memory" section; delete
 # the file when nothing but installer content remains.
 strip_memory_section() {
