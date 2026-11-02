@@ -26,7 +26,7 @@ context, and the daily housekeeping are all derived from it and rebuildable from
 ```
   Claude Code hooks ─┐
                      ├──► ┌──────────────────────────────────────────────────────┐
-  omp extension ─────┘ memory-hook  (SessionStart / UserPromptSubmit /      │
+  omp extension ─────┘     |  memory-hook  (SessionStart / UserPromptSubmit /      │
                            │               PostToolUse / PreCompact / SessionEnd) │
                            │   start: inject index TOC + recent journals,         │
                            │          refresh the index, run daily chores         │
@@ -39,10 +39,10 @@ context, and the daily housekeeping are all derived from it and rebuildable from
                           │ pages/  journals/     │      │  today's journal)     │
                           │ (source of truth)     │      └───────────────────────┘
                           └───┬───────────────▲───┘      ┌───────────────────────┐
-                     derives │               │◄────────►│ memory-index          │
-                               ▼               │          │ (SQLite sidecar,      │
-                      (SQLite index) ────────┘          │  FTS5 + [[link]])     │
-                                                      ▲         └───────────────────────┘
+                      derives │               │◄────────►│ memory-index          │
+                              ▼               │          │ (SQLite sidecar,      │
+                       (SQLite index) ────────┘          │  FTS5 + [[link]])     │
+                                               ▲         └───────────────────────┘
                                                │ distills aged journals (headless agent)
                                       ┌────────┴───────────┐
                                       │ memory-consolidate │
