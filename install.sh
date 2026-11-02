@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# install.sh — put the persistent-memory system files into place for one or more
-# agent harnesses.
+# install.sh — put the llm-harness-memory system files into place for one or more
+# agent harnesses (Claude Code, omp).
 #
 # Run this AS YOUR NORMAL USER on the target Mac (not sudo):
 #
@@ -9,7 +9,7 @@
 #     ./install.sh --harness omp        # oh-my-pi (omp)
 #     ./install.sh --harness all        # both; also: --harness claude,omp
 #
-# Every harness shares one memory workspace (~/.claude/memory), one hook, one index,
+# Every harness shares one memory workspace (~/.llm-harness-memory), one hook, one index,
 # and the same helper binaries in ~/.local/bin; each harness only adds its own wiring.
 #
 # Claude Code: copies the agent definition, appends the memory section to
@@ -17,7 +17,7 @@
 # PostToolUse hooks into settings.json, and allows the whole outl MCP server (plus
 # memory-recall + memory-index) so the memory graph is invisible and never prompts.
 #
-# omp: installs the adapter extension (omp/claude-memory.ts) that drives the same hook
+# omp: installs the adapter extension (omp/llm-harness-memory.ts) that drives the same hook
 # from omp lifecycle events, the memory-recall task agent, and the memory section in
 # ~/.omp/agent/AGENTS.md. Override the agent dir with OMP_AGENT_DIR.
 #
@@ -27,8 +27,8 @@
 #     brew tap outlmd/outl https://github.com/outlmd/outl
 #     brew trust outlmd/outl
 #     brew install outl-beta
-#     outl init ~/.claude/memory
-#     claude mcp add outl --scope user -- outl --workspace ~/.claude/memory mcp serve   # Claude Code
+#     outl init ~/.llm-harness-memory
+#     claude mcp add outl --scope user -- outl --workspace ~/.llm-harness-memory mcp serve   # Claude Code
 #     # omp: add the `outl` server to ~/.omp/agent/mcp.json (snippet printed below)
 #
 set -euo pipefail
@@ -59,19 +59,23 @@ done
 [ "$WANT_CLAUDE" = 1 ] || [ "$WANT_OMP" = 1 ] || WANT_CLAUDE=1
 
 CLAUDE_DIR="$HOME/.claude"
-MEM_DIR="$CLAUDE_DIR/memory"
+MEM_DIR="$HOME/.llm-harness-memory"
 BIN_DIR="$HOME/.local/bin"
 SETTINGS="$CLAUDE_DIR/settings.json"
 CLAUDEMD="$CLAUDE_DIR/CLAUDE.md"
-HOOK="$BIN_DIR/claude-memory-hook"
+HOOK="$BIN_DIR/memory-hook"
 MEMIDX="$BIN_DIR/memory-index"
 AGENTS_DIR="$CLAUDE_DIR/agents"
 OMP_DIR="${OMP_AGENT_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}}"
 
+if [ -d "$HOME/.claude/memory/.outl" ] && ! [ -e "$MEM_DIR" ]; then
+  echo "✖ found a workspace at ~/.claude/memory; run ./upgrade.sh to move it to $MEM_DIR" >&2
+  exit 1
+fi
 mkdir -p "$MEM_DIR" "$BIN_DIR"
 
 # append_memory_section <file> <whole-template-if-missing: yes|no>
-# Idempotently appends CLAUDE_TEMPLATE.md's "## Persistent memory" section to <file>.
+# Idempotently appends MEMORY_TEMPLATE.md's "## Persistent memory" section to <file>.
 # Shipped sections reference the protocol docs by ~ path (user-agnostic, read on demand —
 # no @import), so no path rewrite is needed.
 append_memory_section() {
@@ -81,13 +85,13 @@ append_memory_section() {
     echo "• $label already has the memory section; left as-is ($file)"
     return
   fi
-  section="$(awk '/^## Persistent memory/{p=1} p' "$SRC/CLAUDE_TEMPLATE.md")"
+  section="$(awk '/^## Persistent memory/{p=1} p' "$SRC/MEMORY_TEMPLATE.md")"
   mkdir -p "$(dirname "$file")"
   if [ -f "$file" ]; then
     printf '\n\n%s\n' "$section" >> "$file"
     echo "✔ $label -> appended memory section to $file"
   elif [ "$whole" = yes ]; then
-    cp "$SRC/CLAUDE_TEMPLATE.md" "$file"
+    cp "$SRC/MEMORY_TEMPLATE.md" "$file"
     echo "✔ $label -> $file"
   else
     printf '%s\n' "$section" > "$file"
@@ -107,9 +111,9 @@ if command -v brew >/dev/null 2>&1; then
 else
   OUTL_PATH="/opt/homebrew/bin/outl"   # Apple-Silicon default; Intel is /usr/local/bin/outl
 fi
-# claude-memory-hook: every harness's lifecycle events; memory-agent: headless runner
+# memory-hook: every harness's lifecycle events; memory-agent: headless runner
 # (claude -p | omp -p) for the background agents.
-for f in claude-memory-hook memory-agent; do
+for f in memory-hook memory-agent; do
   tmp="$(mktemp)"
   sed "s|^OUTL=.*|OUTL=\"\${OUTL_BIN:-$OUTL_PATH}\"|" "$SRC/$f" > "$tmp"
   mv "$tmp" "$BIN_DIR/$f"
@@ -117,8 +121,8 @@ for f in claude-memory-hook memory-agent; do
   echo "✔ $f -> $BIN_DIR/$f  (outl: $OUTL_PATH)"
 done
 # memory-index: retrieval sidecar; memory-consolidate: automatic headless distillation
-# of aged journals; claude-memory-dump: on-close journaler (fired by SessionEnd).
-for f in memory-index memory-consolidate claude-memory-dump; do
+# of aged journals; memory-dump: on-close journaler (fired by SessionEnd).
+for f in memory-index memory-consolidate memory-dump; do
   cp "$SRC/$f" "$BIN_DIR/$f"
   chmod 755 "$BIN_DIR/$f"
   echo "✔ $f -> $BIN_DIR/$f"
@@ -266,10 +270,10 @@ fi # WANT_CLAUDE
 OMP_MCP_TODO=0
 if [ "$WANT_OMP" = 1 ]; then
 
-# ---- 6. adapter extension: omp lifecycle events -> claude-memory-hook --------
+# ---- 6. adapter extension: omp lifecycle events -> memory-hook --------
 mkdir -p "$OMP_DIR/extensions" "$OMP_DIR/agents"
-cp "$SRC/omp/claude-memory.ts" "$OMP_DIR/extensions/claude-memory.ts"
-echo "✔ omp extension  -> $OMP_DIR/extensions/claude-memory.ts"
+cp "$SRC/omp/llm-harness-memory.ts" "$OMP_DIR/extensions/llm-harness-memory.ts"
+echo "✔ omp extension  -> $OMP_DIR/extensions/llm-harness-memory.ts"
 
 # ---- 7. memory-recall task agent -------------------------------------------
 # omp agents take omp tool names and model selectors. MCP tools reach omp subagents

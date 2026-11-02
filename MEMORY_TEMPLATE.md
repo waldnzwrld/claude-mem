@@ -1,21 +1,24 @@
-# memory — persistent-memory system for Claude Code
+# memory — persistent-memory system for LLM coding harnesses
 
-This repo is the installer + source for the outl-backed persistent memory system.
-`install.sh` deploys into `~/.claude`: `claude-memory-hook` (SessionStart/PreCompact),
-`memory-index` (stdlib-only SQLite retrieval sidecar: FTS5 keyword + a typed/weighted
-`[[link]]` edge table with a recursive multi-hop `search` whose depth follows graph size), `memory-consolidate` (headless
-distillation agent), and `AGENTS.md` → `~/.claude/memory/`.
+This repo (llm-harness-memory) is the installer + source for the outl-backed persistent memory
+system, shared by every supported harness (Claude Code, omp). `install.sh` deploys
+`memory-hook` (the shared lifecycle hook), `memory-index` (stdlib-only SQLite retrieval
+sidecar: FTS5 keyword + a typed/weighted `[[link]]` edge table with a recursive multi-hop
+`search` whose depth follows graph size), `memory-consolidate` (headless distillation agent,
+run on the harness that fired the hook via `memory-agent`), and `AGENTS.md` →
+`~/.llm-harness-memory/`.
 
-Global hard rules live in `~/.claude/CLAUDE.md` and are
-**not** repeated here. The section below is the template `install.sh` appends to a
-user's global `~/.claude/CLAUDE.md` — keep them in sync with the slim global version (they
-reference the full protocol docs by path for on-demand reading, never via `@import`).
+The section below is the template `install.sh` appends to each harness's global user-context
+file — `~/.claude/CLAUDE.md` for Claude Code, `~/.omp/agent/AGENTS.md` for omp. Global hard
+rules live in those files and are **not** repeated here. Keep this section in sync with the
+slim installed version (it references the full protocol docs by path for on-demand reading,
+never via `@import`).
 
 ## Persistent memory
 
 This is your **active, vivid memory** — the persistence layer on this machine for who the
 user is, the projects and concepts you work on together, and the decisions you've made. It is
-an **outl** graph at `~/.claude/memory` (via the `outl` MCP tools), it is **always loaded** (a
+an **outl** graph at `~/.llm-harness-memory` (via the `outl` MCP tools), it is **always loaded** (a
 **SessionStart hook** injects the **index (TOC)** and a **recent-journal window** every
 session), and it is the **first place you look**, not a reference archive you consult last.
 
@@ -37,5 +40,5 @@ tree is **automatic** (hook + background agent) — never consolidate or delete 
 unless a `⚠ CONSOLIDATION REQUIRED` fallback directive appears, then follow it.
 
 Full protocol — graph model, crosslinking, writing, retrieval, condensation, frecency — is in
-`~/.claude/memory/AGENTS.md`. That doc is **not** loaded every session (context economy);
+`~/.llm-harness-memory/AGENTS.md`. That doc is **not** loaded every session (context economy);
 read it **only when doing memory maintenance**. The memory itself, though, is always live.

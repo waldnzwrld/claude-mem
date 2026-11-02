@@ -11,11 +11,11 @@
 #   "## Persistent memory" section from ~/.claude/CLAUDE.md.
 # omp: removes the adapter extension, the memory-recall task agent, and the
 #   "## Persistent memory" section from ~/.omp/agent/AGENTS.md (OMP_AGENT_DIR overrides).
-# Shared binaries (claude-memory-hook, memory-index, memory-consolidate,
-#   claude-memory-dump, memory-agent) are deleted from ~/.local/bin only once no
+# Shared binaries (memory-hook, memory-index, memory-consolidate,
+#   memory-dump, memory-agent) are deleted from ~/.local/bin only once no
 #   harness is still wired to them.
 #
-# It DELIBERATELY does NOT touch the memory workspace at ~/.claude/memory — your
+# It DELIBERATELY does NOT touch the memory workspace at ~/.llm-harness-memory — your
 # pages/, journals/, AGENTS.md, and the derived .outl index are all left intact.
 # This unhooks the agent from the memory system WITHOUT deleting any memory, so a
 # later ./install.sh re-couples everything with nothing lost.
@@ -26,6 +26,8 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+. "$SRC/lib.sh"
 
 WANT_CLAUDE=0
 WANT_OMP=0
@@ -53,68 +55,11 @@ done
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 OMP_DIR="${OMP_AGENT_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}}"
-MEM_DIR="$CLAUDE_DIR/memory"
+MEM_DIR="$HOME/.llm-harness-memory"
 SETTINGS="$CLAUDE_DIR/settings.json"
 CLAUDEMD="$CLAUDE_DIR/CLAUDE.md"
-HOOK="$BIN_DIR/claude-memory-hook"
-OMP_EXT="$OMP_DIR/extensions/claude-memory.ts"
-
-# remove_file <path>
-remove_file() {
-  if [ -e "$1" ]; then
-    rm -f "$1" && echo "✔ removed        $1"
-  else
-    echo "• not present    $1"
-  fi
-}
-
-# strip_memory_section <file>: drop the installer's "## Persistent memory" section; delete
-# the file when nothing but installer content remains.
-strip_memory_section() {
-  local file="$1"
-  if ! [ -f "$file" ] || ! command -v python3 >/dev/null 2>&1; then
-    echo "• $(basename "$file") -> not found or python3 missing; skipped section removal ($file)"
-    return
-  fi
-  MEMFILE="$file" python3 - <<'PY'
-import os, re
-
-path = os.environ['MEMFILE']
-label = os.path.basename(path)
-with open(path) as f:
-    lines = f.read().splitlines(keepends=True)
-
-start = None
-for i, l in enumerate(lines):
-    if re.match(r'^##\s+Persistent memory\s*$', l.rstrip('\n')):
-        start = i
-        break
-if start is None:
-    print("• %s -> no '## Persistent memory' section; left as-is (%s)" % (label, path))
-    raise SystemExit
-
-# The section runs until the next top-level (# or ##) heading, or end of file.
-end = len(lines)
-for j in range(start + 1, len(lines)):
-    if re.match(r'^#{1,2}\s+', lines[j]):
-        end = j
-        break
-
-remaining = ''.join(lines[:start]) + ''.join(lines[end:])
-remaining = re.sub(r'\n{3,}', '\n\n', remaining).rstrip()
-stripped = remaining.strip()
-
-# If the file was created wholesale from the installer template (its H1 intro is
-# all that's left) or nothing meaningful remains, remove the file outright.
-if stripped == '' or stripped.startswith('# memory — persistent-memory system'):
-    os.remove(path)
-    print("✔ %s -> only installer-added memory content remained; file removed (%s)" % (label, path))
-else:
-    with open(path, 'w') as f:
-        f.write(remaining + '\n')
-    print("✔ %s -> stripped the '## Persistent memory' section (%s)" % (label, path))
-PY
-}
+HOOK="$BIN_DIR/memory-hook"
+OMP_EXT="$OMP_DIR/extensions/llm-harness-memory.ts"
 
 # ================================= Claude Code ======================================
 if [ "$WANT_CLAUDE" = 1 ]; then
@@ -147,7 +92,7 @@ def is_ours(h):
     c = str(h.get('command', ''))
     # Match the exact deployed path, or any command whose basename is the hook,
     # so a differently-rooted install is still cleaned up.
-    return c == cmd or c.rstrip('/').endswith('/claude-memory-hook') or c == 'claude-memory-hook'
+    return c == cmd or c.rstrip('/').endswith('/memory-hook') or c == 'memory-hook'
 
 changed = False
 for event in ('SessionStart', 'PreCompact', 'SessionEnd', 'UserPromptSubmit', 'PostToolUse'):
@@ -215,12 +160,12 @@ fi # WANT_OMP
 
 # ---- 6. shared binaries: only once no harness is still wired ---------------
 still=""
-[ -f "$SETTINGS" ] && grep -q 'claude-memory-hook' "$SETTINGS" && still="${still} claude"
+[ -f "$SETTINGS" ] && grep -q 'memory-hook' "$SETTINGS" && still="${still} claude"
 [ -e "$OMP_EXT" ] && still="${still} omp"
 if [ -n "$still" ]; then
   echo "• binaries kept in $BIN_DIR — still wired for:${still}"
 else
-  for f in claude-memory-hook memory-index memory-consolidate claude-memory-dump memory-agent; do
+  for f in memory-hook memory-index memory-consolidate memory-dump memory-agent; do
     remove_file "$BIN_DIR/$f"
   done
 fi

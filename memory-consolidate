@@ -12,7 +12,7 @@
 # Reaping and candidate detection are mechanical (`memory-index`); the distil,
 # split, and keep-vs-delete calls need an LLM, so this spawns a detached, headless
 # agent via `memory-agent` (claude -p or omp -p, per MEMORY_HARNESS) per
-# ~/.claude/memory/AGENTS.md. The SessionStart hook backgrounds this whenever any
+# ~/.llm-harness-memory/AGENTS.md. The SessionStart hook backgrounds this whenever any
 # backlog exists.
 #
 # Safe to run any time and repeatedly: it no-ops when nothing is pending,
@@ -22,7 +22,7 @@ set -u
 
 MEMIDX="${MEMORY_INDEX_BIN:-$HOME/.local/bin/memory-index}"
 AGENT="${MEMORY_AGENT_BIN:-$(dirname "${BASH_SOURCE[0]}")/memory-agent}"
-WS="${MEMORY_WS:-$HOME/.claude/memory}"   # override targets an isolated workspace (tests)
+WS="${MEMORY_WS:-$HOME/.llm-harness-memory}"   # override targets an isolated workspace (tests)
 LOCKDIR="$WS/.consolidate.lock.d"
 LOG="$WS/.consolidate.log"
 TODAY="$(date +%F)"
@@ -81,14 +81,14 @@ fi
 tasks=""
 [ -n "$pend" ] && tasks="${tasks}
 JOURNALS — distill these aged journals (older than the 5 most recent, not yet consolidated): $pend
-  Follow the Condensation section of AGENTS.md exactly. For EACH date: (1) outl_daily_get and read it; (2) cluster items by the [[page]]/topic they concern — an item already marked #in-deep [[leaf]] was written through when authored, so do NOT re-merge it, just verify the leaf still carries it and list that leaf in the date's distilled-into evidence; (3) tier every remaining cluster: DROP ephemeral git/branch/working-tree/status/session-local notes outright, promote-or-drop borderline items DELIBERATELY, and for each lasting cluster (cross-repo relationships, plan state, decisions+why, gotchas, durable user facts — but not what the repo/git/CLAUDE.md already holds) descend to the right knowledge leaf (create a leaf or split a crowded TOC as needed) and merge the DISTILLED points (synthesise, never paste, never duplicate a point already there); refresh updated::/summary::, ensure project::/parent:: and back-links, touch frecency (new leaf seeds frecency:: 30; a merge is +5 capped 60) and set seen:: $TODAY; (4) add any new leaf/TOC's one-line [[link]]+hook to its parent TOC (and to index for a new top-level topic); (5) as the LAST actions for that date, record evidence then mark done: outl_page_prop_set <date> distilled-into=\"[[a]] [[b]]\" (every leaf merged into; =none if nothing durable), then outl_page_prop_set <date> consolidated=$TODAY. Do NOT delete journals — reaping is automatic once consolidated:: is set. Finally refresh index: bump updated:: and trim Recent journals to the retention window."
+  Follow the Condensation section of AGENTS.md exactly. For EACH date: (1) outl_daily_get and read it; (2) cluster items by the [[page]]/topic they concern — an item already marked #in-deep [[leaf]] was written through when authored, so do NOT re-merge it, just verify the leaf still carries it and list that leaf in the date's distilled-into evidence; (3) tier every remaining cluster: DROP ephemeral git/branch/working-tree/status/session-local notes outright, promote-or-drop borderline items DELIBERATELY, and for each lasting cluster (cross-repo relationships, plan state, decisions+why, gotchas, durable user facts — but not what the repo/git/CLAUDE.md/AGENTS.md already holds) descend to the right knowledge leaf (create a leaf or split a crowded TOC as needed) and merge the DISTILLED points (synthesise, never paste, never duplicate a point already there); refresh updated::/summary::, ensure project::/parent:: and back-links, touch frecency (new leaf seeds frecency:: 30; a merge is +5 capped 60) and set seen:: $TODAY; (4) add any new leaf/TOC's one-line [[link]]+hook to its parent TOC (and to index for a new top-level topic); (5) as the LAST actions for that date, record evidence then mark done: outl_page_prop_set <date> distilled-into=\"[[a]] [[b]]\" (every leaf merged into; =none if nothing durable), then outl_page_prop_set <date> consolidated=$TODAY. Do NOT delete journals — reaping is automatic once consolidated:: is set. Finally refresh index: bump updated:: and trim Recent journals to the retention window."
 [ -n "$split_slugs" ] && tasks="${tasks}
 PAGES TO SPLIT (any page — a content leaf OR a TOC/hub — whose body now costs more than the load budget to read): $split_slugs
   For EACH, follow the 'Split on growth' rule in AGENTS.md, so that NO page stays oversized and the graph is still navigable in a few hops:
    - A content LEAF (type:: knowledge): carve its sections into child leaf documents named <slug>-<section>, move the DETAIL down into those children, and leave in the (now type:: moc) parent one concise one-line [[link]]+hook per child. Give each child full leaf frontmatter (type:: knowledge, project::, parent:: [[the new toc]], updated:: $TODAY, summary::, frecency:: 30, seen:: $TODAY).
    - A HUB (type:: moc) that has grown too big: group its child entries into a few coherent sub-topics, create a sub-TOC (type:: moc, named <slug>-<group>) for each group, move those entries' [[link]]s+hooks down into the matching sub-TOC, and leave in the parent one [[link]]+hook per sub-TOC. The parent stays a thin index OF sub-TOCs; set parent:: on each new sub-TOC and keep every back-link intact.
   Either way: preserve every fact and every crosslink (no dangling links, no orphans), and re-point the page's own parent-TOC entry if its role changed. If a page genuinely has no clean split seam, LEAVE it and say so."
-prompt="You are running headless as the memory-system compaction agent. Do ONLY the tasks below, then stop — ignore everything else. Work entirely within the outl memory graph at ~/.claude/memory; do NOT touch code, git, or anything outside it. Read the named sections of ~/.claude/memory/AGENTS.md and follow them exactly. Do NOT prune, delete, or bump the frecency of any page or section — decay and eviction are handled mechanically elsewhere; touching them here would corrupt the retention signal.
+prompt="You are running headless as the memory-system compaction agent. Do ONLY the tasks below, then stop — ignore everything else. Work entirely within the outl memory graph at ~/.llm-harness-memory; do NOT touch code, git, or anything outside it. Read the named sections of ~/.llm-harness-memory/AGENTS.md and follow them exactly. Do NOT prune, delete, or bump the frecency of any page or section — decay and eviction are handled mechanically elsewhere; touching them here would corrupt the retention signal.
 $tasks
 
 Priorities, in order: (1) never lose a durable fact while distilling; (2) keep the graph navigable — every page reachable from its parent TOC by a one-hop [[link]], no dangling links, no orphans; (3) keep every page small. Work silently."

@@ -1,6 +1,6 @@
 # Third-party dependencies
 
-`claude-mem` is licensed under the [MIT License](LICENSE). It relies on external tools at
+`llm-harness-memory` is licensed under the [MIT License](LICENSE). It relies on external tools at
 runtime that it **does not bundle, vendor, or redistribute** — you install them yourself.
 This file records those dependencies and their licenses.
 
@@ -21,13 +21,26 @@ and permission notice) alongside your distribution.
   bundle outl, copy its upstream `LICENSE` (copyright notice + MIT permission text) into your
   distribution next to this project's `LICENSE`.
 
-## Claude Code / Anthropic Claude
+## Agent harnesses
+
+At least one supported harness is required at runtime. None is bundled; each is invoked at
+arm's length — its hooks/extension run `memory-hook` as a subprocess, and
+`memory-agent` launches the harness CLI headless for the background agents.
+
+### Claude Code / Anthropic Claude
 
 - **License:** proprietary (Anthropic) — separate product, not open-source and not
   redistributed here.
-- **How it's used:** the memory hooks run inside Claude Code, and `memory-consolidate`
-  invokes the `claude` CLI (`claude -p`) as an external process. Required at runtime; not
-  bundled.
+- **How it's used:** native shell hooks in `~/.claude/settings.json` run the memory hook;
+  background agents run as `claude -p`.
+
+### omp (oh-my-pi)
+
+- **License:** MIT
+- **Upstream:** https://github.com/can1357/oh-my-pi
+- **How it's used:** the adapter extension `omp/llm-harness-memory.ts` (this repo's own source)
+  is loaded by omp and imports omp's extension types from `@oh-my-pi/pi-coding-agent`;
+  background agents run as `omp -p`. No omp source or binary is included in this repository.
 
 ## Python standard library
 

@@ -2,7 +2,7 @@
 """
 memory-index — a rebuildable retrieval sidecar over the outl memory graph.
 
-The outl markdown graph at ~/.claude/memory is the sole source of truth. This tool
+The outl markdown graph at ~/.llm-harness-memory is the sole source of truth. This tool
 builds a DERIVED, disposable SQLite index over it (Porter-stemmed, field-weighted FTS5
 keyword + a typed/weighted link/edge table), then walks outward along [[links]] via a
 recursive graph traversal. The index is never authoritative: delete it and `rebuild`
@@ -44,7 +44,7 @@ import subprocess
 import sys
 import time
 
-WS_DEFAULT = os.path.expanduser("~/.claude/memory")
+WS_DEFAULT = os.path.expanduser("~/.llm-harness-memory")
 SCHEMA_VERSION = 3  # stemmed/field-weighted FTS (title/heading/body columns)
 DEFAULT_THRESHOLD = 150  # node count at/above which the index is considered "active"
 

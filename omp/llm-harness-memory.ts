@@ -1,8 +1,8 @@
 /**
  * omp adapter for the outl persistent-memory system.
  *
- * Translates omp lifecycle events into the Claude Code hook protocol and runs the shared
- * `claude-memory-hook`, so both harnesses drive one hook, one workspace, one index:
+ * Translates omp lifecycle events into the memory-hook protocol (Claude Code's hook JSON schema)
+ * and runs the shared `memory-hook`, so every harness drives one hook, one workspace, one index:
  *
  *   session_start / session_switch -> SessionStart      (context injected with the first prompt)
  *   before_agent_start             -> UserPromptSubmit  (push-retrieval pointers)
@@ -12,7 +12,7 @@
  *   session_shutdown               -> SessionEnd        (detached on-close journaler)
  *
  * The hook runs with MEMORY_HARNESS=omp, so the background agents it launches
- * (memory-consolidate, claude-memory-dump) run as `omp -p`.
+ * (memory-consolidate, memory-dump) run as `omp -p`.
  * Overrides: MEMORY_HOOK_BIN (hook path), plus every env var the hook itself honours.
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -20,9 +20,9 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
-const HOOK = process.env.MEMORY_HOOK_BIN || join(homedir(), ".local", "bin", "claude-memory-hook");
+const HOOK = process.env.MEMORY_HOOK_BIN || join(homedir(), ".local", "bin", "memory-hook");
 const HOOK_TIMEOUT_MS = 25_000;
-const CUSTOM_TYPE = "claude-memory";
+const CUSTOM_TYPE = "llm-harness-memory";
 // omp registers MCP tools as mcp__<server>_<tool> with a redundant server prefix dropped.
 const PAGE_GET_TOOLS: Record<string, true> = { mcp__outl_page_get: true, mcp__outl__outl_page_get: true };
 
@@ -98,7 +98,7 @@ const contextOf = (o: HookOutput | null) => o?.hookSpecificOutput?.additionalCon
 const isMain = (ctx: Ctx) => ctx.agent?.kind !== "sub";
 const sessionId = (ctx: Ctx) => ctx.sessionManager?.getSessionId?.() || "omp";
 
-export default function claudeMemory(pi: ExtensionAPI) {
+export default function llmHarnessMemory(pi: ExtensionAPI) {
 	// SessionStart context, injected with the first prompt of the session and cleared once
 	// that prompt's turn starts (before_agent_start may be retried before it is accepted).
 	let pendingStart: Promise<string> | null = null;

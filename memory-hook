@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# Persistent-memory hook. Speaks the Claude Code hook protocol; the omp extension
-# (omp/claude-memory.ts) translates omp lifecycle events into the same protocol and
-# sets MEMORY_HARNESS=omp, which background agents inherit.
+# Persistent-memory hook shared by every harness. Speaks Claude Code's hook JSON schema,
+# which Claude Code emits natively; the omp extension (omp/llm-harness-memory.ts)
+# translates omp lifecycle events into it and sets MEMORY_HARNESS=omp, which background
+# agents inherit.
 #   SessionStart -> inject the memory index (TOC) + recent journals as context,
 #                   and, on the first session of a new day, flag journals that
 #                   have aged out of the retention window for condensation.
@@ -12,16 +13,16 @@
 # Reads the hook JSON on stdin, writes a hookSpecificOutput JSON on stdout.
 # Wired via ~/.claude/settings.json (Claude Code) or the omp extension.
 # Designed to never fail a session (exit 0).
-# See ~/.claude/memory/AGENTS.md for the protocol this supports.
+# See ~/.llm-harness-memory/AGENTS.md for the protocol this supports.
 
 OUTL="${OUTL_BIN:-/opt/homebrew/bin/outl}"
 MEMIDX="${MEMORY_INDEX_BIN:-$HOME/.local/bin/memory-index}"
 CONS="${MEMORY_CONSOLIDATE_BIN:-$HOME/.local/bin/memory-consolidate}"
-DUMP="${MEMORY_DUMP_BIN:-$HOME/.local/bin/claude-memory-dump}"
+DUMP="${MEMORY_DUMP_BIN:-$HOME/.local/bin/memory-dump}"
 AGENT="${MEMORY_AGENT_BIN:-$(dirname "${BASH_SOURCE[0]}")/memory-agent}"
 # agent_ok: a headless agent CLI exists for the current harness (memory-agent decides).
 agent_ok() { [ -x "$AGENT" ] && "$AGENT" --available; }
-WS="${MEMORY_WS:-$HOME/.claude/memory}"   # override targets an isolated workspace (tests)
+WS="${MEMORY_WS:-$HOME/.llm-harness-memory}"   # override targets an isolated workspace (tests)
 MARKER="$WS/.last-session-date"
 ATTEMPTS="$WS/.consolidate-attempts"    # per-journal count of consecutive auto-consolidation attempts
 MAX_CONSOLIDATE_ATTEMPTS=2              # auto-retry a stuck journal this many times, then surface it
@@ -50,7 +51,7 @@ print(json.dumps({"systemMessage": sys.argv[1]}))' "$1"
 }
 
 if [ "$event" = "PreCompact" ]; then
-  emit_msg "Before this context is compacted, flush anything unsaved to today's journal ($TODAY) via the outl tools, per ~/.claude/memory/AGENTS.md. In particular: (1) the slugs you retrieved this session plus the conclusion you drew from each, so you can re-fetch precisely after compaction discards the page bodies; and (2) any unsaved decisions, discoveries, or durable facts. Write IMPACTFUL facts through to their deep-memory leaf now (see the Two-tier writes section)."
+  emit_msg "Before this context is compacted, flush anything unsaved to today's journal ($TODAY) via the outl tools, per ~/.llm-harness-memory/AGENTS.md. In particular: (1) the slugs you retrieved this session plus the conclusion you drew from each, so you can re-fetch precisely after compaction discards the page bodies; and (2) any unsaved decisions, discoveries, or durable facts. Write IMPACTFUL facts through to their deep-memory leaf now (see the Two-tier writes section)."
   exit 0
 fi
 
@@ -173,7 +174,7 @@ except Exception:
 fi
 
 # ---- SessionStart (default) ----
-ctx="Persistent cross-session memory: an outl graph at ~/.claude/memory — your active persistence layer, always loaded (state below), the FIRST place you look before code, a file/dir search, or the web. A UserPromptSubmit hook also PUSHES prompt-relevant slugs as a 'Relevant memory (auto-surfaced …)' pointer block before you act — pointers only, so outl_page_get to confirm (that fetch credits frecency); their absence does not mean memory is empty. Work from the injected index + journals below; for anything deeper dispatch the memory-recall subagent (Sonnet, read-only) — it walks the graph in isolation and returns the conclusion + [[slugs]] with the page bodies kept off this thread. Reserve a direct outl_page_get for a quick single-slug read; never brute-force the graph. Curate as you go: append durable decisions/discoveries to today's journal at each checkpoint, and write impactful facts through to their leaf. Full protocol (read only for maintenance): ~/.claude/memory/AGENTS.md."$'\n\n'
+ctx="Persistent cross-session memory: an outl graph at ~/.llm-harness-memory — your active persistence layer, always loaded (state below), the FIRST place you look before code, a file/dir search, or the web. A UserPromptSubmit hook also PUSHES prompt-relevant slugs as a 'Relevant memory (auto-surfaced …)' pointer block before you act — pointers only, so outl_page_get to confirm (that fetch credits frecency); their absence does not mean memory is empty. Work from the injected index + journals below; for anything deeper dispatch the memory-recall subagent (Sonnet, read-only) — it walks the graph in isolation and returns the conclusion + [[slugs]] with the page bodies kept off this thread. Reserve a direct outl_page_get for a quick single-slug read; never brute-force the graph. Curate as you go: append durable decisions/discoveries to today's journal at each checkpoint, and write impactful facts through to their leaf. Full protocol (read only for maintenance): ~/.llm-harness-memory/AGENTS.md."$'\n\n'
 
 # Table of contents (index page), with a raw-file fallback.
 toc="$("$OUTL" export md index -w "$WS" 2>/dev/null)"

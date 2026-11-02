@@ -11,7 +11,7 @@
 # on a branch; use verify.sh for the fast mechanical check.
 #
 #   tests/verify-agent.sh                 # both scenarios, Claude Code
-#   HARNESS=omp tests/verify-agent.sh     # both scenarios, omp (via omp/claude-memory.ts)
+#   HARNESS=omp tests/verify-agent.sh     # both scenarios, omp (via omp/llm-harness-memory.ts)
 #   SKIP_CONSOLIDATION=1 tests/verify-agent.sh   # only the cheap propagation scenario
 set -u
 
@@ -19,7 +19,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 OUTL="${OUTL_BIN:-/opt/homebrew/bin/outl}"
 MI="${MI:-$REPO/memory-index}"
-HOOK="$REPO/claude-memory-hook"
+HOOK="$REPO/memory-hook"
 CONS="$REPO/memory-consolidate"
 FX="$HERE/fixture"
 TODAY="$(date +%F)"
@@ -87,7 +87,7 @@ else
   printf '{"mcpServers":{"outl":{"type":"stdio","command":"%s","args":["mcp","serve","-w","%s"]}}}' "$OUTL" "$W" > "$P/.omp/mcp.json"
   MEMORY_WS="$W" MEMORY_INDEX_BIN="$MI" OUTL_BIN="$OUTL" MEMORY_HOOK_BIN="$HOOK" \
     MEMORY_CONSOLIDATE_BIN=/usr/bin/true MEMORY_DUMP_BIN=/usr/bin/true \
-    omp -p --cwd "$P" --no-extensions -e "$REPO/omp/claude-memory.ts" \
+    omp -p --cwd "$P" --no-extensions -e "$REPO/omp/llm-harness-memory.ts" \
       --model "${MEMORY_MODEL:-claude-sonnet-5}" --approval-mode yolo --no-session --no-title -- \
       'Use the outl page_get tool with slug "alpha-notes" to read that memory page. After it returns, reply with just: DONE.' \
       >"$TMPROOT/ag1.out" 2>"$TMPROOT/ag1.err"
