@@ -1,14 +1,17 @@
 # Persistent Memory Protocol
 
-You (Claude) have persistent, cross-session memory. It lives in an **outl** outliner graph
-at `~/.claude/memory` and is reachable through the `outl` MCP tools (also the `outl` CLI).
+You (the agent) have persistent, cross-session memory. It lives in an **outl** outliner graph
+at `~/.llm-harness-memory` and is reachable through the `outl` MCP tools (also the `outl` CLI).
+The same graph is shared by every harness this system is installed into (Claude Code, omp), so
+what you write in one is recalled in the others.
 It is your **active, vivid persistence layer** — always loaded, and the **first place you
 look** before reaching for code, a file/dir search, or the web, not a reference archive you
 consult last. Keep it curated continuously, not just at maintenance time.
-This document is the source of truth for how that memory works. `~/.claude/CLAUDE.md` points
-at it and the SessionStart hook injects the live memory state every session, so you never
-need to be told that you have memory — but this full protocol is **not** loaded every
-session; read it only when doing memory maintenance.
+This document is the source of truth for how that memory works. Your harness's user-context
+file (`~/.claude/CLAUDE.md` for Claude Code, `~/.omp/agent/AGENTS.md` for omp) points at it and
+the SessionStart hook injects the live memory state every session, so you never need to be
+told that you have memory — but this full protocol is **not** loaded every session; read it
+only when doing memory maintenance.
 
 ## How memory reaches you
 
@@ -184,13 +187,14 @@ Crosslinks are what make this a graph instead of a pile of files. Use them liber
 ## What long-term memory is for (the signal filter)
 
 Memory is not a mirror of the codebase — it is the layer of context that **cannot be
-reconstructed from the repos themselves**. Every repo already carries its own `CLAUDE.md` /
-`DEVELOPMENT.md` / `README`, its git history, and its source. Duplicating any of that into a
-knowledge leaf is waste: it goes stale, it bloats the graph, and the repo was the source of
-truth anyway. Before writing or distilling anything, apply one test:
+reconstructed from the repos themselves**. Every repo already carries its own agent-context
+file (`CLAUDE.md` / `AGENTS.md`), `DEVELOPMENT.md` / `README`, its git history, and its source.
+Duplicating any of that into a knowledge leaf is waste: it goes stale, it bloats the graph, and
+the repo was the source of truth anyway. Before writing or distilling anything, apply one test:
 
-> **Could I reconstruct this by opening the repo (code, git log, `CLAUDE.md`)?** If yes,
-> *link to where it lives* instead of copying it. Only store what the repo can't tell you.
+> **Could I reconstruct this by opening the repo (code, git log, `CLAUDE.md` / `AGENTS.md`)?**
+> If yes, *link to where it lives* instead of copying it. Only store what the repo can't tell
+> you.
 
 **Keep — the durable, cross-cutting, hard-to-reconstruct:**
 
@@ -203,13 +207,13 @@ truth anyway. Before writing or distilling anything, apply one test:
 - **Decisions about an overarching plan and their *why*** — architectural direction, the
   long-term trade-off chosen and the constraint that forced it.
 - **Non-obvious gotchas** that cost real time to rediscover and are written down *nowhere*
-  (not in any `CLAUDE.md` or code comment).
+  (not in any `CLAUDE.md` / `AGENTS.md` or code comment).
 - **Durable facts about the user** and their working preferences.
 
 **Drop — reconstructable or trivial; do not store in long-term leaves:**
 
-- Anything already in a repo's `CLAUDE.md` / `DEVELOPMENT.md` / `README` — **link to it,
-  never replicate it.**
+- Anything already in a repo's `CLAUDE.md` / `AGENTS.md` / `DEVELOPMENT.md` / `README` —
+  **link to it, never replicate it.**
 - Recent commits / git-log summaries — git history already has these.
 - What an individual function, file, or module does — the code is the source of truth.
 - Any transient mechanic that a glance at the current repo would re-establish.
@@ -257,7 +261,8 @@ The five sections and what each holds:
   it.
 - Carry **one durable fact** — a decision + its why, a discovery, a user preference, project
   state. Write signal, not transcript, and apply *What long-term memory is for* above: if the
-  repo, its git log, or its `CLAUDE.md` already holds it, link to that instead of copying it.
+  repo, its git log, or its `CLAUDE.md` / `AGENTS.md` already holds it, link to that instead of
+  copying it.
 
 A `PreCompact` hook will remind you to flush anything unsaved before the context is
 compacted — treat that as a cue to write pending notes to the journal.
@@ -294,7 +299,7 @@ and **condensation** for everything else. Tier every durable fact as you write i
    doubles as the routing link.
 
 Edit-merge, never clobber: read the leaf first and add to it. This applies to the headless
-on-close journaler too — `claude-memory-dump` write-through's impactful items on these same
+on-close journaler too — `memory-dump` write-through's impactful items on these same
 rules; an autonomous agent that pastes instead of merging duplicates pages.
 
 ## Condensation (daily → knowledge rollup)
@@ -315,12 +320,13 @@ aged journal (every journal older than the 5 most recent) two ways and acts acco
   automatically** (`outl page delete --confirm`). You never delete a journal by hand.
 - **pending** = aged and **not** yet `consolidated::` → distillation is synthesis, so it needs
   an LLM — but it is **not left to whatever interactive session happens to notice a directive**.
-  The hook launches **`memory-consolidate`**, a detached, headless `claude -p` agent, in the
-  background: it distills every pending journal per this section, marks each `consolidated::
-  <today>`, and reaps — automatically, with no prompting, on every install that has the
-  `claude` CLI. Your interactive session is only *told* it is running (so you don't do it by
-  hand). The **`⚠ CONSOLIDATION REQUIRED`** directive is now only a **fallback**, injected when
-  the `claude` CLI or `memory-consolidate` is unavailable; when you see it, do the steps below
+  The hook launches **`memory-consolidate`**, a detached, headless agent, in the background —
+  run via `memory-agent` on the same harness that fired the hook (`claude -p` or `omp -p`): it
+  distills every pending journal per this section, marks each `consolidated:: <today>`, and
+  reaps — automatically, with no prompting, on every install whose harness CLI is available.
+  Your interactive session is only *told* it is running (so you don't do it by hand). The
+  **`⚠ CONSOLIDATION REQUIRED`** directive is now only a **fallback**, injected when the
+  harness CLI or `memory-consolidate` is unavailable; when you see it, do the steps below
   *this session, before the user's request*.
 
 **Retention is by count and deletion is driven by the `consolidated::` mark:** the 5 most
@@ -349,9 +355,10 @@ When you see the `⚠ CONSOLIDATION REQUIRED` directive, for each pending journa
    durability is genuinely uncertain (e.g. a "retrieval cost pattern" musing), apply *What
    long-term memory is for* and promote-or-drop **deliberately** — do not reflexively keep.
    For each cluster that clears the bar (keep cross-repo relationships, plan state, decisions
-   + why; drop anything the repo/git/`CLAUDE.md` already holds) — descend the tree to the
-   target leaf document (an existing one, or create a new leaf under the right TOC — splitting
-   or adding a TOC level if a parent is getting crowded). Merge the **distilled** points in —
+   + why; drop anything the repo/git/`CLAUDE.md`/`AGENTS.md` already holds) — descend the tree
+   to the target leaf document (an existing one, or create a new leaf under the right TOC —
+   splitting or adding a TOC level if a parent is getting crowded). Merge the **distilled**
+   points in —
    synthesize, don't copy verbatim, and never duplicate a point the leaf already states
    (semantic dedup, on top of the `#in-deep` skip above). Set/refresh `updated::` and
    `summary::`; ensure `project:: [[...]]`,
@@ -392,7 +399,7 @@ granularities**, all sharing the same seed **30** / cap **60** / **−1-per-day*
 - **Line (content block).** Each real content bullet decays independently, keyed by its
   **stable outl block id**, so a stale line inside an otherwise-live page ages out on its own
   while the file lives. Scores live in a ws-level ledger
-  `~/.claude/memory/.frecency/sections.json` keyed `{slug: {block_id: {f, seen}}}` —
+  `~/.llm-harness-memory/.frecency/sections.json` keyed `{slug: {block_id: {f, seen}}}` —
   **outside** `.outl/`, so a `rebuild` never wipes it. It is a usage signal, not knowledge: if
   lost, lines just reseed at 30. **Never hand-edit it;** `memory-index` owns it. (Headings and
   frontmatter props are not tracked lines.)

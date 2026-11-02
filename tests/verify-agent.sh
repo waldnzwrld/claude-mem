@@ -2,15 +2,16 @@
 #
 # verify-agent.sh — AGENT-IN-THE-LOOP proof.
 #
-# Unlike verify.sh (which drives memory-index directly), this points a REAL running Claude
-# agent at an isolated copy of the fixture and proves the end-to-end runtime behaves as
-# expected: the actual outl MCP tools, the actual PostToolUse hook, and the actual `claude -p`
+# Unlike verify.sh (which drives memory-index directly), this points a REAL running agent
+# at an isolated copy of the fixture and proves the end-to-end runtime behaves as
+# expected: the actual outl MCP tools, the actual PostToolUse hook, and the actual headless
 # consolidation agent — all operating on the throwaway workspace, never on live memory.
 #
-# It is slower and consumes model quota (it launches Claude). Run it to prove behaviour on a
-# branch; use verify.sh for the fast mechanical check.
+# It is slower and consumes model quota (it launches the agent). Run it to prove behaviour
+# on a branch; use verify.sh for the fast mechanical check.
 #
-#   tests/verify-agent.sh                 # both scenarios
+#   tests/verify-agent.sh                 # both scenarios, Claude Code
+#   HARNESS=omp tests/verify-agent.sh     # both scenarios, omp (via omp/llm-harness-memory.ts)
 #   SKIP_CONSOLIDATION=1 tests/verify-agent.sh   # only the cheap propagation scenario
 set -u
 
@@ -18,14 +19,18 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 OUTL="${OUTL_BIN:-/opt/homebrew/bin/outl}"
 MI="${MI:-$REPO/memory-index}"
-HOOK="$REPO/claude-memory-hook"
+HOOK="$REPO/memory-hook"
 CONS="$REPO/memory-consolidate"
 FX="$HERE/fixture"
 TODAY="$(date +%F)"
+HARNESS="${HARNESS:-claude}"
 TMPROOT="$(mktemp -d)"
 trap 'rm -rf "$TMPROOT"' EXIT
 
-command -v claude >/dev/null 2>&1 || { echo "claude CLI not found"; exit 1; }
+case "$HARNESS" in
+  claude|omp) command -v "$HARNESS" >/dev/null 2>&1 || { echo "$HARNESS CLI not found"; exit 1; } ;;
+  *) echo "unknown HARNESS '$HARNESS' (want claude|omp)"; exit 1 ;;
+esac
 [ -d "$FX" ] || { echo "fixture missing — run tests/build-fixture.sh"; exit 1; }
 
 PASS=0; FAIL=0; SKIP=0
@@ -49,7 +54,7 @@ getf(){ grep -m1 '^frecency::' "$1/pages/$2.md" 2>/dev/null | sed 's/^frecency::
 jhere(){ [ -f "$1/journals/$2.md" ] && echo yes || echo no; }
 pend(){ "$MI" -w "$1" consolidate --json 2>/dev/null | python3 -c "import sys,json;print(len(json.load(sys.stdin)['pending']))"; }
 
-echo "== agent-in-the-loop (real claude runs against the fixture) =="
+echo "== agent-in-the-loop (real $HARNESS runs against the fixture) =="
 
 # ---------------------------------------------------------------------------------
 # Scenario 1 — a live agent calling outl_page_get triggers touch + upward propagation.
@@ -60,24 +65,38 @@ check "baseline alpha-notes" "$(getf "$W" alpha-notes)" "30"
 check "baseline proj-alpha"  "$(getf "$W" proj-alpha)"  "30"
 check "baseline index"       "$(getf "$W" index)"       "40"
 
-MCP="$TMPROOT/mcp1.json"
-printf '{"mcpServers":{"outl":{"command":"%s","args":["mcp","serve","-w","%s"]}}}' "$OUTL" "$W" > "$MCP"
-SET="$TMPROOT/set1.json"
-printf '{"hooks":{"PostToolUse":[{"matcher":"mcp__outl__outl_page_get","hooks":[{"type":"command","command":"%s"}]}]}}' "$HOOK" > "$SET"
+if [ "$HARNESS" = claude ]; then
+  MCP="$TMPROOT/mcp1.json"
+  printf '{"mcpServers":{"outl":{"command":"%s","args":["mcp","serve","-w","%s"]}}}' "$OUTL" "$W" > "$MCP"
+  SET="$TMPROOT/set1.json"
+  printf '{"hooks":{"PostToolUse":[{"matcher":"mcp__outl__outl_page_get","hooks":[{"type":"command","command":"%s"}]}]}}' "$HOOK" > "$SET"
 
-MEMORY_WS="$W" MEMORY_INDEX_BIN="$MI" OUTL_BIN="$OUTL" \
-  claude -p 'Use the outl_page_get tool with slug "alpha-notes" to read that memory page. After it returns, reply with just: DONE.' \
-    --model sonnet \
-    --mcp-config "$MCP" --strict-mcp-config \
-    --settings "$SET" \
-    --allowedTools "mcp__outl__outl_page_get" \
-    --dangerously-skip-permissions \
-    >"$TMPROOT/ag1.out" 2>"$TMPROOT/ag1.err"
+  MEMORY_WS="$W" MEMORY_INDEX_BIN="$MI" OUTL_BIN="$OUTL" \
+    claude -p 'Use the outl_page_get tool with slug "alpha-notes" to read that memory page. After it returns, reply with just: DONE.' \
+      --model sonnet \
+      --mcp-config "$MCP" --strict-mcp-config \
+      --settings "$SET" \
+      --allowedTools "mcp__outl__outl_page_get" \
+      --dangerously-skip-permissions \
+      >"$TMPROOT/ag1.out" 2>"$TMPROOT/ag1.err"
+else
+  # omp: the adapter extension drives every hook event, so SessionStart fires too. A no-op
+  # consolidator makes the hook report background consolidation instead of asking this
+  # agent to distil the fixture's aged journals; the project .omp/mcp.json scopes outl to W.
+  P="$TMPROOT/proj1"; mkdir -p "$P/.omp"
+  printf '{"mcpServers":{"outl":{"type":"stdio","command":"%s","args":["mcp","serve","-w","%s"]}}}' "$OUTL" "$W" > "$P/.omp/mcp.json"
+  MEMORY_WS="$W" MEMORY_INDEX_BIN="$MI" OUTL_BIN="$OUTL" MEMORY_HOOK_BIN="$HOOK" \
+    MEMORY_CONSOLIDATE_BIN=/usr/bin/true MEMORY_DUMP_BIN=/usr/bin/true \
+    omp -p --cwd "$P" --no-extensions -e "$REPO/omp/llm-harness-memory.ts" \
+      --model "${MEMORY_MODEL:-claude-sonnet-5}" --approval-mode yolo --no-session --no-title -- \
+      'Use the outl page_get tool with slug "alpha-notes" to read that memory page. After it returns, reply with just: DONE.' \
+      >"$TMPROOT/ag1.out" 2>"$TMPROOT/ag1.err"
+fi
 # the PostToolUse touch is fire-and-forget; wait for the propagated write to land
 for _ in $(seq 1 60); do [ "$(getf "$W" alpha-notes)" != "30" ] && break; sleep 0.5; done
 
 if [ "$(getf "$W" alpha-notes)" = "30" ] && blocked "$TMPROOT/ag1.err" "$TMPROOT/ag1.out"; then
-  skip "live-agent scenario — Claude could not run (usage/rate limit or auth); inconclusive"
+  skip "live-agent scenario — $HARNESS could not run (usage/rate limit or auth); inconclusive"
 else
   gt "leaf touched by the agent's page_get" "$(getf "$W" alpha-notes)" 30
   gt "parent moc propagated"                "$(getf "$W" proj-alpha)"  30
@@ -90,20 +109,20 @@ fi
 if [ -n "${SKIP_CONSOLIDATION:-}" ]; then
   echo "[2] consolidation agent — SKIPPED (SKIP_CONSOLIDATION set)"
 else
-  echo "[2] consolidation agent: claude -p distills 2020-01-04 -> marked -> reaped"
+  echo "[2] consolidation agent: $HARNESS -p distills 2020-01-04 -> marked -> reaped"
   W="$(setup ag2)"
   check "one pending aged journal before" "$(pend "$W")" "1"
   check "pending journal present before"  "$(jhere "$W" 2020-01-04)" "yes"
 
   MEMORY_WS="$W" MEMORY_INDEX_BIN="$MI" MEMORY_CONSOLIDATE_BIN="$CONS" OUTL_BIN="$OUTL" \
-    MEMORY_MODEL="${MEMORY_MODEL:-claude-sonnet-5}" \
+    MEMORY_HARNESS="$HARNESS" MEMORY_MODEL="${MEMORY_MODEL:-claude-sonnet-5}" \
     bash "$CONS" >"$TMPROOT/ag2.out" 2>"$TMPROOT/ag2.err" || true
 
-  # The distiller's own output goes to the workspace consolidate log. If Claude could not run
-  # (quota/limit/auth), 2020-01-04 stays pending — report inconclusive, not a code failure.
+  # The distiller's own output goes to the workspace consolidate log. If the agent could not
+  # run (quota/limit/auth), 2020-01-04 stays pending — report inconclusive, not a code failure.
   DLOG="$W/.consolidate.log"
   if [ "$(jhere "$W" 2020-01-04)" = "yes" ] && blocked "$DLOG" "$TMPROOT/ag2.err" "$TMPROOT/ag2.out"; then
-    skip "consolidation scenario — Claude could not run (usage/rate limit or auth); inconclusive"
+    skip "consolidation scenario — $HARNESS could not run (usage/rate limit or auth); inconclusive"
   else
     # Deterministic proof: 2020-01-04 is reaped ONLY after the distiller marks it consolidated::,
     # which the prompt instructs solely after the fact is written into a knowledge leaf.
@@ -121,5 +140,5 @@ if [ "$FAIL" -gt 0 ]; then
   cp "$TMPROOT"/ag*.out "$TMPROOT"/ag*.err /tmp/ 2>/dev/null || true
   exit 1
 fi
-[ "$SKIP" -gt 0 ] && { printf 'Inconclusive: re-run when Claude quota is available.\n'; exit 2; }
+[ "$SKIP" -gt 0 ] && { printf 'Inconclusive: re-run when %s quota is available.\n' "$HARNESS"; exit 2; }
 printf 'All agent scenarios proven.\n'

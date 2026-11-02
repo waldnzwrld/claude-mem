@@ -1,28 +1,27 @@
 #!/usr/bin/env bash
 #
-# claude-memory-dump — on session close, record the session's DURABLE facts via a
-# detached, headless agent. Fired by the SessionEnd branch of claude-memory-hook,
+# memory-dump — on session close, record the session's DURABLE facts via a
+# detached, headless agent. Fired by the SessionEnd branch of memory-hook,
 # which passes the transcript path.
 #
-# Follows the two-tier write policy (see ~/.claude/memory/AGENTS.md): every durable
+# Follows the two-tier write policy (see ~/.llm-harness-memory/AGENTS.md): every durable
 # fact lands in today's journal, and IMPACTFUL facts (ones that make a knowledge
 # page wrong, reverse a prior decision, or add a new component / cross-project
 # relationship / durable user fact) are additionally written through to the right
-# deep-memory leaf, merged and back-marked #in-deep in the journal. Runs on a
-# capable model (Sonnet 5 by default; override with MEMORY_MODEL). The agent reads
-# the transcript, extracts what is worth remembering across sessions, and writes it
-# via the outl MCP tools, deduping and never rewriting or deleting existing entries.
+# deep-memory leaf, merged and back-marked #in-deep in the journal. Runs headless via
+# `memory-agent` on the harness that fired the hook (MEMORY_HARNESS) and a capable model
+# (Sonnet 5 by default; override with MEMORY_MODEL). The agent reads the transcript,
+# extracts what is worth remembering across sessions, and writes it via the outl MCP
+# tools, deduping and never rewriting or deleting existing entries.
 #
 # Safe to run any time: it no-ops on a trivial/absent transcript, single-instances
 # via a lock, and refuses to recurse into the agent it spawns.
 
 set -u
 
-CLAUDE="${CLAUDE_BIN:-claude}"
-# Hooks can run with a minimal PATH; fall back to the usual install location.
-command -v "$CLAUDE" >/dev/null 2>&1 || CLAUDE="$HOME/.local/bin/claude"
-MODEL="${MEMORY_MODEL:-claude-sonnet-5}"
-WS="$HOME/.claude/memory"
+AGENT="${MEMORY_AGENT_BIN:-$(dirname "${BASH_SOURCE[0]}")/memory-agent}"
+HARNESS="${MEMORY_HARNESS:-claude}"
+WS="${MEMORY_WS:-$HOME/.llm-harness-memory}"   # override targets an isolated workspace (tests)
 LOCKDIR="$WS/.dump.lock.d"
 LOG="$WS/.dump.log"
 MIN_LINES="${MEMORY_DUMP_MIN_LINES:-8}"   # skip trivial sessions
@@ -32,10 +31,10 @@ TRANSCRIPT="${MEMORY_DUMP_TRANSCRIPT:-${1:-}}"
 [ -n "${MEMORY_DUMP_ACTIVE:-}" ] && exit 0
 [ -n "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] && exit 0
 
-# Need a real transcript, a memory workspace, and the CLI.
+# Need a real transcript, a memory workspace, and a headless agent CLI.
 [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ] || exit 0
 [ -d "$WS" ] || exit 0
-command -v "$CLAUDE" >/dev/null 2>&1 || exit 0
+[ -x "$AGENT" ] && "$AGENT" --available || exit 0
 
 # Skip trivial sessions; line count proxies meaningful work.
 lines="$(wc -l < "$TRANSCRIPT" 2>/dev/null | tr -d ' ')"
@@ -52,14 +51,14 @@ trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
 
 prompt="You are running headless as the memory-system session journaler. Do ONLY the task below, then stop — ignore everything else.
 
-A Claude Code session just ended. Its full transcript (JSONL, one message per line) is at:
+A coding-agent session ($HARNESS) just ended. Its full transcript (JSONL, one record per line) is at:
   $TRANSCRIPT
 
-Read that transcript, then record the session's DURABLE facts via the outl MCP tools, following the 'Two-tier writes', 'Writing to memory', 'What long-term memory is for', and 'Condensation' sections of ~/.claude/memory/AGENTS.md.
+Read that transcript, then record the session's DURABLE facts via the outl MCP tools, following the 'Two-tier writes', 'Writing to memory', 'What long-term memory is for', and 'Condensation' sections of ~/.llm-harness-memory/AGENTS.md.
 
 Rules:
   1. FIRST call outl_daily_today to read today's journal. It may already contain entries the interactive agent wrote at checkpoints — you are ADDING to it, not replacing it.
-  2. Extract ONLY what is worth remembering across sessions: decisions + their why, discoveries/gotchas, long-running plan state, cross-repo relationships, durable user facts. DROP chit-chat, transient tool output, and anything the code / its git log / its CLAUDE.md already records.
+  2. Extract ONLY what is worth remembering across sessions: decisions + their why, discoveries/gotchas, long-running plan state, cross-repo relationships, durable user facts. DROP chit-chat, transient tool output, and anything the code / its git log / its CLAUDE.md or AGENTS.md already records.
   3. Append each new fact as a CHILD BULLET under the right existing section. The five sections are EXACTLY: ## Focus / ## Key Decisions / ## Discoveries / ## Action Items / ## Session Notes — they already exist in today's journal (the template laid them down). To append: from the outline you read in step 1, take the block id of the matching ## Section, then call outl_block_append with parent = that block id and text = just the bullet, with NO '## ' header inside the text. Do NOT use outl_daily_append for section content — it appends a FLAT top-level block and cannot nest, so it produces duplicate '## Focus'/'## Discoveries' headers and unsectioned bullets. NEVER emit a '## Section' header that already exists. Link each bullet outward to the [[project-...]] or [[topic]] it concerns. Be concise — one bullet per fact.
   4. Do NOT duplicate anything already in today's journal — compare against what you read in step 1 and add only what is missing. Skip any item already marked #in-deep (it is already in deep memory).
   5. TIER each durable fact and act accordingly:
@@ -70,9 +69,6 @@ Rules:
   7. If the session produced nothing durable, do nothing at all.
   8. Do NOT touch code, git, or anything outside the memory graph."
 
-MEMORY_DUMP_ACTIVE=1 "$CLAUDE" -p "$prompt" \
-  --model "$MODEL" \
-  --dangerously-skip-permissions \
-  >>"$LOG" 2>&1 || true
+MEMORY_DUMP_ACTIVE=1 "$AGENT" "$prompt" >>"$LOG" 2>&1 || true
 
 exit 0
