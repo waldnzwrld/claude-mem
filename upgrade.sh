@@ -265,7 +265,7 @@ done
 
 # ---- 4. install the current layout -------------------------------------------
 echo
-"$SRC/install.sh" --harness "$harnesses"
+"$SRC/install.sh" --no-prompt --harness "$harnesses"
 
 echo
 for f in "$CLAUDE_DIR/CLAUDE.md" "$OMP_DIR/AGENTS.md" "$SETTINGS" "$OMP_DIR/mcp.json"; do

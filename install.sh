@@ -9,9 +9,18 @@
 #     ./install.sh --harness omp        # oh-my-pi (omp)
 #     ./install.sh --harness pi         # pi
 #     ./install.sh --harness all        # every harness; also: --harness claude,omp,pi
+#     ./install.sh --harness omp --model omp=MODEL   # also pick that harness's memory-agent model
+#     ./install.sh --no-prompt          # never ask questions (also the case without a terminal)
 #
 # Every harness shares one memory workspace (~/.llm-harness-memory), one hook, one index,
 # and the same helper binaries in ~/.local/bin; each harness only adds its own wiring.
+#
+# Memory model: the background memory agents (on-close journaler, consolidation) run on one
+# model per harness. On a terminal, install prompts for each selected harness (Enter keeps the
+# current model, ? lists the choices); --model HARNESS=MODEL answers without asking and is the
+# only way to choose when there is no terminal. HARNESS must also be selected with --harness.
+# --no-prompt skips the questions (upgrade.sh uses it). Change the model later with the
+# memory-model skill or `memory-agent --harness H --set-model MODEL`.
 #
 # Claude Code: copies the agent definition, appends the memory section to
 # ~/.claude/CLAUDE.md, wires the SessionStart/PreCompact/SessionEnd/UserPromptSubmit/
@@ -56,11 +65,79 @@ want() {
     esac
   done
 }
+
+NO_PROMPT=0
+# selected <harness> — true iff the harness is among those being installed.
+selected() {
+  case "$1" in
+    claude) [ "$WANT_CLAUDE" = 1 ] ;;
+    omp) [ "$WANT_OMP" = 1 ] ;;
+    pi) [ "$WANT_PI" = 1 ] ;;
+  esac
+}
+MODEL_ARGS=""
+# add_model HARNESS=MODEL — record a --model answer (checked against the selection later).
+add_model() {
+  case "$1" in
+    claude=?*|omp=?*|pi=?*) MODEL_ARGS="${MODEL_ARGS}$1"$'\n' ;;
+    *) echo "--model wants claude|omp|pi=MODEL, got '$1'" >&2; exit 2 ;;
+  esac
+}
+
+# model_arg <harness> — the --model answer for a harness ("" if none).
+model_arg() {
+  printf '%s' "$MODEL_ARGS" | awk -F= -v h="$1" '$1 == h { sub(/^[^=]*=/, ""); m = $0 } END { print m }'
+}
+
+# magent <memory-agent> <args...> — run memory-agent with the workspace pinned to $MEM_DIR, so
+# an ambient MEMORY_MODELS_FILE / MEMORY_MODEL cannot redirect or mask the install's choice.
+magent() {
+  local bin="$1"
+  shift
+  env -u MEMORY_MODELS_FILE -u MEMORY_MODEL MEMORY_WS="$MEM_DIR" "$bin" "$@"
+}
+
+# choose_model <harness> — set the harness's memory-agent model from --model, else (on a
+# terminal) by prompt: Enter keeps the current model, ? lists the harness's models.
+choose_model() {
+  local h="$1" agent="$BIN_DIR/memory-agent" want cur
+  if ! magent "$agent" --harness "$h" --available; then
+    echo "• $h model        -> $h CLI not found; later: memory-agent --harness $h --set-model MODEL"
+    return 0
+  fi
+  want="$(model_arg "$h")"
+  if [ -n "$want" ]; then
+    magent "$agent" --harness "$h" --set-model "$want" || exit 1
+    return 0
+  fi
+  [ "$NO_PROMPT" = 0 ] && [ -t 0 ] && [ -t 1 ] || return 0
+  cur="$(magent "$agent" --harness "$h" --get-model | cut -f2)"
+  while :; do
+    printf 'Model for the %s memory agents [%s] (Enter keeps, ? lists): ' "$h" "$cur"
+    read -r want || return 0
+    case "$want" in
+      '') return 0 ;;
+      '?') magent "$agent" --harness "$h" --list-models ;;
+      *) magent "$agent" --harness "$h" --set-model "$want" && return 0 ;;
+    esac
+  done
+}
+
+# install_skill <skills-dir> <harness> <label> — the memory-model skill for one harness.
+install_skill() {
+  local dir="$1/memory-model"
+  mkdir -p "$dir"
+  sed -e "s|{{HARNESS_LABEL}}|$3|g" -e "s|{{HARNESS}}|$2|g" "$SRC/skills/memory-model/SKILL.md" > "$dir/SKILL.md"
+  echo "✔ $2 skill       -> $dir/SKILL.md"
+}
 while [ $# -gt 0 ]; do
   case "$1" in
     --harness) [ $# -ge 2 ] || { echo "--harness needs a value" >&2; exit 2; }; want "$2"; shift 2 ;;
     --harness=*) want "${1#--harness=}"; shift ;;
-    -h|--help) sed -n '3,11p' "$0"; exit 0 ;;
+    --model) [ $# -ge 2 ] || { echo "--model needs HARNESS=MODEL" >&2; exit 2; }; add_model "$2"; shift 2 ;;
+    --model=*) add_model "${1#--model=}"; shift ;;
+    --no-prompt) NO_PROMPT=1; shift ;;
+    -h|--help) sed -n '3,13p' "$0"; exit 0 ;;
     *) echo "unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -82,6 +159,18 @@ if [ "$OMP_DIR" -ef "$PI_DIR" ] || [ "$OMP_DIR" = "$PI_DIR" ]; then
   echo "✖ omp and pi resolve to the same agent dir ($OMP_DIR); set OMP_AGENT_DIR / PI_AGENT_DIR apart" >&2
   exit 2
 fi
+
+# Check every --model answer before anything is written, so a typo cannot leave a half install.
+for h in claude omp pi; do
+  m="$(model_arg "$h")"
+  if [ -n "$m" ] && ! selected "$h"; then
+    echo "--model $h=… given, but $h is not selected; add --harness $h" >&2
+    exit 2
+  fi
+  if [ -n "$m" ] && magent "$SRC/memory-agent" --harness "$h" --available; then
+    magent "$SRC/memory-agent" --harness "$h" --check-model "$m" || exit 1
+  fi
+done
 
 if [ -d "$HOME/.claude/memory/.outl" ] && ! [ -e "$MEM_DIR" ]; then
   echo "✖ found a workspace at ~/.claude/memory; run ./upgrade.sh to move it to $MEM_DIR" >&2
@@ -291,6 +380,9 @@ else
 EOF
 fi
 
+# ---- memory-model skill ------------------------------------------------------
+install_skill "$CLAUDE_DIR/skills" claude "Claude Code"
+
 fi # WANT_CLAUDE
 
 # ===================================== omp ==========================================
@@ -325,6 +417,9 @@ else
   OMP_MCP_TODO=1
 fi
 
+# ---- memory-model skill ------------------------------------------------------
+install_skill "$OMP_DIR/skills" omp omp
+
 fi # WANT_OMP
 
 # ====================================== pi ==========================================
@@ -346,7 +441,15 @@ else
   PI_MCP_TODO=1
 fi
 
+# ---- memory-model skill ------------------------------------------------------
+install_skill "$PI_DIR/skills" pi pi
+
 fi # WANT_PI
+
+# ================================ memory model ======================================
+if [ "$WANT_CLAUDE" = 1 ]; then choose_model claude; fi
+if [ "$WANT_OMP" = 1 ]; then choose_model omp; fi
+if [ "$WANT_PI" = 1 ]; then choose_model pi; fi
 
 cat <<EOF
 

@@ -6,6 +6,11 @@ the fixture is never mutated and nothing touches live memory.
 
 - **`verify.sh`** — fast, deterministic. Drives `memory-index` directly (no LLM) and asserts
   the mechanical outcomes.
+- **`verify-model.sh`** — memory-model selection. Offline: the harness CLIs are stubs. Covers
+  `memory-agent`'s `--list/get/set/unset/check-model`, precedence (`MEMORY_MODEL`, stored line,
+  default), the command line each harness gets, the hint after a failed run, and
+  `install.sh`/`uninstall.sh` (`--model`, `--no-prompt`, the prompt through a pty, skills,
+  nothing-installed-on-error).
 - **`verify-agent.sh`** — the agent-in-the-loop proof. Points a **real running agent** at the
   fixture (real outl MCP, real PostToolUse hook, real headless consolidation agent) and asserts
   the end-to-end runtime behaves as expected. `HARNESS=claude` (default), `HARNESS=omp`, or
@@ -16,6 +21,7 @@ the fixture is never mutated and nothing touches live memory.
 
 ```bash
 tests/verify.sh                                 # mechanical layer (this branch's ./memory-index)
+tests/verify-model.sh                           # memory-model selection (offline, stub CLIs)
 tests/verify-agent.sh                           # agent-in-the-loop proof (launches Claude)
 HARNESS=omp tests/verify-agent.sh               # same proof through omp + omp/llm-harness-memory.ts
 HARNESS=pi tests/verify-agent.sh                # same proof through pi + pi/llm-harness-memory.ts

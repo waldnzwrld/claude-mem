@@ -1,20 +1,57 @@
 #!/usr/bin/env bash
 #
-# memory-agent — run one headless memory-maintenance agent on the selected harness.
+# memory-agent — run one headless memory-maintenance agent on the selected harness, and
+# manage which model those agents use.
 #
 #   memory-agent --available          exit 0 iff the harness CLI is runnable
-#   memory-agent [--ws DIR] PROMPT    run PROMPT headless with full tool permissions;
+#   memory-agent [--ws DIR] [--] PROMPT
+#                                     run PROMPT headless with full tool permissions;
 #                                     --ws scopes the agent's outl MCP server to DIR
+#   memory-agent --list-models        models the harness can run (claude: aliases only)
+#   memory-agent --get-model          effective memory model and where it comes from
+#   memory-agent --set-model MODEL    store MODEL as this harness's memory model
+#   memory-agent --unset-model        drop the stored model (back to the default)
+#   memory-agent --check-model MODEL  validate MODEL like --set-model, without storing it
+#   --harness claude|omp|pi may accompany any of these, in any position among the options;
+#   a missing option value or an unknown option is an error, never taken as the prompt.
 #
-# Harness: MEMORY_HARNESS = claude (default) | omp | pi. The hook inherits it from the harness
-# that fired it, so background agents run on the same CLI as the interactive session.
-# Model: MEMORY_MODEL (default: Sonnet 5 on claude/omp; pi's own configured default on pi).
+# Harness: --harness, else MEMORY_HARNESS (the hook inherits it from the harness that fired
+# it), else claude. There is no environment detection: an agent harness launched from inside
+# another would be misread, so callers that are not Claude Code's native hooks say which.
+# Model: MEMORY_MODEL, else the harness's line in the models file, else the default (Sonnet 5
+# on claude/omp; pi's own configured default on pi). Models file: MEMORY_MODELS_FILE, else
+# <workspace>/.memory-models, one `harness=model` line per harness.
 # CLI overrides: CLAUDE_BIN, OMP_BIN, PI_BIN. stdout/stderr pass through; callers redirect to a log.
 
 set -u
 
+SUB=""; ARG=""; WS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --harness|--ws|--set-model|--check-model)
+      [ $# -ge 2 ] && [ -n "$2" ] || { echo "memory-agent: $1 needs a value" >&2; exit 2; }
+      case "$1" in
+        --harness) MEMORY_HARNESS="$2" ;;
+        --ws) WS="$2" ;;
+        *) [ -z "$SUB" ] || { echo "memory-agent: only one of --available/--*-model per call" >&2; exit 2; }
+           SUB="$1"; ARG="$2" ;;
+      esac
+      shift 2 ;;
+    --available|--list-models|--get-model|--unset-model)
+      [ -z "$SUB" ] || { echo "memory-agent: only one of --available/--*-model per call" >&2; exit 2; }
+      SUB="$1"; shift ;;
+    --) shift; break ;;
+    -*) echo "memory-agent: unknown option '$1'" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+if [ -n "$SUB" ] && [ $# -gt 0 ]; then
+  echo "memory-agent: unexpected argument '$1' after $SUB" >&2
+  exit 2
+fi
 HARNESS="${MEMORY_HARNESS:-claude}"
 OUTL="${OUTL_BIN:-/opt/homebrew/bin/outl}"
+MODELS_FILE="${MEMORY_MODELS_FILE:-${MEMORY_WS:-$HOME/.llm-harness-memory}/.memory-models}"
 
 # Hooks can run with a minimal PATH; fall back to the usual install locations.
 resolve() {
@@ -29,29 +66,90 @@ resolve() {
 case "$HARNESS" in
   claude)
     CLI="$(resolve "${CLAUDE_BIN:-}" claude "$HOME/.local/bin/claude")"
-    MODEL="${MEMORY_MODEL:-claude-sonnet-5}" ;;
+    DEFAULT_MODEL="claude-sonnet-5" ;;
   omp)
     CLI="$(resolve "${OMP_BIN:-}" omp /opt/homebrew/bin/omp /usr/local/bin/omp "$HOME/.bun/bin/omp")"
-    MODEL="${MEMORY_MODEL:-claude-sonnet-5}" ;;
+    DEFAULT_MODEL="claude-sonnet-5" ;;
   pi)
     CLI="$(resolve "${PI_BIN:-}" pi /opt/homebrew/bin/pi /usr/local/bin/pi)"
-    MODEL="${MEMORY_MODEL:-}" ;;
+    DEFAULT_MODEL="" ;;
   *)
-    echo "memory-agent: unknown MEMORY_HARNESS '$HARNESS' (want claude|omp|pi)" >&2
+    echo "memory-agent: unknown harness '$HARNESS' (want claude|omp|pi)" >&2
     exit 2 ;;
 esac
 
-if [ "${1:-}" = "--available" ]; then
-  [ -n "$CLI" ]
-  exit $?
-fi
+STORED_MODEL="$(awk -F= -v h="$HARNESS" '$1 == h { sub(/^[^=]*=/, ""); m = $0 } END { print m }' \
+  "$MODELS_FILE" 2>/dev/null)"
+MODEL="${MEMORY_MODEL:-${STORED_MODEL:-$DEFAULT_MODEL}}"
+
+# list_models: one selector per line, as the harness's --model accepts it. Claude Code has no
+# model listing; its aliases resolve to the latest model of each family.
+list_models() {
+  case "$HARNESS" in
+    claude) printf '%s\n' sonnet opus haiku ;;
+    omp) "$CLI" models --json 2>/dev/null | python3 -c 'import json, sys
+for m in json.load(sys.stdin).get("models", []):
+    if m.get("kind", "chat") == "chat":
+        print(m["selector"])' ;;
+    pi) "$CLI" --list-models 2>/dev/null | awk 'NR > 1 && NF >= 2 { print $1 "/" $2 }' ;;
+  esac
+}
+
+# store_model <model|"">  — rewrite the models file with this harness's line replaced or dropped.
+store_model() {
+  local tmp
+  mkdir -p "$(dirname "$MODELS_FILE")" || return 1
+  tmp="$(mktemp "$MODELS_FILE.XXXXXX")" || return 1
+  { awk -F= -v h="$HARNESS" '$1 != h' "$MODELS_FILE" 2>/dev/null
+    if [ -n "$1" ]; then printf '%s=%s\n' "$HARNESS" "$1"; fi
+  } > "$tmp" && mv "$tmp" "$MODELS_FILE" || { rm -f "$tmp"; return 1; }
+}
+
+case "$SUB" in
+  --available)
+    [ -n "$CLI" ]
+    exit $? ;;
+  --get-model)
+    if [ -n "${MEMORY_MODEL:-}" ]; then src="MEMORY_MODEL"
+    elif [ -n "$STORED_MODEL" ]; then src="$MODELS_FILE"
+    else src="default"
+    fi
+    printf '%s\t%s\t%s\n' "$HARNESS" "${MODEL:-(harness default)}" "$src"
+    exit 0 ;;
+  --unset-model)
+    store_model "" || exit 1
+    echo "$HARNESS memory model reset to default (${DEFAULT_MODEL:-harness default})"
+    exit 0 ;;
+  --list-models|--set-model|--check-model)
+    [ -n "$CLI" ] || { echo "memory-agent: $HARNESS CLI not found" >&2; exit 127; }
+    if [ "$SUB" = --list-models ]; then
+      list_models
+      [ "$HARNESS" = claude ] && echo "(or any full Claude model ID, e.g. claude-sonnet-5)" >&2
+      exit 0
+    fi
+    want="$ARG"   # --set-model validates then stores; --check-model only validates
+    [ -n "$want" ] || { echo "memory-agent: $SUB needs a model" >&2; exit 2; }
+    case "$want" in *[[:space:]=]*) echo "memory-agent: invalid model '$want'" >&2; exit 2 ;; esac
+    # omp and pi can list their models, so reject a typo instead of failing every background
+    # run later; a bare id matches a provider/id selector. Claude Code accepts any id, and a
+    # harness that lists nothing (not logged in yet) cannot validate, so it is stored as given.
+    if [ "$HARNESS" != claude ]; then
+      known="$(list_models)"
+      if [ -z "$known" ]; then
+        echo "memory-agent: $HARNESS lists no models (not logged in?); storing '$want' unchecked" >&2
+      elif ! printf '%s\n' "$known" | awk -v m="$want" '$0 == m || substr($0, index($0, "/") + 1) == m { f = 1 } END { exit !f }'; then
+        echo "memory-agent: '$want' is not a model $HARNESS can run; see memory-agent --harness $HARNESS --list-models" >&2
+        exit 1
+      fi
+    fi
+    if [ "$SUB" = --set-model ]; then
+      store_model "$want" || exit 1
+      echo "$HARNESS memory model set to $want ($MODELS_FILE)"
+    fi
+    exit 0 ;;
+esac
 [ -n "$CLI" ] || { echo "memory-agent: $HARNESS CLI not found" >&2; exit 127; }
 
-WS=""
-if [ "${1:-}" = "--ws" ]; then
-  WS="${2:-}"
-  shift 2
-fi
 PROMPT="${1:-}"
 [ -n "$PROMPT" ] || { echo "memory-agent: empty prompt" >&2; exit 2; }
 
@@ -97,3 +195,10 @@ case "$HARNESS" in
     "$CLI" -p --no-session --approve ${MODEL:+--model "$MODEL"} -- "$PROMPT"
     ;;
 esac
+rc=$?
+# A failed run on a user-chosen model is likely a bad model; the logs callers redirect this to
+# are rarely read, so say how to check and undo the choice there.
+if [ "$rc" -ne 0 ] && [ -z "${MEMORY_MODEL:-}" ] && [ -n "$STORED_MODEL" ]; then
+  echo "memory-agent: $HARNESS run exited $rc on stored model '$STORED_MODEL' ($MODELS_FILE); if the model is the cause: memory-agent --harness $HARNESS --list-models, then --set-model or --unset-model" >&2
+fi
+exit "$rc"
