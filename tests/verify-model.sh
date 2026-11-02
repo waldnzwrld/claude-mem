@@ -117,6 +117,25 @@ printf 'pi=model-b\n' > "$F"
 ma --harness pi PROMPT >/dev/null 2>&1
 check "--harness selects the harness"  "$(args | grep -c model-b)" "1"
 
+echo "== memory-agent: argument parsing"
+rm -f "$STUB_ARGS"
+check "no environment detection (OMPCODE set, claude still default)" \
+  "$(OMPCODE=1 PI_CODING_AGENT=true ma --get-model | cut -f1)" "claude"
+ma --ws /tmp/w --harness pi PROMPT >/dev/null 2>&1
+check "--ws before --harness: harness and prompt both honoured" "$(args)" "-p --no-session --approve --model model-b -- PROMPT"
+rm -f "$STUB_ARGS"
+for bad in "--harness" "--ws" "--set-model" "--bogus PROMPT" "--get-model --list-models" "--get-model extra"; do
+  # shellcheck disable=SC2086
+  ma $bad >/dev/null 2>&1; rc=$?
+  check "'$bad' is a usage error (exit 2)" "$rc" "2"
+done
+check "usage errors never invoke a CLI" "$([ -e "$STUB_ARGS" ] && echo ran || echo none)" "none"
+ma --harness omp -- -dashed >/dev/null 2>&1
+check "a prompt starting with '-' passes after --" "$(args | grep -c -- '-- -dashed')" "1"
+for f in memory-consolidate memory-dump; do
+  check "$f prompt cannot start with '-'" "$(grep -cE '^prompt="-' "$REPO/$f")" "0"
+done
+
 echo "== memory-agent: failed run on a stored model"
 err="$(MEMORY_HARNESS=pi STUB_RC=3 ma PROMPT 2>&1 >/dev/null)"; rc=$?
 check "run's exit status is preserved" "$rc" "3"

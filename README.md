@@ -224,7 +224,10 @@ claude/omp; pi's own default model on pi, since a pi install may have no Anthrop
   memory-agent --harness omp --unset-model      # back to the default
   ```
 
-  `--harness` defaults to the harness the command runs in. For omp and pi, `--set-model` checks the
+  `--harness` defaults to claude (or `MEMORY_HARNESS`, which the hook sets); it is never guessed
+  from the environment, since a harness launched inside another would be misread. Options may
+  come in any order, a missing value or unknown option is an error, and `--` ends options. For
+  omp and pi, `--set-model` checks the
   name against the harness's own model list (a bare id matches a `provider/id` entry); if the
   harness lists nothing, such as before login, the name is stored unchecked with a warning.
   Claude Code has no model listing, so any model ID is accepted.
