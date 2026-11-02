@@ -74,8 +74,14 @@ CLAUDEMD="$CLAUDE_DIR/CLAUDE.md"
 HOOK="$BIN_DIR/memory-hook"
 MEMIDX="$BIN_DIR/memory-index"
 AGENTS_DIR="$CLAUDE_DIR/agents"
-OMP_DIR="${OMP_AGENT_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}}"
+# omp also reads PI_CODING_AGENT_DIR, but that variable is pi's; honouring it for both would
+# point the two harnesses at one extensions/llm-harness-memory.ts.
+OMP_DIR="${OMP_AGENT_DIR:-$HOME/.omp/agent}"
 PI_DIR="${PI_AGENT_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}}"
+if [ "$OMP_DIR" -ef "$PI_DIR" ] || [ "$OMP_DIR" = "$PI_DIR" ]; then
+  echo "✖ omp and pi resolve to the same agent dir ($OMP_DIR); set OMP_AGENT_DIR / PI_AGENT_DIR apart" >&2
+  exit 2
+fi
 
 if [ -d "$HOME/.claude/memory/.outl" ] && ! [ -e "$MEM_DIR" ]; then
   echo "✖ found a workspace at ~/.claude/memory; run ./upgrade.sh to move it to $MEM_DIR" >&2

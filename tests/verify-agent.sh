@@ -34,6 +34,27 @@ case "$HARNESS" in
 esac
 # pi runs on its own default model unless MEMORY_MODEL is set; claude/omp default to Sonnet 5.
 [ "$HARNESS" = pi ] || MEMORY_MODEL="${MEMORY_MODEL:-claude-sonnet-5}"
+# pi: run from a throwaway agent dir holding only the user's credentials, models, and settings
+# (minus packages), so installed extensions — this repo's included — and user MCP servers
+# never load beside the branch's extension. --no-extensions can't do this: it also disables
+# pi's built-in MCP support.
+if [ "$HARNESS" = pi ]; then
+  PI_USER_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+  export PI_CODING_AGENT_DIR="$TMPROOT/pi-agent"
+  mkdir -p "$PI_CODING_AGENT_DIR"
+  for f in auth.json models.json; do
+    [ -f "$PI_USER_DIR/$f" ] && cp "$PI_USER_DIR/$f" "$PI_CODING_AGENT_DIR/"
+  done
+  python3 - "$PI_USER_DIR/settings.json" "$PI_CODING_AGENT_DIR/settings.json" <<'PY'
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    s = {}
+s.pop("packages", None)
+json.dump(s, open(sys.argv[2], "w"))
+PY
+fi
 [ -d "$FX" ] || { echo "fixture missing — run tests/build-fixture.sh"; exit 1; }
 
 PASS=0; FAIL=0; SKIP=0
@@ -96,8 +117,7 @@ elif [ "$HARNESS" = omp ]; then
       >"$TMPROOT/ag1.out" 2>"$TMPROOT/ag1.err"
 else
   # pi: like omp, the extension drives every hook event. The project .pi/mcp.json (trusted by
-  # --approve) scopes outl to W with direct exposure. --no-extensions would also disable pi's
-  # built-in MCP support, so user extensions load alongside the repo's.
+  # --approve) scopes outl to W with direct exposure.
   P="$TMPROOT/proj1"; mkdir -p "$P/.pi"
   printf '{"mcpServers":{"outl":{"command":"%s","args":["mcp","serve","-w","%s"],"exposure":"direct"}}}' "$OUTL" "$W" > "$P/.pi/mcp.json"
   ( cd "$P" && MEMORY_WS="$W" MEMORY_INDEX_BIN="$MI" OUTL_BIN="$OUTL" MEMORY_HOOK_BIN="$HOOK" \

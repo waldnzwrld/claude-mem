@@ -4,7 +4,7 @@
  * Translates pi lifecycle events into the memory-hook protocol (Claude Code's hook JSON schema)
  * and runs the shared `memory-hook`, so every harness drives one hook, one workspace, one index:
  *
- *   session_start (startup/new/resume/fork) -> SessionStart      (context injected with the first prompt)
+ *   session_start (not reload)               -> SessionStart      (context injected with the first prompt)
  *   before_agent_start (user prompt)         -> UserPromptSubmit  (push-retrieval pointers)
  *   tool_result(mcp__outl__outl_page_get)    -> PostToolUse       (frecency touch; codemode calls included)
  *   session_before_compact                   -> PreCompact        (reminder delivered after compaction)
@@ -24,10 +24,11 @@ const HOOK_TIMEOUT_MS = 25_000;
 const CUSTOM_TYPE = "llm-harness-memory";
 const PAGE_GET_TOOL = "mcp__outl__outl_page_get";
 
-// pi session_start reasons -> Claude Code SessionStart sources. "reload" swaps the extension
-// runtime inside the same conversation, so it neither starts nor ends a session.
-const START_SOURCE: Record<string, string> = { startup: "startup", new: "clear", resume: "resume", fork: "resume" };
-const END_REASON: Record<string, string> = { quit: "other", new: "clear", resume: "other", fork: "other" };
+// pi session_start / session_shutdown reasons -> Claude Code SessionStart sources / SessionEnd
+// reasons; a reason pi adds later falls back to "startup" / "other". "reload" swaps the
+// extension runtime inside the same conversation, so it neither starts nor ends a session.
+const START_SOURCE: Record<string, string> = { new: "clear", resume: "resume", fork: "resume" };
+const END_REASON: Record<string, string> = { new: "clear" };
 
 interface HookOutput {
 	hookSpecificOutput?: { additionalContext?: string };
@@ -93,8 +94,8 @@ export default function llmHarnessMemory(pi: ExtensionAPI) {
 	let pendingStart: Promise<string> | null = null;
 
 	pi.on("session_start", (event, ctx) => {
-		const source = START_SOURCE[event.reason];
-		if (!source) return;
+		if (event.reason === "reload") return;
+		const source = START_SOURCE[event.reason] ?? "startup";
 		pendingStart = runHook(
 			{ hook_event_name: "SessionStart", source, session_id: sessionId(ctx), cwd: ctx.cwd },
 			ctx.cwd,
@@ -103,9 +104,9 @@ export default function llmHarnessMemory(pi: ExtensionAPI) {
 
 	// Fires before teardown, so the session manager still describes the ending session.
 	pi.on("session_shutdown", (event, ctx) => {
-		const reason = END_REASON[event.reason];
 		const transcript = ctx.sessionManager.getSessionFile();
-		if (!reason || !transcript) return;
+		if (event.reason === "reload" || !transcript) return;
+		const reason = END_REASON[event.reason] ?? "other";
 		fireHook(
 			{ hook_event_name: "SessionEnd", reason, session_id: sessionId(ctx), transcript_path: transcript, cwd: ctx.cwd },
 			ctx.cwd,
@@ -161,6 +162,9 @@ export default function llmHarnessMemory(pi: ExtensionAPI) {
 	pi.on("session_compact", () => {
 		if (!compactReminder) return;
 		pi.sendMessage({ customType: CUSTOM_TYPE, content: compactReminder, display: false }, { deliverAs: "nextTurn" });
+		compactReminder = "";
+	});
+	pi.on("session_compact_failed", () => {
 		compactReminder = "";
 	});
 }

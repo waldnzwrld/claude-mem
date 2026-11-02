@@ -192,7 +192,9 @@ machine's Homebrew, and builds the index.
 - **pi:** installs the adapter extension to `~/.pi/agent/extensions/llm-harness-memory.ts` and
   appends the `## Persistent memory` section to `~/.pi/agent/AGENTS.md` (idempotent). Reports
   whether `~/.pi/agent/mcp.json` already serves `outl`. `PI_AGENT_DIR` (else
-  `PI_CODING_AGENT_DIR`) targets another agent dir.
+  `PI_CODING_AGENT_DIR`) targets another agent dir. omp also reads `PI_CODING_AGENT_DIR`, but
+  the scripts use it only for pi, and refuse to run if the omp and pi dirs resolve to the same
+  place (both extensions share a filename).
 
 Start a new session to load the system.
 
@@ -280,10 +282,11 @@ with `MEMORY_HARNESS=pi`:
 
 Behaviour that differs from Claude Code:
 
-- Background agents run as `pi -p --no-session`. `MEMORY_MODEL` takes a pi `--model` pattern;
-  unset, pi's own default model is used (there is no Sonnet default, since a pi install may have
-  no Anthropic credentials). `memory-agent --ws` scopes outl with a project `.pi/mcp.json` in a
-  scratch cwd, trusted for that run with `--approve`.
+- Background agents run as `pi -p --no-session --approve` in a scratch cwd whose project
+  `.pi/mcp.json` serves outl with `direct` exposure: on the `--ws` workspace, else
+  `~/.llm-harness-memory`. `MEMORY_MODEL` takes a pi `--model` pattern; unset, pi's own default
+  model is used (there is no Sonnet default, since a pi install may have no Anthropic
+  credentials).
 - pi has no subagents, so `memory-recall` is not installed; recall happens in the main thread.
 - pi's default MCP exposure (`codemode`) hides outl's tools from direct calls; serve outl with
   `"exposure": "direct"`. pi does not prompt for tool approval.

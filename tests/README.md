@@ -31,10 +31,13 @@ With `HARNESS=claude`, `verify-agent.sh` launches `claude -p` with `--mcp-config
 **outl MCP at the throwaway workspace**, `--strict-mcp-config` so no other MCP loads, and
 `--settings` wiring the repo's PostToolUse hook. With `HARNESS=omp`, it launches `omp -p` in a
 scratch project whose `.omp/mcp.json` points outl at the copy, loading only the repo's
-`omp/llm-harness-memory.ts` (`--no-extensions -e`). With `HARNESS=pi`, it launches `pi -p` in a
-scratch project whose `.pi/mcp.json` (trusted by `--approve`) points outl at the copy with
-`direct` exposure, adding the repo's `pi/llm-harness-memory.ts` with `-e`; user extensions still
-load, because `--no-extensions` also disables pi's built-in MCP support. pi uses its own default
+`omp/llm-harness-memory.ts` (`--no-extensions -e`). With `HARNESS=pi`, it points
+`PI_CODING_AGENT_DIR` at a throwaway agent dir holding only your `auth.json`, `models.json`, and
+`settings.json` (minus `packages`), so no installed extension or user MCP server loads;
+`--no-extensions` can't be used, since it also disables pi's MCP support. It then launches
+`pi -p` in a scratch project whose `.pi/mcp.json` (trusted by `--approve`) points outl at the
+copy with `direct` exposure, adding the repo's `pi/llm-harness-memory.ts` with `-e`. pi uses its
+own default
 model unless `MEMORY_MODEL` is set. Every way, `MEMORY_WS=<copy>` makes every hook/script target
 the copy, and `memory-consolidate` scopes its distiller's outl MCP to the workspace it manages
 (`memory-agent --ws`).

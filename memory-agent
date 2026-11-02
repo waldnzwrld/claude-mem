@@ -87,16 +87,13 @@ case "$HARNESS" in
     ;;
   pi)
     # pi: like omp, a project .pi/mcp.json in a scratch cwd replaces the user `outl` entry
-    # (--approve trusts it for this run); "direct" exposure declares the outl tools to the
-    # model instead of leaving them behind codemode.
-    set -- -p --no-session ${MODEL:+--model "$MODEL"}
-    if [ -n "$WS" ]; then
-      TMP="$(mktemp -d)"
-      mkdir -p "$TMP/.pi"
-      mcp_json "$WS" direct > "$TMP/.pi/mcp.json"
-      set -- "$@" --approve
-      cd "$TMP" || exit 1
-    fi
-    "$CLI" "$@" "$PROMPT"
+    # (--approve trusts it for this run). Always written, defaulting to the live workspace,
+    # because "direct" exposure is what declares the outl tools to the model; the user's own
+    # entry may leave them behind codemode.
+    TMP="$(mktemp -d)"
+    mkdir -p "$TMP/.pi"
+    mcp_json "${WS:-${MEMORY_WS:-$HOME/.llm-harness-memory}}" direct > "$TMP/.pi/mcp.json"
+    cd "$TMP" || exit 1
+    "$CLI" -p --no-session --approve ${MODEL:+--model "$MODEL"} -- "$PROMPT"
     ;;
 esac

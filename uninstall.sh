@@ -59,8 +59,12 @@ done
 
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
-OMP_DIR="${OMP_AGENT_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}}"
+OMP_DIR="${OMP_AGENT_DIR:-$HOME/.omp/agent}"
 PI_DIR="${PI_AGENT_DIR:-${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}}"
+if [ "$OMP_DIR" -ef "$PI_DIR" ] || [ "$OMP_DIR" = "$PI_DIR" ]; then
+  echo "✖ omp and pi resolve to the same agent dir ($OMP_DIR); set OMP_AGENT_DIR / PI_AGENT_DIR apart" >&2
+  exit 2
+fi
 MEM_DIR="$HOME/.llm-harness-memory"
 SETTINGS="$CLAUDE_DIR/settings.json"
 CLAUDEMD="$CLAUDE_DIR/CLAUDE.md"
