@@ -33,7 +33,9 @@ Design notes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
+import fcntl
 import glob
 import hashlib
 import json
@@ -42,10 +44,11 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 WS_DEFAULT = os.path.expanduser("~/.llm-harness-memory")
-SCHEMA_VERSION = 3  # stemmed/field-weighted FTS (title/heading/body columns)
+SCHEMA_VERSION = 4  # edges.authored: only authored edges steer the walk/cascade
 DEFAULT_THRESHOLD = 150  # node count at/above which the index is considered "active"
 
 # Field weights for bm25 over the (title, heading, text) FTS columns. A hit in the page
@@ -61,8 +64,8 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # Block-level (line) frecency: decays each content BULLET of a page independently, keyed by
 # its stable outl block id, so a stale line ages out and is evicted on its own while the file
 # lives. Credit: a search HIT bumps the matched lines (+HIT); a page_get bumps every line
-# (+PAGEGET). Decayed −1/day. Ledger {slug: {block_id: {f, seen}}} lives outside .outl/ so a
-# rebuild never wipes it.
+# (+PAGEGET). Decayed −1 per daily sweep. Ledger {slug: {block_id: {f, seen}}} lives outside
+# .outl/ so a rebuild never wipes it.
 SECTION_SEED = 30
 SECTION_CAP = 60
 SECTION_PAGEGET_BUMP = 2   # whole-page fetch: weak per-section evidence
@@ -148,6 +151,7 @@ def init_schema(con):
             dst    TEXT NOT NULL,
             type   TEXT NOT NULL DEFAULT 'refs',   -- refs | supersedes | contradicts | part-of
             weight INTEGER NOT NULL DEFAULT 1,      -- link multiplicity: how strongly src cites dst
+            authored INTEGER NOT NULL DEFAULT 0,    -- 1: type from a prop (parent::/supersedes::/…)
             UNIQUE(src, dst, type)
         );
         CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
@@ -310,24 +314,27 @@ def chunk_body(fm: dict, body: list[str]):
 
 
 # Edge typing, authored beating inferred:
-#   * AUTHORED: a frontmatter prop naming the relationship (e.g. `supersedes:: [[x]]`).
-#   * INFERRED: for a bare body [[link]], guessed from the line's wording, else 'refs'.
-# One edge per (src, target): the highest-precedence type wins.
+#   * AUTHORED: a page prop naming the relationship (e.g. `supersedes:: [[x]]`, `parent:: [[x]]`),
+#     col-0 or as a leading body bullet (see body_props).
+#   * INFERRED: for any other [[link]], guessed from whole words on its line, else 'refs'.
+# One edge per (src, target): authored beats inferred, then the higher-precedence type wins.
+# Only AUTHORED edges steer: the walk hides authored-superseded pages and the eviction cascade
+# and parent-chain credit follow authored part-of. Inferred types are labels only.
 EDGE_TYPES = (
-    ("supersedes",  ("supersede", "replaces", "replace", "obsoletes", "deprecates")),
-    ("contradicts", ("contradict", "conflicts", "conflict", "disagrees", "refutes")),
-    ("part-of",     ("part of", "parent", "belongs to", "under ", "child of", "subpage")),
+    ("supersedes",  re.compile(r"\b(?:supersede[sd]?|replaces?|obsoletes|deprecates)\b")),
+    ("contradicts", re.compile(r"\b(?:contradict(?:s|ed)?|conflicts?|disagrees|refutes)\b")),
+    ("part-of",     re.compile(r"\b(?:part of|parent|belongs to|under|child of|subpage)\b")),
 )
 TYPE_PRECEDENCE = {"supersedes": 3, "contradicts": 2, "part-of": 1, "refs": 0}
-# Frontmatter keys whose [[slug]] value(s) are AUTHORED typed edges (key -> edge type).
+# Prop keys whose [[slug]] value(s) are AUTHORED typed edges (key -> edge type).
 AUTHORED_EDGE_KEYS = {"supersedes": "supersedes", "contradicts": "contradicts",
                       "parent": "part-of"}
 
 
 def _edge_type(line: str) -> str:
     low = line.lower()
-    for etype, kws in EDGE_TYPES:
-        if any(kw in low for kw in kws):
+    for etype, pat in EDGE_TYPES:
+        if pat.search(low):
             return etype
     return "refs"
 
@@ -339,22 +346,29 @@ def _targets(text: str):
             yield target
 
 
-def links_in(fm: dict, body: list[str]) -> dict[str, tuple[str, int]]:
+def links_in(fm: dict, body: list[str]) -> dict[str, tuple[str, int, bool]]:
     """Collapse a page's [[links]] to one typed, weighted edge PER TARGET. Returns
-    {target: (type, weight)} where weight is the link's multiplicity within the page and
-    type is the highest-precedence type seen for that target — authored frontmatter edges
-    (AUTHORED_EDGE_KEYS) beating the wording-inferred type of inline body links."""
-    typ: dict[str, str] = {}   # target -> best type so far
-    wt: dict[str, int] = {}    # target -> link multiplicity
+    {target: (type, weight, authored)} where weight is the link's multiplicity within the
+    page. An authored prop edge (AUTHORED_EDGE_KEYS, col-0 or a leading body prop bullet)
+    beats the wording-inferred type of any other link; ties go to TYPE_PRECEDENCE."""
+    best: dict[str, tuple[bool, str]] = {}   # target -> (authored, type)
+    wt: dict[str, int] = {}                  # target -> link multiplicity
 
     def consider(target: str, etype: str, authored: bool):
         wt[target] = wt.get(target, 0) + 1
-        cur = typ.get(target)
-        # Authored type always wins; otherwise higher precedence wins.
-        if cur is None or authored or TYPE_PRECEDENCE[etype] > TYPE_PRECEDENCE[cur]:
-            typ[target] = etype
+        cur = best.get(target)
+        if cur is None or (authored, TYPE_PRECEDENCE[etype]) > (cur[0], TYPE_PRECEDENCE[cur[1]]):
+            best[target] = (authored, etype)
 
+    in_props = True  # leading prop bullets, up to the first `## heading` (as body_props)
     for ln in body:
+        if in_props and SECTION_RE.match(ln):
+            in_props = False
+        m = BODY_PROP_RE.match(ln) if in_props else None
+        if m and m.group(1) in AUTHORED_EDGE_KEYS:
+            for target in _targets(m.group(2)):
+                consider(target, AUTHORED_EDGE_KEYS[m.group(1)], authored=True)
+            continue
         etype = _edge_type(ln)
         for target in _targets(ln):
             consider(target, etype, authored=False)
@@ -362,7 +376,7 @@ def links_in(fm: dict, body: list[str]) -> dict[str, tuple[str, int]]:
         for target in _targets(fm.get(key, "")):
             consider(target, etype, authored=True)
 
-    return {t: (typ[t], wt.get(t, 1)) for t in typ}
+    return {t: (best[t][1], wt[t], best[t][0]) for t in best}
 
 
 def sha256_text(s: str) -> str:
@@ -476,10 +490,10 @@ def _index_files(con, ws: str, files, full: bool):
                 "INSERT INTO chunks_fts(rowid, title, heading, text) VALUES(?,?,?,?)",
                 (cur.lastrowid, fts_title, heading, text),
             )
-        for dst, (etype, weight) in links_in(fm, body).items():
+        for dst, (etype, weight, authored) in links_in(fm, body).items():
             con.execute(
-                "INSERT OR IGNORE INTO edges(src,dst,type,weight) VALUES(?,?,?,?)",
-                (slug, dst, etype, weight),
+                "INSERT OR IGNORE INTO edges(src,dst,type,weight,authored) VALUES(?,?,?,?,?)",
+                (slug, dst, etype, weight, int(authored)),
             )
     _apply_heals(con)  # re-prune the edge table per the stored heal policy (no-op if unset)
     set_meta(con, "indexed_at", str(int(time.time())))
@@ -528,9 +542,9 @@ def _graph_expand(con, seeds, depth: int, limit: int):
         SELECT slug, depth, weight, type, via
         FROM ranked
         WHERE rn = 1 AND slug NOT IN (SELECT slug FROM seed)
-          -- Type-aware: a page something supersedes is stale, so association never
-          -- surfaces it (the supersedes edge steers the walk, not just labels it).
-          AND slug NOT IN (SELECT dst FROM edges WHERE type='supersedes')
+          -- Type-aware: a page an AUTHORED supersedes:: names is stale, so association never
+          -- surfaces it. Inferred supersedes (prose wording) only labels.
+          AND slug NOT IN (SELECT dst FROM edges WHERE type='supersedes' AND authored=1)
         ORDER BY depth ASC, weight DESC
         LIMIT ?
     """
@@ -588,33 +602,6 @@ def cmd_search(ws: str, query: str, k: int, no_graph: bool, as_json: bool = Fals
             label = f"(via {via} · {etype} · {d}h ·w{weight})"
             results.append(("link", cand, label, summary, 0.0))
 
-    # Block-frecency credit: a keyword hit resolves to `slug › heading`; credit the matched
-    # content lines under that heading (line-level recall). Opt-in (push-retrieval passes
-    # --credit); graph 'link' rows have no section, so skip. Read-only outl reads, no writes.
-    if credit:
-        today = datetime.date.today().isoformat()
-        outl = _outl_bin()
-        sfrec = _load_sfrec(ws)
-        dirty = False
-        qterms = [t.lower() for t in re.findall(r"[A-Za-z0-9_]+", query)
-                  if t.lower() not in STOPWORDS and len(t) > 1]
-        seen_slugs: set = set()
-        for kind, slug, heading, _text, _score in results:
-            if kind != "hit" or heading in ("(summary)", "(top)") or slug in seen_slugs:
-                continue
-            seen_slugs.add(slug)
-            content = _content_blocks(_outl_outline(outl, ws, slug))
-            if not content:
-                continue
-            in_sec = [b for b in content if b["heading"] == heading]
-            pool = in_sec or content
-            matched = [b for b in pool if any(t in b["text"].lower() for t in qterms)]
-            target = matched or pool
-            _bump_blocks(sfrec, slug, [b["id"] for b in target], SECTION_HIT_BUMP, today)
-            dirty = True
-        if dirty:
-            _save_sfrec(ws, sfrec)
-
     if as_json:
         # Machine shape for programmatic callers (push-retrieval hook), so gating/dedupe
         # live in the caller. `score` is raw bm25 for keyword hits (null for graph rows);
@@ -629,6 +616,56 @@ def cmd_search(ws: str, query: str, k: int, no_graph: bool, as_json: bool = Fals
     else:
         _render_results(query, results)
     con.close()
+
+    # Crediting costs one outl read per hit page, so it runs detached AFTER the results are
+    # out: the push hook's 10s timeout covers only the search itself.
+    if credit and any(kind == "hit" for kind, *_ in results) and _detach():
+        try:
+            _credit_hits(ws, query, results)
+        finally:
+            os._exit(0)
+
+
+def _detach() -> bool:
+    """Fork a child in its own session with stdio on /dev/null. True in the child, False in
+    the parent. The child must drop the inherited stdout: a caller reading it to EOF (the
+    push hook) would otherwise wait for the child too."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if os.fork():
+        return False
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    return True
+
+
+def _credit_hits(ws: str, query: str, results):
+    """Block-frecency credit: a keyword hit resolves to `slug › heading`; credit the matched
+    content lines under that heading (line-level recall). Graph 'link' rows have no section,
+    so they are skipped. outl reads first, then one locked ledger update."""
+    today = datetime.date.today().isoformat()
+    outl = _outl_bin()
+    qterms = [t.lower() for t in re.findall(r"[A-Za-z0-9_]+", query)
+              if t.lower() not in STOPWORDS and len(t) > 1]
+    credits = []  # (slug, block ids)
+    seen_slugs: set = set()
+    for kind, slug, heading, _text, _score in results:
+        if kind != "hit" or heading in ("(summary)", "(top)") or slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+        content = _content_blocks(_outl_outline(outl, ws, slug))
+        if not content:
+            continue
+        in_sec = [b for b in content if b["heading"] == heading]
+        pool = in_sec or content
+        matched = [b for b in pool if any(t in b["text"].lower() for t in qterms)]
+        credits.append((slug, [b["id"] for b in (matched or pool)]))
+    if credits:
+        with _sfrec_locked(ws) as sfrec:
+            for slug, ids in credits:
+                _bump_blocks(sfrec, slug, ids, SECTION_HIT_BUMP, today)
 
 
 def _fts_query(q: str) -> str:
@@ -683,7 +720,7 @@ def _heal_count(con, name: str, param) -> int:
     if name == "superseded":  # plain refs INTO a page something supersedes (stale target)
         return con.execute(
             "SELECT COUNT(*) FROM edges WHERE type='refs' "
-            "AND dst IN (SELECT dst FROM edges WHERE type='supersedes')"
+            "AND dst IN (SELECT dst FROM edges WHERE type='supersedes' AND authored=1)"
         ).fetchone()[0]
     if name == "caphubs":  # per-source out-edges beyond the top-N by weight
         n = int(param or 12)
@@ -703,7 +740,7 @@ def _heal_delete(con, name: str, param) -> int:
     elif name == "superseded":
         cur = con.execute(
             "DELETE FROM edges WHERE type='refs' "
-            "AND dst IN (SELECT dst FROM edges WHERE type='supersedes')"
+            "AND dst IN (SELECT dst FROM edges WHERE type='supersedes' AND authored=1)"
         )
     elif name == "caphubs":
         n = int(param or 12)
@@ -784,8 +821,8 @@ def _graph_health(con) -> dict:
     ncomp = len(comp_sizes)
     largest = max(comp_sizes.values()) if comp_sizes else 0
 
-    superseded = sorted({r[0] for r in
-                         con.execute("SELECT DISTINCT dst FROM edges WHERE type='supersedes'")})
+    superseded = sorted({r[0] for r in con.execute(
+        "SELECT DISTINCT dst FROM edges WHERE type='supersedes' AND authored=1")})
     frisk = con.execute(
         "SELECT slug, frecency FROM pages WHERE frecency IS NOT NULL AND frecency <= ? "
         "ORDER BY frecency, slug", (FRECENCY_RISK,)
@@ -1007,28 +1044,63 @@ def _truthy(v) -> bool:
 
 
 # ---------------------------------------------- section-level frecency (ledger)
-# A ws-level JSON ledger {slug: {heading: {"f": frecency, "seen": date}}}. Lives outside
+# A ws-level JSON ledger {slug: {block_id: {"f": frecency, "seen": date}}}. Lives outside
 # .outl/ so `rebuild` never wipes it. See the SECTION_* constants for the decay/credit model.
 def _sfrec_path(ws: str) -> str:
     return os.path.join(ws, ".frecency", "sections.json")
 
 
-def _load_sfrec(ws: str) -> dict:
+def _load_sfrec(ws: str, quarantine: bool = False) -> dict:
+    """The ledger, or {} if absent. An unreadable ledger reads as {}; with `quarantine` (the
+    locked write paths) it is first moved aside so the next save cannot overwrite it unseen."""
+    path = _sfrec_path(ws)
     try:
-        with open(_sfrec_path(ws), "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             d = json.load(f)
-            return d if isinstance(d, dict) else {}
-    except Exception:
+        if not isinstance(d, dict):
+            raise ValueError("not a JSON object")
+        return d
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        if quarantine:
+            aside = f"{path}.corrupt-{int(time.time())}"
+            with contextlib.suppress(OSError):
+                os.replace(path, aside)
+            print(f"memory-index: unreadable {path} ({e}); moved to {aside}, "
+                  f"lines reseed at {SECTION_SEED}", file=sys.stderr)
         return {}
 
 
 def _save_sfrec(ws: str, data: dict):
     path = _sfrec_path(ws)
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".sections.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, separators=(",", ":"), sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+@contextlib.contextmanager
+def _sfrec_locked(ws: str):
+    """Exclusive load-modify-save of the ledger: yields the freshly loaded dict and saves it
+    on a clean exit. Hold it only around in-memory edits — touch, search --credit, and
+    maintain run concurrently from separate hook processes."""
+    path = _sfrec_path(ws)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, separators=(",", ":"), sort_keys=True)
-    os.replace(tmp, path)  # atomic
+    with open(path + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = _load_sfrec(ws, quarantine=True)
+        yield data
+        _save_sfrec(ws, data)
 
 
 # ---------------------------------------------- outl outline + hierarchy helpers
@@ -1042,9 +1114,10 @@ def _outl_outline(outl, ws: str, slug: str):
     """Flat block list for a page via `outl page get --json`. Each entry:
     {id, text, heading, refs, is_head, is_prop}. `heading` is the nearest ancestor
     `## …` section text (or '(top)'); `refs` are [[link]] targets from ref tokens.
-    Returns [] on any failure (missing binary/page/parse)."""
+    Returns None on any failure (missing binary/page/parse), so callers can tell an
+    unreadable page from an empty one."""
     if not outl:
-        return []
+        return None
     try:
         out = subprocess.run(
             [outl, "-w", ws, "page", "get", slug, "--json"],
@@ -1052,7 +1125,7 @@ def _outl_outline(outl, ws: str, slug: str):
         ).stdout
         outline = json.loads(out)["data"]["outline"]
     except Exception:
-        return []
+        return None
     flat = []
 
     def walk(nodes, heading):
@@ -1061,6 +1134,7 @@ def _outl_outline(outl, ws: str, slug: str):
             is_head = bool(_HEAD_RE.match(txt))
             h = txt.lstrip("#").strip() if is_head else heading
             refs = [t.get("value") for t in n.get("tokens", []) if t.get("kind") == "ref"]
+            refs = [r.split("|")[0].split("#")[0].strip() for r in refs if r]
             flat.append({
                 "id": n.get("id"), "text": txt, "heading": h,
                 "refs": [r for r in refs if r],
@@ -1074,15 +1148,16 @@ def _outl_outline(outl, ws: str, slug: str):
 
 def _content_blocks(blocks):
     """Trackable body lines: real content bullets, not headings or frontmatter props."""
-    return [b for b in blocks if b["id"] and not b["is_head"] and not b["is_prop"] and b["text"]]
+    return [b for b in blocks or [] if b["id"] and not b["is_head"] and not b["is_prop"] and b["text"]]
 
 
 def _part_of_maps(con):
-    """(parent_of, children_of) from the derived `part-of` edges (src=child, dst=parent).
-    Authoritative for hierarchy regardless of whether `parent::` is hoisted to frontmatter
-    or authored as a body bullet — the edge is built from either."""
+    """(parent_of, children_of) from AUTHORED `part-of` edges (src=child, dst=parent), i.e.
+    `parent::` props, hoisted or as a body bullet. Prose that merely says "under [[x]]" is
+    an inferred label and never makes a page part of x's eviction subtree."""
     parent_of, children_of = {}, {}
-    for src, dst in con.execute("SELECT src, dst FROM edges WHERE type='part-of'"):
+    for src, dst in con.execute(
+            "SELECT src, dst FROM edges WHERE type='part-of' AND authored=1"):
         parent_of.setdefault(src, dst)
         children_of.setdefault(dst, set()).add(src)
     return parent_of, children_of
@@ -1133,15 +1208,14 @@ def _bump_blocks(sfrec: dict, slug: str, block_ids, amount: int, today: str):
 _REF_PAT_CACHE: dict = {}
 
 
-def _strip_ref(text: str, target: str) -> str:
+def _unlink_ref(text: str, target: str) -> str:
+    """`[[target]]`, `[[target#sec]]`, `[[target|alias]]` → plain text (the alias, else the
+    slug), so the surrounding prose still reads once the target page is gone."""
     pat = _REF_PAT_CACHE.get(target)
     if pat is None:
-        pat = re.compile(r"\[\[" + re.escape(target) + r"(?:\|[^\]]*)?\]\]")
+        pat = re.compile(r"\[\[" + re.escape(target) + r"(?:#[^\]|]*)?(?:\|([^\]]*))?\]\]")
         _REF_PAT_CACHE[target] = pat
-    t = pat.sub("", text)
-    t = re.sub(r"\s{2,}", " ", t)
-    t = re.sub(r"(^\s*[—–-]\s*|\s*[—–-]\s*$)", "", t)
-    return t.strip()
+    return pat.sub(lambda m: (m.group(1) or "").strip() or target, text)
 
 
 def _outl_run(outl, ws: str, args) -> bool:
@@ -1162,15 +1236,14 @@ def _evict_block(outl, ws, bid):
 
 
 def _scrub_ref_block(outl, ws, block, dead):
-    """Remove [[dead…]] refs from one surviving block. Delete the block outright when it
-    was a pointer entry (led with the ref, nothing meaningful left); else rewrite its text."""
+    """Unlink [[dead…]] refs in one surviving block. A pointer entry (led with a link and
+    links nothing once the dead ones are gone, e.g. a TOC bullet) is deleted; any other
+    block keeps its prose with each dead link replaced by its plain text."""
     text = block["text"]
     new = text
     for d in dead:
-        new = _strip_ref(new, d)
-    still_links = "[[" in new
-    leads_with_ref = text.lstrip().startswith("[[")
-    if not re.search(r"[A-Za-z0-9]", new) or (leads_with_ref and not still_links):
+        new = _unlink_ref(new, d)
+    if text.lstrip().startswith("[[") and "[[" not in new:
         _evict_block(outl, ws, block["id"])
     else:
         _outl_run(outl, ws, ["block", "update", block["id"], "--text", new])
@@ -1179,24 +1252,28 @@ def _scrub_ref_block(outl, ws, block, dead):
 def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
     """Daily frecency sweep + silent, mechanical eviction. Frecency is the SOLE retention
     metric for this decay-cache memory: every page (leaf AND moc) and every content block
-    decays −1/day unless credited today; `touch`/`search --credit` reinforce on use and
-    propagate up the parent chain. Anything reaching 0 is FORGOTTEN — no prompt, no message:
+    decays −1 per sweep (at most once a day, via the seen guard) unless credited today;
+    `touch`/`search --credit` reinforce on use and propagate up the parent chain. Anything
+    reaching 0 is FORGOTTEN — no prompt, no message:
       * content block → 0 : delete just that block (the file stays).
-      * knowledge leaf → 0: soft-trash the page; scrub [[it]] from every survivor; parent stays.
-      * moc/toc → 0       : soft-trash the moc AND its whole subtree; scrub inbound refs.
+      * knowledge leaf → 0: soft-trash the page; unlink [[it]] in every survivor; parent stays.
+      * moc/toc → 0       : soft-trash the moc AND its authored parent:: subtree; unlink refs.
     All mutations go through outl (page/block delete/update); the sqlite index is refreshed
-    after. `--dry-run` writes nothing and only reports (used for split-candidate discovery)."""
+    first (hierarchy) and after. `--dry-run` changes no markdown and only reports (used for
+    split-candidate discovery)."""
     outl = _outl_bin()
     if outl is None and not dry_run:
         print("memory-index maintain: outl binary not found; cannot evict", file=sys.stderr)
         return 3
 
-    sfrec = _load_sfrec(ws)
     decayed, split_cands = [], []
     dead: list[str] = []                  # pages that reached frecency 0 this sweep
     block_evict: dict[str, set] = {}
-    all_blocks: dict[str, list] = {}
+    outlines: dict = {}                   # slug -> flat blocks, or None if unreadable
 
+    # Hierarchy comes from the index, so bring it up to date with the markdown first: a
+    # leaf re-parented since the last refresh must not die with its old parent.
+    cmd_refresh(ws, None, quiet=True)
     con = _open_current(ws)
     _parent_of, child_map = _part_of_maps(con)
     con.close()
@@ -1231,30 +1308,37 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
             if new <= 0:
                 dead.append(slug)
 
-        # Block-level decay (real content lines only). Read-only outl calls, skipped in dry-run.
+        # Block outlines for line decay and the ref scrub. Read-only, skipped in dry-run.
         if not dry_run and outl:
-            blocks = _outl_outline(outl, ws, slug)
-            all_blocks[slug] = blocks
-            page_led = sfrec.setdefault(slug, {})
-            live_ids = set()
-            for b in _content_blocks(blocks):
-                live_ids.add(b["id"])
-                rec = page_led.get(b["id"]) or {"f": SECTION_SEED, "seen": ""}
-                if rec.get("seen") == today:
-                    page_led[b["id"]] = rec
-                    continue
-                rec["f"] = int(rec.get("f", SECTION_SEED)) - 1
-                rec["seen"] = today
-                page_led[b["id"]] = rec
-                if rec["f"] <= SECTION_PRUNE:
-                    block_evict.setdefault(slug, set()).add(b["id"])
-            for bid in list(page_led.keys()):  # GC ledger ids no longer present in the page
-                if bid not in live_ids:
-                    del page_led[bid]
+            outlines[slug] = _outl_outline(outl, ws, slug)
 
-    # A dead page takes its whole subtree with it (a moc == a page with children). Upward
-    # credit propagation guarantees a page only reaches 0 once its entire subtree is cold, so
-    # the cascade is safe. Journals are excluded (retention/consolidation own their lifecycle).
+    # Block-level decay (real content lines only), on the ledger as it is NOW: a touch or
+    # search credit that landed during the outline reads above is kept, not overwritten.
+    if not dry_run and outl:
+        with _sfrec_locked(ws) as sfrec:
+            for slug, blocks in outlines.items():
+                if blocks is None:  # unreadable outline: leave this page's ledger untouched
+                    continue
+                page_led = sfrec.setdefault(slug, {})
+                live_ids = set()
+                for b in _content_blocks(blocks):
+                    live_ids.add(b["id"])
+                    rec = page_led.get(b["id"]) or {"f": SECTION_SEED, "seen": ""}
+                    if rec.get("seen") == today:
+                        page_led[b["id"]] = rec
+                        continue
+                    rec["f"] = int(rec.get("f", SECTION_SEED)) - 1
+                    rec["seen"] = today
+                    page_led[b["id"]] = rec
+                    if rec["f"] <= SECTION_PRUNE:
+                        block_evict.setdefault(slug, set()).add(b["id"])
+                for bid in list(page_led.keys()):  # GC ledger ids no longer present in the page
+                    if bid not in live_ids:
+                        del page_led[bid]
+
+    # A dead page takes its authored parent:: subtree with it (a moc == a page with
+    # children). Upward credit propagation keeps a page warm while anything beneath it is
+    # used. Journals are excluded (retention/consolidation own their lifecycle).
     dead_set: set = set()
     stack = list(dead)
     while stack:
@@ -1267,34 +1351,36 @@ def cmd_maintain(ws: str, today: str, dry_run: bool, as_json: bool):
 
     evicted_pages, evicted_blocks = [], []
     if not dry_run and outl:
-        # 1) scrub inbound refs to any dead slug from SURVIVOR blocks (no dangling links left)
-        if dead_set:
-            for slug, path, fm, typ in pages:
-                if slug in dead_set:
-                    continue
-                for b in all_blocks.get(slug, []):
-                    if b["is_prop"] or not b["id"]:
-                        continue
-                    hits = [d for d in b["refs"] if d in dead_set]
-                    if hits:
-                        _scrub_ref_block(outl, ws, b, hits)
-        # 2) soft-trash every dead page (leaf, or moc + its whole subtree)
-        for slug in dead_set:
+        # 1) soft-trash every dead page (leaf, or moc + its whole subtree)
+        for slug in sorted(dead_set):
             if _evict_page(outl, ws, slug):
                 evicted_pages.append(slug)
-            sfrec.pop(slug, None)
+        gone = set(evicted_pages)
+        # 2) unlink refs to pages actually gone, in every surviving page (no dangling links)
+        if gone:
+            for slug, path, fm, typ in pages:
+                if slug in gone:
+                    continue
+                for b in outlines.get(slug) or []:
+                    if b["is_prop"] or not b["id"]:
+                        continue
+                    hits = [d for d in b["refs"] if d in gone]
+                    if hits:
+                        _scrub_ref_block(outl, ws, b, hits)
         # 3) line-level: delete dead content blocks on surviving pages
         for slug, ids in block_evict.items():
-            if slug in dead_set:
+            if slug in gone:
                 continue
             for bid in ids:
                 if _evict_block(outl, ws, bid):
                     evicted_blocks.append(f"{slug}:{bid}")
-                sfrec.get(slug, {}).pop(bid, None)
-
-    if not dry_run:
-        _save_sfrec(ws, sfrec)
         if evicted_pages or evicted_blocks:
+            with _sfrec_locked(ws) as sfrec:
+                for slug in evicted_pages:
+                    sfrec.pop(slug, None)
+                for ref in evicted_blocks:
+                    slug, bid = ref.split(":", 1)
+                    sfrec.get(slug, {}).pop(bid, None)
             cmd_refresh(ws, None, quiet=True)
 
     split_cands.sort(key=lambda d: d["tokens"], reverse=True)
@@ -1315,7 +1401,7 @@ def cmd_touch(ws: str, slugs, today: str, bump: int, as_json: bool):
     """Credit a material USE and keep the whole access PATH warm. Bumps the page's frecency,
     its content blocks, AND every ancestor moc/toc up the `parent::` chain (using a memory
     means using the index that led to it — so an index never dies while a memory reached
-    through it stays live). Decay's counterpart: `maintain` −1/day, `touch` reinforces on use.
+    through it stays live). Decay's counterpart: `maintain` −1 per sweep, `touch` reinforces on use.
     Any page type is eligible (leaf or moc); missing pages are skipped. Called by the
     PostToolUse(outl_page_get) hook and safe to run by hand."""
     outl = _outl_bin()
@@ -1323,8 +1409,7 @@ def cmd_touch(ws: str, slugs, today: str, bump: int, as_json: bool):
         print("memory-index touch: outl binary not found; cannot write props", file=sys.stderr)
         return 3
     touched, skipped = [], []
-    sfrec = _load_sfrec(ws)
-    sfrec_dirty = False
+    credits = []  # (slug, content block ids) — applied in one locked ledger update below
     bumped: set = set()
     con = _open_current(ws)
     parent_of, _children = _part_of_maps(con)
@@ -1340,8 +1425,7 @@ def cmd_touch(ws: str, slugs, today: str, bump: int, as_json: bool):
         # search HIT credits the matched lines more precisely (see cmd_search --credit).
         content = _content_blocks(_outl_outline(outl, ws, slug))
         if content:
-            _bump_blocks(sfrec, slug, [b["id"] for b in content], SECTION_PAGEGET_BUMP, today)
-            sfrec_dirty = True
+            credits.append((slug, [b["id"] for b in content]))
         # Keep the pathway warm: propagate the bump up the parent chain to the root index.
         for anc in _ancestors(parent_of, slug):
             if anc in bumped:
@@ -1350,8 +1434,10 @@ def cmd_touch(ws: str, slugs, today: str, bump: int, as_json: bool):
             if ar is not None:
                 bumped.add(anc)
                 touched.append({"slug": anc, "from": ar[0], "to": ar[1], "via": slug})
-    if sfrec_dirty:
-        _save_sfrec(ws, sfrec)
+    if credits:
+        with _sfrec_locked(ws) as sfrec:
+            for slug, ids in credits:
+                _bump_blocks(sfrec, slug, ids, SECTION_PAGEGET_BUMP, today)
     if touched:
         cmd_refresh(ws, None, quiet=True)  # reflect the bumped frontmatter in the index
     result = {"date": today, "bump": bump, "touched": touched, "skipped": skipped}
@@ -1474,7 +1560,8 @@ def main(argv=None):
     sp.add_argument("--no-graph", action="store_true")
     sp.add_argument("--json", action="store_true", help="machine-readable results (for hooks)")
     sp.add_argument("--credit", action="store_true",
-                    help="credit section frecency for each keyword hit's section (for the push hook)")
+                    help="credit line frecency for each keyword hit's section, in a detached "
+                         "process after the results are printed (for the push hook)")
     ss = sub.add_parser("stats")
     ss.add_argument("--json", action="store_true")
     st = sub.add_parser("touch", help="credit a use: frecency += bump on the named knowledge leaves")

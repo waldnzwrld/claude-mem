@@ -59,6 +59,23 @@ def walk(ns):
         if walk(n.get('children',[])): return True
     return False
 walk(o)"; }
+# yes = some block of page $2 has exactly the text $3
+hastext(){ "$OUTL" -w "$1" page get "$2" --json 2>/dev/null | python3 -c "
+import sys,json
+want=sys.argv[1]
+def walk(ns):
+    return any((n.get('text') or '').strip()==want or walk(n.get('children',[])) for n in ns)
+print('yes' if walk(json.load(sys.stdin)['data']['outline']) else 'no')" "$3"; }
+# id of the first block of page $2 whose text starts with $3
+blockid(){ "$OUTL" -w "$1" page get "$2" --json 2>/dev/null | python3 -c "
+import sys,json
+pre=sys.argv[1]
+def walk(ns):
+    for n in ns:
+        if (n.get('text') or '').strip().startswith(pre): print(n['id']); return True
+        if walk(n.get('children',[])): return True
+    return False
+walk(json.load(sys.stdin)['data']['outline'])" "$3"; }
 evicted_json(){ "$MI" -w "$1" maintain --json 2>/dev/null; }
 jq_py(){ python3 -c "import sys,json;d=json.load(sys.stdin);print($1)"; }
 
@@ -85,6 +102,7 @@ check "leaf file removed"        "$(gone "$W" alpha-stale)" "yes"
 check "parent proj-alpha survives" "$(here "$W" proj-alpha)" "yes"
 check "TOC ref scrubbed (proj-alpha)" "$(noref "$W" proj-alpha alpha-stale)" "yes"
 check "inline ref scrubbed (alpha-notes)" "$(noref "$W" alpha-notes alpha-stale)" "yes"
+check "inline ref unlinked to plain text" "$(hastext "$W" alpha-notes 'a cross-reference to alpha-stale which may age out')" "yes"
 check "alpha-notes still present" "$(here "$W" alpha-notes)" "yes"
 
 echo "[4] moc cascade (moc=0 -> whole subtree gone, rest survives)"
@@ -147,6 +165,26 @@ check "summary captured from bullet" "$(pcol "$W" bullet-probe summary)" "probe 
 check "updated captured from bullet" "$(pcol "$W" bullet-probe updated)"  "2020-02-02"
 FTS="$("$MI" -w "$W" search "quarterly" --no-graph --json 2>/dev/null | jq_py "any(r.get('slug')=='bullet-probe' for r in d['results'])")"
 check "summary text reached FTS"     "$FTS" "True"
+
+echo "[11] prose wording never steers (only authored parent::/supersedes:: do)"
+W="$(setup s11)"
+"$OUTL" -w "$W" page create gamma-notes --title "Gamma notes" \
+  --content '[{"text":"type:: knowledge"},{"text":"parent:: [[misc]]"},{"text":"## Notes"},{"text":"historically filed under [[proj-beta]]"},{"text":"this replaces [[alpha-decisions]] for gamma"}]' >/dev/null 2>&1
+"$MI" -w "$W" rebuild >/dev/null 2>&1
+check "prose 'replaces' supersedes nothing" "$("$MI" -w "$W" doctor --json 2>/dev/null | jq_py "d['superseded_targets']")" "[]"
+frec "$W" proj-beta 1
+evicted_json "$W" >/dev/null
+check "authored child beta-notes cascades" "$(gone "$W" beta-notes)" "yes"
+check "prose 'under [[proj-beta]]' page survives" "$(here "$W" gamma-notes)" "yes"
+check "its dead link reads as plain text" "$(hastext "$W" gamma-notes 'historically filed under proj-beta')" "yes"
+
+echo "[12] maintain sees a re-parent made since the last index refresh"
+W="$(setup s12)"
+"$OUTL" -w "$W" block update "$(blockid "$W" beta-notes 'parent::')" --text 'parent:: [[misc]]' >/dev/null 2>&1
+frec "$W" proj-beta 1
+evicted_json "$W" >/dev/null
+check "old parent proj-beta evicted" "$(gone "$W" proj-beta)" "yes"
+check "re-parented beta-notes survives" "$(here "$W" beta-notes)" "yes"
 
 echo
 printf 'TOTAL: \033[32m%d passed\033[0m, ' "$PASS"

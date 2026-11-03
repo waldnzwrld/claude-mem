@@ -45,8 +45,8 @@ scratch project whose `.omp/mcp.json` points outl at the copy, loading only the 
 copy with `direct` exposure, adding the repo's `pi/llm-harness-memory.ts` with `-e`. pi uses its
 own default
 model unless `MEMORY_MODEL` is set. Every way, `MEMORY_WS=<copy>` makes every hook/script target
-the copy, and `memory-consolidate` scopes its distiller's outl MCP to the workspace it manages
-(`memory-agent --ws`).
+the copy, and `memory-consolidate` and `memory-dump` scope their agent's outl MCP to the
+workspace they manage (`memory-agent --ws`).
 
 ## What it covers
 
@@ -54,13 +54,16 @@ the copy, and `memory-consolidate` scopes its distiller's outl MCP to the worksp
 |---|----------|--------|
 | 1 | graph sanity | rebuild + `part-of` edges |
 | 2 | touch propagation | credit flows leaf → parent moc → root index |
-| 3 | leaf eviction | frecency 0 soft-trashes the leaf; inbound `[[refs]]` scrubbed (TOC bullet deleted, inline ref rewritten); parent survives |
+| 3 | leaf eviction | frecency 0 soft-trashes the leaf; inbound `[[refs]]` unlinked (TOC bullet deleted, inline ref rewritten to its plain slug); parent survives |
 | 4 | moc cascade | a page-with-children at 0 takes its whole subtree; unrelated tree survives |
 | 5 | block eviction | a line whose block-frecency hit 0 is removed; the file lives |
 | 6 | pin decay | `pin:: true` is **not** exempt — it evicts at 0 |
 | 7 | split detection | oversized leaf flagged as a split candidate |
 | 8 | consolidation reap | a journal marked `consolidated::` is reaped; pending backlog detected |
 | 9 | healthy baseline | a hot graph evicts nothing |
+| 10 | body-bullet props | `summary::`/`updated::` written as body bullets are indexed |
+| 11 | prose never steers | "under [[x]]" / "replaces [[x]]" wording neither cascades an eviction nor marks a page superseded; only authored `parent::`/`supersedes::` do |
+| 12 | stale hierarchy | a re-parent made since the last index refresh is honoured by `maintain` |
 
 ### `verify-agent.sh` (agent-in-the-loop)
 

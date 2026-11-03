@@ -2,18 +2,16 @@
 #
 # memory-consolidate — automatic, headless compaction of the memory graph.
 #
-# One headless agent handles three backlogs in a single pass:
+# One headless agent handles two backlogs in a single pass:
 #   * journals — distil aged, un-`consolidated::` journals into knowledge leaves,
 #     mark each `consolidated:: <today>`, then reap (delete) the marked ones.
-#   * split    — carve a `type:: knowledge` leaf grown past the load budget
-#     (MEMORY_SPLIT_TOKENS) into a TOC + `<slug>-<section>` child leaves.
-#   * prune    — delete (soft/recoverable) a leaf whose frecency decayed to 0,
-#     after cleaning up its parent-TOC link, or bump it if it still earns a place.
-# Reaping and candidate detection are mechanical (`memory-index`); the distil,
-# split, and keep-vs-delete calls need an LLM, so this spawns a detached, headless
-# agent via `memory-agent` (claude -p, omp -p, or pi -p, per MEMORY_HARNESS) per
-# ~/.llm-harness-memory/AGENTS.md. The SessionStart hook backgrounds this whenever any
-# backlog exists.
+#   * split    — carve a page grown past the load budget (MEMORY_SPLIT_TOKENS) into a
+#     TOC + `<slug>-<section>` child leaves.
+# Decay and eviction are mechanical and live in `memory-index maintain`. Reaping and
+# candidate detection are mechanical too; distilling and splitting need an LLM, so this
+# spawns a detached, headless agent via `memory-agent` (claude -p, omp -p, or pi -p, per
+# MEMORY_HARNESS) per ~/.llm-harness-memory/AGENTS.md. The SessionStart hook backgrounds
+# this whenever any backlog exists.
 #
 # Safe to run any time and repeatedly: it no-ops when nothing is pending,
 # single-instances via a lock, and refuses to recurse into the agent it spawns.
@@ -50,13 +48,11 @@ except Exception:
 
 pend="$(pending)"
 
-# Split candidates only. All pruning/eviction is now MECHANICAL and SILENT in
+# Split candidates only. All pruning/eviction is MECHANICAL and SILENT in
 # `memory-index maintain` (frecency 0 -> forgotten, no LLM); the agent handles only the two
-# generative jobs left — distilling journals and splitting oversized pages. The SessionStart
-# hook passes the authoritative sweep JSON via MEMORY_CONSOLIDATE_SWEEP; standalone, fall back
-# to a dry-run sweep (read-only, so it never double-decays).
-sweep="${MEMORY_CONSOLIDATE_SWEEP:-}"
-[ -z "$sweep" ] && sweep="$("$MEMIDX" -w "$WS" maintain --dry-run --json 2>/dev/null)"
+# generative jobs left — distilling journals and splitting oversized pages. Candidates come
+# from a dry-run sweep (no markdown changes, so it never double-decays).
+sweep="$("$MEMIDX" -w "$WS" maintain --dry-run --json 2>/dev/null)"
 split_slugs="$(printf '%s' "$sweep" | python3 -c 'import sys, json
 try:
     c = json.load(sys.stdin).get("split_candidates", [])

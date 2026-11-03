@@ -55,18 +55,18 @@ context, and the daily housekeeping are all derived from it and rebuildable from
   to flush anything uncaptured. The **5 most recent** journals are kept; older ones are distilled
   into the knowledge tree and reaped.
 - **Knowledge pages** (`pages/*.md`) are a TOC tree linked by typed `[[wikilinks]]`. Retention
-  is by **frecency**: `frecency::` is a checkpoint stamped at `seen::`, and effective frecency =
-  `frecency − days_since(seen)`. A leaf/line is evicted at effective ≤ 0 (mechanical, no review).
-  A fetch credits the page +5 (cap 60), stamps `seen = today`, and propagates +5 up the
-  `parent::` chain. The daily sweep writes only evictions.
+  is by **frecency**: every page carries `frecency::`/`seen::`, and every content line has a
+  score in a ledger. The daily sweep (`memory-index maintain`, on the first session of each day)
+  decays every page and line not credited that day by 1 and evicts anything at ≤ 0 (mechanical,
+  no review). Days without a session don't decay, so a fresh node (seed 30) lasts ~30 days of
+  use. A fetch credits the page +5 (cap 60), stamps `seen = today`, and propagates +5 up the
+  `parent::` chain.
 - **Retrieval auto-scales.** Below a node threshold, memory is read by TOC descent; at/above it,
   `memory-index search` is the entry point. The hook reports which regime is active.
 - **Push-retrieval.** A `UserPromptSubmit` hook runs the index against each prompt and injects
-  strong hits as pointers. Gated: index active, bm25 ceiling, ≤3 pointers, per-session dedup.
-  Crediting runs in the background; `outl_page_get` also credits frecency via a `PostToolUse` hook.
-- **Tags** are a curated `#tag` facet layer, orthogonal to `[[links]]`. `memory-index search`
-  expands along shared `#topic/…` tags in parallel with the link walk. Numeric/off-vocabulary
-  tags are filtered out; PR/issue `#numbers` are excluded and normalized on install.
+  strong hits as pointers. Gated: ≥2 content terms, bm25 ceiling, ≤3 pointers, per-session
+  dedup; skipped inside the background agents. Crediting runs in the background;
+  `outl_page_get` also credits frecency via a `PostToolUse` hook.
 
 ## Components
 
@@ -79,7 +79,7 @@ Deployed by `install.sh`. Shared by every harness:
 | `memory-index` | `~/.local/bin/` | Stdlib-only SQLite retrieval sidecar (see below). |
 | `memory-agent` | `~/.local/bin/` | Runs one headless maintenance agent on the harness that fired the hook (`MEMORY_HARNESS`: `claude -p`, `omp -p`, or `pi -p`). `--ws DIR` scopes its outl MCP server to a workspace. Also manages the model those agents use (`--harness H --list-models / --get-model / --set-model / --unset-model`; see [Memory model](#memory-model)). |
 | `memory-consolidate` | `~/.local/bin/` | Headless agent (via `memory-agent`) that distills aged journals into knowledge pages, then reaps them. Single-instanced. |
-| `memory-dump` | `~/.local/bin/` | SessionEnd journaler: a detached headless agent (via `memory-agent`) that appends durable facts to today's journal, deduped. Skips sessions with no tool use; head/tail-truncates long transcripts. Edits only the journal. |
+| `memory-dump` | `~/.local/bin/` | SessionEnd journaler: a detached headless agent (via `memory-agent`, scoped to the workspace) that appends durable facts to today's journal, deduped, and writes impactful ones through to their knowledge leaf. Skips transcripts under `MEMORY_DUMP_MIN_LINES` lines (default 8). Single-instanced: a session that ends while a dump runs is queued and journaled after it. |
 
 Per harness:
 
@@ -100,55 +100,42 @@ network. Delete the index and `rebuild` reconstructs it from the markdown.
   across three columns (title ≫ heading ≫ body).
 - **Graph expansion:** a recursive walk of the typed, weighted `[[link]]` edge table outward
   from the keyword hits. Edge type (`refs` / `supersedes` / `contradicts` / `part-of`) is
-  inferred from the wording around each link; the markdown is never annotated. Hop depth scales
-  with graph size (1 → 2 → 3).
-- **Tag expansion:** a parallel axis from the same seeds (and any `#topic/…` named in the query)
-  that pulls pages sharing a curated `#tag` via an indexed join. Numeric/off-vocabulary tags are
-  filtered; `[[links]]` keep ranking primacy (tags are additive, never structural).
+  authored by a prop (`supersedes::`, `contradicts::`, `parent::`) or inferred from whole words
+  on the link's line. Only authored types steer: the walk hides a page an authored
+  `supersedes::` names, and eviction cascades and parent-chain credit follow `parent::`.
+  Inferred types are labels. Hop depth scales with graph size (1 → 2 → 3).
 
 ```
 memory-index rebuild        # full reindex from markdown (idempotent)
 memory-index refresh        # incremental: reindex only pages whose content changed
-memory-index search "q"     # field-weighted bm25 hits + [[link]] graph walk + tag expansion
+memory-index search "q"     # field-weighted bm25 hits + [[link]] graph walk
                             #   (--json for machine output; consumed by the push hook)
 memory-index touch <slug>…  # credit a use: frecency +5 (cap 60), seen=today, up the parent chain
 memory-index stats          # node/chunk/edge counts, freshness, active/inactive
-memory-index doctor         # read-only health report: link graph + tag-noise (--json)
+memory-index doctor         # read-only health report: link graph + props the parser misses (--json)
 memory-index medic          # prune pathological edges from the index (--dry-run, --off)
-memory-index maintain       # daily lazy-decay sweep: evict at effective 0, stamp seen on first
-                            #   sight; reports split candidates
+memory-index maintain       # daily sweep: −1 per page/line not credited today, evict at 0,
+                            #   unlink refs to evicted pages; reports split candidates
 memory-index consolidate    # journal-consolidation backlog; --reap deletes aged journals
                             #   the distiller marked `consolidated::`
-memory-index normalize      # migrate the graph to the current standard (versioned, idempotent):
-                            #   --status | --apply | --force
 ```
 
-`search` flags: `-k N` (result count), `--no-graph` (keyword only). Workspace: `-w <dir>`
-(default `~/.llm-harness-memory`, or `$MEMORY_WS`).
+`search` flags: `-k N` (result count), `--no-graph` (keyword only), `--json`, `--credit` (credit
+the hit lines' frecency, detached after printing). Workspace: `-w <dir>` (default
+`~/.llm-harness-memory`, or `$MEMORY_WS`).
 
 ### `doctor` and `medic`
 
 Both operate on the derived index only and never edit the markdown.
 
 - **`doctor`** — read-only report: orphans, dangling `[[links]]`, connected components, hub node,
-  superseded targets, effective-frecency decay-risk, and **tag-noise** (numeric/off-vocabulary
-  `#tags`). Performance-first verdict; `--json` for scripts.
+  authored-superseded targets, page and line frecency decay-risk, and `frecency::`/`seen::`/
+  `title::`/`icon::` written as body bullets (invisible to the parser). `--json` for scripts.
 - **`medic`** — prunes pathological edges from the index: dangling links and self-loops by
   default; opt-in `--cap-hubs N` and `--prune-superseded`. The heal set is persisted as a policy
   and re-applied on every `refresh`. `--dry-run` previews; `--off` restores edges from markdown.
   Dead `[[links]]` stay in the source (they may be intentional placeholders); the medic only
   stops the graph walk from traversing them.
-
-### `normalize` — migrate to the current standard
-
-Conventions apply retroactively. `memory-index normalize` brings the existing graph up to the
-current standard, versioned by a `.standard-version` marker (idempotent; a no-op once current).
-`install.sh` runs it after an `outl backup`. Flags: `--status`, `--apply`, `--force`.
-
-Migration v1 strips PR/issue `#`-number tags: drop the `#`, adding `PR` only when not already
-labeled (`closed #450` → `closed PR 450`, `PR #272` → `PR 272`, `PR#273` → `PR 273`). Markdown
-links `[#272](url)` and non-references like `C#9` are left untouched. A block `outl` refuses to
-rewrite (e.g. a journal whose `.md` is ahead of the op log) is skipped and flagged by `doctor`.
 
 ## Installation
 
@@ -182,7 +169,10 @@ Deploy:
 
 Shared for every harness, `install.sh` copies `AGENTS.md` into the workspace and the binaries
 into `~/.local/bin`, patches the `outl` path in `memory-hook` and `memory-agent` for this
-machine's Homebrew, and builds the index.
+machine's Homebrew, sets the workspace's journal template page (`templates-journal`, which outl
+copies into each new daily journal) to the sections in `templates-journal.md`, and builds the
+index. The template step needs an initialized workspace; a template whose sections differ is
+rewritten (old blocks go to outl's trash).
 
 - **Claude Code:** wires the SessionStart + PreCompact + SessionEnd + UserPromptSubmit +
   PostToolUse(`outl_page_get`) hooks into `~/.claude/settings.json`, allows the outl MCP server,
