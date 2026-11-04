@@ -28,6 +28,33 @@ agent_ok() { [ -x "$AGENT" ] && "$AGENT" --available; }
 WS="${MEMORY_WS:-$HOME/.llm-harness-memory}"   # override targets an isolated workspace (tests)
 MARKER="$WS/.last-session-date"
 ATTEMPTS="$WS/.consolidate-attempts"    # per-journal count of consecutive auto-consolidation attempts
+
+# ---- single-instance lock: an atomic mkdir dir holding its holder's PID (macOS has no flock).
+# The lock is stale only once that process is gone, so a long run is never taken over. A
+# PID-less lock (mid-acquire, or left by an older version) counts as live until 60 min old.
+lock_live() {
+  local pid
+  pid="$(cat "$1/pid" 2>/dev/null)"
+  case "$pid" in
+    ''|*[!0-9]*) [ -d "$1" ] && [ -z "$(find "$1" -maxdepth 0 -mmin +60 2>/dev/null)" ] ;;
+    *) kill -0 "$pid" 2>/dev/null ;;
+  esac
+}
+# lock_take <dir>: 0 if acquired (recording $$). A stale lock is cleared under a short-lived
+# takeover mutex, so two contenders can never both clear it and both acquire.
+lock_take() {
+  if ! mkdir "$1" 2>/dev/null; then
+    lock_live "$1" && return 1
+    [ -n "$(find "$1.takeover" -maxdepth 0 -mmin +1 2>/dev/null)" ] && rm -rf "$1.takeover"
+    mkdir "$1.takeover" 2>/dev/null || return 1
+    if lock_live "$1" || { rm -rf "$1"; ! mkdir "$1" 2>/dev/null; }; then
+      rmdir "$1.takeover" 2>/dev/null
+      return 1
+    fi
+    rmdir "$1.takeover" 2>/dev/null
+  fi
+  printf '%s' "$$" > "$1/pid"
+}
 MAX_CONSOLIDATE_ATTEMPTS=2              # auto-retry a stuck journal this many times, then surface it
 TODAY="$(date +%F)"
 # Set inside the headless agents this system spawns (memory-consolidate, memory-dump): their
@@ -263,8 +290,7 @@ try:
 except Exception:
     print("")' 2>/dev/null)"
   fi
-  if [ -n "$pend" ] && [ -d "$WS/.consolidate.lock.d" ] \
-     && [ -z "$(find "$WS/.consolidate.lock.d" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
+  if [ -n "$pend" ] && lock_live "$WS/.consolidate.lock.d"; then
     # A background run holds the consolidation lock: not a failed attempt, nothing to launch.
     ctx+="Memory consolidation is already running in a background agent for aged journals ($pend) — it will distill them into the knowledge tree and reap them. Do NOT consolidate or delete journals yourself."$'\n\n'
   elif [ -n "$pend" ]; then
@@ -304,15 +330,16 @@ except Exception:
 fi
 
 # Once-per-new-day work (frecency sweep). Left to the next interactive session when headless.
-# The day is claimed atomically (mkdir), so simultaneous session starts cannot both decay. The
-# marker is written only once maintain succeeds; a failed sweep releases the claim so the next
-# session retries (maintain's seen guard keeps a retry from decaying anything twice).
+# The day is claimed with a lock held by the background sweep's PID, so simultaneous session
+# starts cannot both decay. The marker is written only once maintain succeeds; a failed sweep
+# releases the claim and a killed one leaves a dead PID, so either way the next session retries
+# (maintain's seen guard keeps a retry from decaying anything twice).
 last=""
 [ -f "$MARKER" ] && last="$(cat "$MARKER" 2>/dev/null)"
 claim="$WS/.sweep-$TODAY.lock.d"
-if [ -z "$HEADLESS" ] && [ "$last" != "$TODAY" ] && [ -x "$MEMIDX" ] && mkdir "$claim" 2>/dev/null; then
+if [ -z "$HEADLESS" ] && [ "$last" != "$TODAY" ] && [ -x "$MEMIDX" ] && lock_take "$claim"; then
   for old in "$WS"/.sweep-*.lock.d; do  # claims left by a sweep killed on an earlier day
-    [ "$old" = "$claim" ] || rmdir "$old" 2>/dev/null
+    [ "$old" = "$claim" ] || rm -rf "$old"
   done
   # Frecency sweep (silent, mechanical): decay every page + content line by 1 and EVICT
   # anything that reached 0 — soft-trash + reference unlink, no prompt and no message. Then
@@ -322,12 +349,14 @@ if [ -z "$HEADLESS" ] && [ "$last" != "$TODAY" ] && [ -x "$MEMIDX" ] && mkdir "$
     if "$MEMIDX" -w "$WS" maintain >/dev/null 2>&1; then
       printf '%s' "$TODAY" > "$MARKER" 2>/dev/null
     fi
-    rmdir "$claim" 2>/dev/null
+    rm -rf "$claim"
     "$MEMIDX" -w "$WS" refresh >/dev/null 2>&1
     if [ -x "$CONS" ] && agent_ok; then
       "$CONS" >/dev/null 2>&1
     fi
   ) >/dev/null 2>&1 &
+  # The claim belongs to the sweep, not this short-lived hook (bash 3.2 has no $BASHPID).
+  [ -d "$claim" ] && printf '%s' "$!" 2>/dev/null > "$claim/pid"
   disown 2>/dev/null || true
 fi
 

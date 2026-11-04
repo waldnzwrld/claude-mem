@@ -186,6 +186,26 @@ evicted_json "$W" >/dev/null
 check "old parent proj-beta evicted" "$(gone "$W" proj-beta)" "yes"
 check "re-parented beta-notes survives" "$(here "$W" beta-notes)" "yes"
 
+echo "[13] single-instance lock: only a dead holder's lock is taken over (memory-dump)"
+W="$TMPROOT/s13"; mkdir -p "$W"
+STUB="$TMPROOT/stub-agent"
+printf '#!/bin/sh\n[ "$1" = --available ] && exit 0\necho ran >> "%s/agent.log"\n' "$W" > "$STUB"; chmod +x "$STUB"
+seq 1 20 > "$W/t.jsonl"
+dump(){ MEMORY_WS="$W" MEMORY_AGENT_BIN="$STUB" MEMORY_DUMP_TRANSCRIPT="$W/t.jsonl" "$REPO/memory-dump"; }
+runs(){ [ -f "$W/agent.log" ] && wc -l < "$W/agent.log" | tr -d ' ' || echo 0; }
+mkdir "$W/.dump.lock.d"; printf '%s' "$$" > "$W/.dump.lock.d/pid"
+dump
+check "live holder: lock kept, nothing run" "$(runs)" "0"
+check "live holder: transcript left queued" "$(ls "$W/.dump-queue" | wc -l | tr -d ' ')" "1"
+sh -c 'exit 0' & dead=$!; wait "$dead"
+printf '%s' "$dead" > "$W/.dump.lock.d/pid"
+dump
+check "dead holder: lock taken, both queued jobs run" "$(runs)" "2"
+check "lock released after drain" "$([ -d "$W/.dump.lock.d" ] && echo held || echo free)" "free"
+mkdir "$W/.dump.lock.d"
+dump
+check "fresh PID-less lock is respected" "$(runs)" "2"
+
 echo
 printf 'TOTAL: \033[32m%d passed\033[0m, ' "$PASS"
 if [ "$FAIL" -gt 0 ]; then printf '\033[31m%d failed\033[0m\n' "$FAIL"; exit 1; fi

@@ -30,6 +30,33 @@ LOG="$WS/.dump.log"
 MIN_LINES="${MEMORY_DUMP_MIN_LINES:-8}"   # skip trivial sessions
 TRANSCRIPT="${MEMORY_DUMP_TRANSCRIPT:-${1:-}}"
 
+# ---- single-instance lock: an atomic mkdir dir holding its holder's PID (macOS has no flock).
+# The lock is stale only once that process is gone, so a long run is never taken over. A
+# PID-less lock (mid-acquire, or left by an older version) counts as live until 60 min old.
+lock_live() {
+  local pid
+  pid="$(cat "$1/pid" 2>/dev/null)"
+  case "$pid" in
+    ''|*[!0-9]*) [ -d "$1" ] && [ -z "$(find "$1" -maxdepth 0 -mmin +60 2>/dev/null)" ] ;;
+    *) kill -0 "$pid" 2>/dev/null ;;
+  esac
+}
+# lock_take <dir>: 0 if acquired (recording $$). A stale lock is cleared under a short-lived
+# takeover mutex, so two contenders can never both clear it and both acquire.
+lock_take() {
+  if ! mkdir "$1" 2>/dev/null; then
+    lock_live "$1" && return 1
+    [ -n "$(find "$1.takeover" -maxdepth 0 -mmin +1 2>/dev/null)" ] && rm -rf "$1.takeover"
+    mkdir "$1.takeover" 2>/dev/null || return 1
+    if lock_live "$1" || { rm -rf "$1"; ! mkdir "$1" 2>/dev/null; }; then
+      rmdir "$1.takeover" 2>/dev/null
+      return 1
+    fi
+    rmdir "$1.takeover" 2>/dev/null
+  fi
+  printf '%s' "$$" > "$1/pid"
+}
+
 # Never recurse: the spawned agent's SessionEnd must not refire this. The hook guards this too.
 [ -n "${MEMORY_DUMP_ACTIVE:-}" ] && exit 0
 [ -n "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] && exit 0
@@ -74,22 +101,18 @@ Rules:
   MEMORY_DUMP_ACTIVE=1 "$AGENT" --ws "$WS" "$prompt" >>"$LOG" 2>&1 || true
 }
 
-# Drain the queue under a single-instance lock (portable, no flock; mkdir is atomic). A stale
-# lock from a crashed run (>60 min old) is cleared first. After releasing, re-check: a session
-# that queued after the last pass saw the lock held and left its job to us.
+# Drain the queue under the single-instance lock. After releasing, re-check: a session that
+# queued after the last pass saw the lock held and left its job to us.
 while :; do
-  if [ -d "$LOCKDIR" ] && [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
-    rmdir "$LOCKDIR" 2>/dev/null || true
-  fi
-  mkdir "$LOCKDIR" 2>/dev/null || exit 0
-  trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
+  lock_take "$LOCKDIR" || exit 0
+  trap 'rm -rf "$LOCKDIR"' EXIT
   for job in "$QUEUE"/*; do
     [ -f "$job" ] || continue
     t="$(cat "$job" 2>/dev/null)"
     rm -f "$job"
     [ -n "$t" ] && [ -f "$t" ] && dump_one "$t"
   done
-  rmdir "$LOCKDIR" 2>/dev/null
+  rm -rf "$LOCKDIR"
   trap - EXIT
   [ -n "$(ls -A "$QUEUE" 2>/dev/null)" ] || exit 0
 done
