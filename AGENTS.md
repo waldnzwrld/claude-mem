@@ -19,10 +19,14 @@ only when doing memory maintenance.
 At the start of every session a **SessionStart hook** injects, as context:
 
 1. The **`index` page** — a compact table of contents (the "MOC", map of content).
-2. **Today's journal in full**, plus the **`## Focus` digest** of the previous up-to-4 dated
-   journals (each prior day contributes only its day's-work TOC — pull a full prior journal
-   with `outl_daily_get <date>` when a digest line points somewhere you need).
-3. Occasionally a **`⚠ Consolidation due`** flag (see *Condensation* below).
+2. **Today's journal in full** (only its `## Focus` digest once it exceeds
+   `MEMORY_TODAY_MAXBYTES`, default 6000 bytes — pull the rest with `outl_daily_today`), plus
+   the **`## Focus` digest** of the previous up-to-4 dated journals (each prior day contributes
+   only its day's-work TOC — pull a full prior journal with `outl_daily_get <date>` when a
+   digest line points somewhere you need).
+3. When aged journals await distillation, a note that background consolidation is running —
+   or, only when it cannot run or keeps failing, a **`⚠ CONSOLIDATION REQUIRED`** directive
+   (see *Condensation* below).
 
 Beyond the session-start injection, a **`UserPromptSubmit` hook pushes retrieval per prompt**:
 it runs the index against the user's prompt and, on a strong hit, injects a **"Relevant memory
@@ -88,16 +92,21 @@ You never choose the regime; it's gated on node count.
   by default, or `supersedes` / `contradicts` / `part-of`) and a `weight` (link multiplicity),
   and exactly one edge is kept per src→dst (the highest-precedence type). Typing has two
   sources, **authored beating inferred**:
-  - **Authored (authoritative):** a frontmatter prop that names the relationship, its value one
-    or more `[[slug]]` links — `supersedes:: [[old-note]]`, `contradicts:: [[other]]`,
-    `parent:: [[toc]]` (→ `part-of`). State the type here when you mean it; the keyword guess
-    never overrides it. Prefer this for any real supersede/contradict relation.
-  - **Inferred (fallback):** a bare inline `[[link]]` takes its type from the wording of its
-    line (line-granular — every link on a line is tagged alike), else `refs`.
-- **Type steers the walk, it isn't just a label.** A page that something `supersedes` is stale,
-  so association never surfaces it — the graph walk skips superseded targets. (The opt-in
-  `medic --prune-superseded` heal additionally drops plain refs into them.) You do nothing to
-  produce edges beyond authoring links/props; a schema bump self-heals on the next read.
+  - **Authored (authoritative):** a page prop (col-0 frontmatter or a leading body bullet) that
+    names the relationship, its value one or more `[[slug]]` links — `supersedes:: [[old-note]]`,
+    `contradicts:: [[other]]`, `parent:: [[toc]]` (→ `part-of`). State the type here when you
+    mean it; the keyword guess never overrides it. Prefer this for any real supersede/contradict
+    relation.
+  - **Inferred (fallback):** any other `[[link]]` takes its type from whole words on its line
+    (`replaces`, `under`, `conflicts`, …; line-granular — every link on a line is tagged
+    alike), else `refs`.
+- **Only authored types steer.** A page an authored `supersedes::` names is stale, so
+  association never surfaces it — the graph walk skips it (the opt-in
+  `medic --prune-superseded` heal additionally drops plain refs into it). Eviction cascades and
+  parent-chain credit follow authored `parent::` edges. An inferred type is only a label in
+  search output: prose like "filed under [[x]]" never puts a page in x's subtree. You do
+  nothing to produce edges beyond authoring links/props; a schema bump self-heals on the next
+  read.
 - **The SessionStart hook injects whether the index is ACTIVE.** When it is, retrieve like
   this: run **`memory-index search "<query terms>"`** *first* to land directly on the narrow
   relevant band — keyword (FTS5/bm25) ranking that returns `slug › heading` pointers, **then**
@@ -158,12 +167,11 @@ Two rules keep the tree lean:
   behind. An overgrown **TOC/hub** becomes a thin index of **sub-TOCs**: its entries are
   grouped into sub-TOCs (`<slug>-<group>`) and only their one-line `[[link]]` + hook stays in
   the parent. Either way detail moves down a level and the parent stays scannable — better to
-  traverse a few tiny pages than load one huge one. This is **automatic**: the daily
-  `memory-index maintain` sweep flags any page over budget (leaf or hub), and the SessionStart
-  hook hands them to the headless `memory-consolidate` compaction agent (which also distils
-  journals and prunes dead lines, leaves, and TOCs) — it carves them with no prompting. A `⚠
-  Split-on-growth candidates` directive is only the fallback for when the agent CLI is
-  unavailable.
+  traverse a few tiny pages than load one huge one. This is **automatic**: `memory-index
+  maintain` flags any page over budget (leaf or hub), and the SessionStart hook hands them to
+  the headless `memory-consolidate` compaction agent (which also distils journals) — it carves
+  them with no prompting. Without the agent CLI, oversized pages wait for a session where it
+  is available.
 - **TOCs live with their children — via frecency, not exemption.** A TOC now carries and
   decays frecency like any page, but every use of a descendant propagates credit *up* the
   `parent::` chain (see *Frecency & pruning*), so a TOC stays warm as long as anything beneath
@@ -387,10 +395,10 @@ current window.
 
 Every node — every content **line**, every **leaf**, and every **TOC/MOC** — that stops
 earning its place is dropped, so the tree never accretes dead weight. Frecency = frequency +
-recency, kept integer-simple (no exponentials), scaled to a **~1-month** window: long enough
+recency, kept integer-simple (no exponentials), scaled to **~30 days of use**: long enough
 that real-but-occasional knowledge survives, short enough that stale detail clears out. It is
 the **sole retention metric** for this decay-cache memory, and it runs at **three
-granularities**, all sharing the same seed **30** / cap **60** / **−1-per-day** decay:
+granularities**, all sharing the same seed **30** / cap **60** / **−1 per daily sweep** decay:
 
 - **Page (leaf AND TOC).** *Every* page carries `frecency::` (integer) and `seen::` (last date
   the score changed) as **hoisted frontmatter** — leaves and MOCs alike. There is **no `pin::`
@@ -431,20 +439,21 @@ so the `.outl` sidecar stays in sync. Anything that reaches **0 is FORGOTTEN imm
 no prompt, no injected `⚠` candidate list, no reviewed step:
 
 - **line → 0** — delete just that block (`outl block delete`); the file stays.
-- **leaf → 0** — soft-trash the page and scrub `[[it]]` out of every surviving block; the
-  parent TOC stays.
-- **MOC → 0** — soft-trash the MOC **and its whole subtree** (all descendants via `part-of`),
-  and scrub inbound refs. Upward credit propagation guarantees this only fires once the entire
-  subtree is cold, so the cascade is safe.
+- **leaf → 0** — soft-trash the page, then unlink `[[it]]` in every surviving block (a pointer
+  entry such as a TOC bullet is deleted; prose keeps the slug as plain text); the parent TOC
+  stays.
+- **MOC → 0** — soft-trash the MOC **and its whole subtree** (all descendants via authored
+  `parent::`), and unlink inbound refs. Upward credit propagation keeps a MOC warm while
+  anything beneath it is used, so the cascade only fires once the entire subtree is cold.
 
 The old "pruning stays yours / prune-candidate directive" step is **gone**: `maintain`
 performs all deletion itself through `outl`, then refreshes the index. `doctor` still reports
 `decay-risk` (page ≤5) and `sec-decay` (line ≤5) for visibility, and the ledger GCs block ids
 that no longer exist.
 
-Scale: a fresh node (seed 30) survives ~30 idle days; each use adds ~5 days; a
-heavily-used node rides at the 60-day cap. Deletion here is intentional and unrecoverable,
-exactly like journal burning.
+Scale: the sweep runs only on days with a session, so days away don't count. A fresh node
+(seed 30) survives ~30 days of use; each use adds ~5; a heavily-used node rides at the 60 cap.
+Deletion here is intentional and unrecoverable, exactly like journal burning.
 
 ## Research references (external live docs)
 

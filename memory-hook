@@ -4,11 +4,14 @@
 # which Claude Code emits natively; the omp and pi extensions (omp/llm-harness-memory.ts,
 # pi/llm-harness-memory.ts) translate their lifecycle events into it and set
 # MEMORY_HARNESS=omp|pi, which background agents inherit.
-#   SessionStart -> inject the memory index (TOC) + recent journals as context,
-#                   and, on the first session of a new day, flag journals that
-#                   have aged out of the retention window for condensation.
-#   PreCompact   -> best-effort reminder to flush unsaved notes to the journal
-#                   before the context is compacted.
+#   SessionStart     -> inject the memory index (TOC) + recent journals as context, refresh
+#                       the index, reap/distill aged journals, and run the once-a-day
+#                       frecency sweep.
+#   UserPromptSubmit -> push-retrieval: inject strong index hits for the prompt as pointers.
+#   PostToolUse      -> credit an outl_page_get fetch to frecency (memory-index touch).
+#   PreCompact       -> best-effort reminder to flush unsaved notes to the journal
+#                       before the context is compacted.
+#   SessionEnd       -> queue the transcript for the detached journaler (memory-dump).
 #
 # Reads the hook JSON on stdin, writes a hookSpecificOutput JSON on stdout.
 # Wired via ~/.claude/settings.json (Claude Code) or the omp / pi extension.
@@ -25,6 +28,33 @@ agent_ok() { [ -x "$AGENT" ] && "$AGENT" --available; }
 WS="${MEMORY_WS:-$HOME/.llm-harness-memory}"   # override targets an isolated workspace (tests)
 MARKER="$WS/.last-session-date"
 ATTEMPTS="$WS/.consolidate-attempts"    # per-journal count of consecutive auto-consolidation attempts
+
+# ---- single-instance lock: an atomic mkdir dir holding its holder's PID (macOS has no flock).
+# The lock is stale only once that process is gone, so a long run is never taken over. A
+# PID-less lock (mid-acquire, or left by an older version) counts as live until 60 min old.
+lock_live() {
+  local pid
+  pid="$(cat "$1/pid" 2>/dev/null)"
+  case "$pid" in
+    ''|*[!0-9]*) [ -d "$1" ] && [ -z "$(find "$1" -maxdepth 0 -mmin +60 2>/dev/null)" ] ;;
+    *) kill -0 "$pid" 2>/dev/null ;;
+  esac
+}
+# lock_take <dir>: 0 if acquired (recording $$). A stale lock is cleared under a short-lived
+# takeover mutex, so two contenders can never both clear it and both acquire.
+lock_take() {
+  if ! mkdir "$1" 2>/dev/null; then
+    lock_live "$1" && return 1
+    [ -n "$(find "$1.takeover" -maxdepth 0 -mmin +1 2>/dev/null)" ] && rm -rf "$1.takeover"
+    mkdir "$1.takeover" 2>/dev/null || return 1
+    if lock_live "$1" || { rm -rf "$1"; ! mkdir "$1" 2>/dev/null; }; then
+      rmdir "$1.takeover" 2>/dev/null
+      return 1
+    fi
+    rmdir "$1.takeover" 2>/dev/null
+  fi
+  printf '%s' "$$" > "$1/pid"
+}
 MAX_CONSOLIDATE_ATTEMPTS=2              # auto-retry a stuck journal this many times, then surface it
 TODAY="$(date +%F)"
 # Set inside the headless agents this system spawns (memory-consolidate, memory-dump): their
@@ -158,8 +188,8 @@ except Exception:
 fi
 
 # ---- SessionEnd: flush the session's durable facts to today's journal -------
-# Spawn the detached headless journaler (Sonnet 5) with the transcript path, unless
-# already inside a spawned agent (its own SessionEnd must not re-trigger us).
+# Spawn the detached headless journaler (on the harness's memory model) with the transcript
+# path, unless already inside a spawned agent (its own SessionEnd must not re-trigger us).
 if [ "$event" = "SessionEnd" ]; then
   if [ -z "$HEADLESS" ] \
      && [ -x "$DUMP" ] && agent_ok; then
@@ -177,7 +207,13 @@ except Exception:
 fi
 
 # ---- SessionStart (default) ----
-ctx="Persistent cross-session memory: an outl graph at ~/.llm-harness-memory — your active persistence layer, always loaded (state below), the FIRST place you look before code, a file/dir search, or the web. A UserPromptSubmit hook also PUSHES prompt-relevant slugs as a 'Relevant memory (auto-surfaced …)' pointer block before you act — pointers only, so outl_page_get to confirm (that fetch credits frecency); their absence does not mean memory is empty. Work from the injected index + journals below; for anything deeper dispatch the memory-recall subagent (Sonnet, read-only) — it walks the graph in isolation and returns the conclusion + [[slugs]] with the page bodies kept off this thread. Reserve a direct outl_page_get for a quick single-slug read; never brute-force the graph. Curate as you go: append durable decisions/discoveries to today's journal at each checkpoint, and write impactful facts through to their leaf. Full protocol (read only for maintenance): ~/.llm-harness-memory/AGENTS.md."$'\n\n'
+# pi has no subagents, so it descends the TOC itself instead of dispatching memory-recall.
+if [ "${MEMORY_HARNESS:-claude}" = pi ]; then
+  recall="for anything deeper descend the TOC yourself (index → topic TOC → leaf), one outl_page_get per hop."
+else
+  recall="for anything deeper dispatch the memory-recall subagent (Sonnet, read-only) — it walks the graph in isolation and returns the conclusion + [[slugs]] with the page bodies kept off this thread."
+fi
+ctx="Persistent cross-session memory: an outl graph at ~/.llm-harness-memory — your active persistence layer, always loaded (state below), the FIRST place you look before code, a file/dir search, or the web. A UserPromptSubmit hook also PUSHES prompt-relevant slugs as a 'Relevant memory (auto-surfaced …)' pointer block before you act — pointers only, so outl_page_get to confirm (that fetch credits frecency); their absence does not mean memory is empty. Work from the injected index + journals below; $recall Reserve a direct outl_page_get for a quick single-slug read; never brute-force the graph. Curate as you go: append durable decisions/discoveries to today's journal at each checkpoint, and write impactful facts through to their leaf. Full protocol (read only for maintenance): ~/.llm-harness-memory/AGENTS.md."$'\n\n'
 
 # Table of contents (index page), with a raw-file fallback.
 toc="$("$OUTL" export md index -w "$WS" 2>/dev/null)"
@@ -199,7 +235,7 @@ if [ -f "$tf" ]; then
     ctx+="## Journal $TODAY"$'\n\n'"$(cat "$tf" 2>/dev/null)"$'\n\n'
   else
     tfocus="$(focus_of "$tf")"
-    ctx+="## Journal $TODAY (Focus digest — today's journal is large; pull it in full, incl. Decisions/Discoveries/Open threads, via outl_daily_today)"$'\n\n'"${tfocus}"$'\n\n'
+    ctx+="## Journal $TODAY (Focus digest — today's journal is large; pull it in full via outl_daily_today)"$'\n\n'"${tfocus}"$'\n\n'
   fi
 fi
 
@@ -254,7 +290,10 @@ try:
 except Exception:
     print("")' 2>/dev/null)"
   fi
-  if [ -n "$pend" ]; then
+  if [ -n "$pend" ] && lock_live "$WS/.consolidate.lock.d"; then
+    # A background run holds the consolidation lock: not a failed attempt, nothing to launch.
+    ctx+="Memory consolidation is already running in a background agent for aged journals ($pend) — it will distill them into the knowledge tree and reap them. Do NOT consolidate or delete journals yourself."$'\n\n'
+  elif [ -n "$pend" ]; then
     # Still-pending here means a prior background run did not clear it. Count consecutive
     # auto-attempts per journal; after MAX_CONSOLIDATE_ATTEMPTS, stop launching and surface
     # the interactive fallback.
@@ -291,25 +330,34 @@ except Exception:
 fi
 
 # Once-per-new-day work (frecency sweep). Left to the next interactive session when headless.
+# The day is claimed with a lock held by the background sweep's PID, so simultaneous session
+# starts cannot both decay. The marker is written only once maintain succeeds; a failed sweep
+# releases the claim and a killed one leaves a dead PID, so either way the next session retries
+# (maintain's seen guard keeps a retry from decaying anything twice).
 last=""
 [ -f "$MARKER" ] && last="$(cat "$MARKER" 2>/dev/null)"
-if [ -z "$HEADLESS" ] && [ "$last" != "$TODAY" ]; then
+claim="$WS/.sweep-$TODAY.lock.d"
+if [ -z "$HEADLESS" ] && [ "$last" != "$TODAY" ] && [ -x "$MEMIDX" ] && lock_take "$claim"; then
+  for old in "$WS"/.sweep-*.lock.d; do  # claims left by a sweep killed on an earlier day
+    [ "$old" = "$claim" ] || rm -rf "$old"
+  done
   # Frecency sweep (silent, mechanical): decay every page + content line by 1 and EVICT
-  # anything that reached 0 — soft-trash + reference scrub, no prompt and no message. Then
+  # anything that reached 0 — soft-trash + reference unlink, no prompt and no message. Then
   # hand only the two generative jobs (journal distill + oversized split) to the detached
   # agent. Everything is backgrounded so SessionStart never blocks and nothing is surfaced.
-  if [ -x "$MEMIDX" ]; then
-    (
-      "$MEMIDX" -w "$WS" maintain >/dev/null 2>&1
-      "$MEMIDX" -w "$WS" refresh >/dev/null 2>&1
-      if [ -x "$CONS" ] && agent_ok; then
-        "$CONS" >/dev/null 2>&1
-      fi
-    ) >/dev/null 2>&1 &
-    disown 2>/dev/null || true
-  fi
-
-  printf '%s' "$TODAY" > "$MARKER" 2>/dev/null || true
+  (
+    if "$MEMIDX" -w "$WS" maintain >/dev/null 2>&1; then
+      printf '%s' "$TODAY" > "$MARKER" 2>/dev/null
+    fi
+    rm -rf "$claim"
+    "$MEMIDX" -w "$WS" refresh >/dev/null 2>&1
+    if [ -x "$CONS" ] && agent_ok; then
+      "$CONS" >/dev/null 2>&1
+    fi
+  ) >/dev/null 2>&1 &
+  # The claim belongs to the sweep, not this short-lived hook (bash 3.2 has no $BASHPID).
+  [ -d "$claim" ] && printf '%s' "$!" 2>/dev/null > "$claim/pid"
+  disown 2>/dev/null || true
 fi
 
 CTX="$ctx" emit "SessionStart"

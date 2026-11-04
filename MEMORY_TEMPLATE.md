@@ -31,8 +31,9 @@ before reaching for code, a file or directory search, or the web — check it ag
 block does not mean memory is empty. For anything deeper than the injected index/journals,
 **dispatch the `memory-recall` subagent** (Sonnet, read-only), which walks the graph in an
 isolated context and returns the conclusion + `[[slugs]]` without loading page bodies into the
-main thread. Reserve a direct `outl_page_get <slug>` for a quick single-slug read; never
-brute-force the graph.
+main thread; a harness without subagents (pi) descends the TOC itself, one `outl_page_get` per
+hop. Reserve a direct `outl_page_get <slug>` for a quick single-slug read; never brute-force
+the graph.
 
 **Curate continuously.** Append durable decisions/discoveries to today's journal at each
 checkpoint — don't wait for session end — and write impactful facts through to their knowledge

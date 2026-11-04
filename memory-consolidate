@@ -2,18 +2,16 @@
 #
 # memory-consolidate — automatic, headless compaction of the memory graph.
 #
-# One headless agent handles three backlogs in a single pass:
+# One headless agent handles two backlogs in a single pass:
 #   * journals — distil aged, un-`consolidated::` journals into knowledge leaves,
 #     mark each `consolidated:: <today>`, then reap (delete) the marked ones.
-#   * split    — carve a `type:: knowledge` leaf grown past the load budget
-#     (MEMORY_SPLIT_TOKENS) into a TOC + `<slug>-<section>` child leaves.
-#   * prune    — delete (soft/recoverable) a leaf whose frecency decayed to 0,
-#     after cleaning up its parent-TOC link, or bump it if it still earns a place.
-# Reaping and candidate detection are mechanical (`memory-index`); the distil,
-# split, and keep-vs-delete calls need an LLM, so this spawns a detached, headless
-# agent via `memory-agent` (claude -p, omp -p, or pi -p, per MEMORY_HARNESS) per
-# ~/.llm-harness-memory/AGENTS.md. The SessionStart hook backgrounds this whenever any
-# backlog exists.
+#   * split    — carve a page grown past the load budget (MEMORY_SPLIT_TOKENS) into a
+#     TOC + `<slug>-<section>` child leaves.
+# Decay and eviction are mechanical and live in `memory-index maintain`. Reaping and
+# candidate detection are mechanical too; distilling and splitting need an LLM, so this
+# spawns a detached, headless agent via `memory-agent` (claude -p, omp -p, or pi -p, per
+# MEMORY_HARNESS) per ~/.llm-harness-memory/AGENTS.md. The SessionStart hook backgrounds
+# this whenever any backlog exists.
 #
 # Safe to run any time and repeatedly: it no-ops when nothing is pending,
 # single-instances via a lock, and refuses to recurse into the agent it spawns.
@@ -27,18 +25,40 @@ LOCKDIR="$WS/.consolidate.lock.d"
 LOG="$WS/.consolidate.log"
 TODAY="$(date +%F)"
 
+# ---- single-instance lock: an atomic mkdir dir holding its holder's PID (macOS has no flock).
+# The lock is stale only once that process is gone, so a long run is never taken over. A
+# PID-less lock (mid-acquire, or left by an older version) counts as live until 60 min old.
+lock_live() {
+  local pid
+  pid="$(cat "$1/pid" 2>/dev/null)"
+  case "$pid" in
+    ''|*[!0-9]*) [ -d "$1" ] && [ -z "$(find "$1" -maxdepth 0 -mmin +60 2>/dev/null)" ] ;;
+    *) kill -0 "$pid" 2>/dev/null ;;
+  esac
+}
+# lock_take <dir>: 0 if acquired (recording $$). A stale lock is cleared under a short-lived
+# takeover mutex, so two contenders can never both clear it and both acquire.
+lock_take() {
+  if ! mkdir "$1" 2>/dev/null; then
+    lock_live "$1" && return 1
+    [ -n "$(find "$1.takeover" -maxdepth 0 -mmin +1 2>/dev/null)" ] && rm -rf "$1.takeover"
+    mkdir "$1.takeover" 2>/dev/null || return 1
+    if lock_live "$1" || { rm -rf "$1"; ! mkdir "$1" 2>/dev/null; }; then
+      rmdir "$1.takeover" 2>/dev/null
+      return 1
+    fi
+    rmdir "$1.takeover" 2>/dev/null
+  fi
+  printf '%s' "$$" > "$1/pid"
+}
+
 # Never recurse: the spawned agent's own session must not relaunch us. The hook guards this too.
 [ -n "${MEMORY_CONSOLIDATE_ACTIVE:-}" ] && exit 0
 
 [ -x "$MEMIDX" ] || exit 0
 
-# Single instance (portable, no flock — macOS has none). mkdir is atomic; clear a
-# stale lock left by a crashed run (>60 min old) before trying.
-if [ -d "$LOCKDIR" ] && [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
-  rmdir "$LOCKDIR" 2>/dev/null || true
-fi
-mkdir "$LOCKDIR" 2>/dev/null || exit 0
-trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
+lock_take "$LOCKDIR" || exit 0
+trap 'rm -rf "$LOCKDIR"' EXIT
 
 pending() {
   "$MEMIDX" -w "$WS" consolidate --json 2>/dev/null | python3 -c 'import sys, json
@@ -50,13 +70,11 @@ except Exception:
 
 pend="$(pending)"
 
-# Split candidates only. All pruning/eviction is now MECHANICAL and SILENT in
+# Split candidates only. All pruning/eviction is MECHANICAL and SILENT in
 # `memory-index maintain` (frecency 0 -> forgotten, no LLM); the agent handles only the two
-# generative jobs left — distilling journals and splitting oversized pages. The SessionStart
-# hook passes the authoritative sweep JSON via MEMORY_CONSOLIDATE_SWEEP; standalone, fall back
-# to a dry-run sweep (read-only, so it never double-decays).
-sweep="${MEMORY_CONSOLIDATE_SWEEP:-}"
-[ -z "$sweep" ] && sweep="$("$MEMIDX" -w "$WS" maintain --dry-run --json 2>/dev/null)"
+# generative jobs left — distilling journals and splitting oversized pages. Candidates come
+# from a dry-run sweep (no markdown changes, so it never double-decays).
+sweep="$("$MEMIDX" -w "$WS" maintain --dry-run --json 2>/dev/null)"
 split_slugs="$(printf '%s' "$sweep" | python3 -c 'import sys, json
 try:
     c = json.load(sys.stdin).get("split_candidates", [])

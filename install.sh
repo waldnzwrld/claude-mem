@@ -244,6 +244,49 @@ for f in memory-index memory-consolidate memory-dump; do
   echo "✔ $f -> $BIN_DIR/$f"
 done
 
+# ---- 2b. journal template: the page outl copies into each new daily journal ----
+# Kept to the sections AGENTS.md defines (templates-journal.md), through the outl CLI so the
+# op log stays consistent. Needs outl and an initialized workspace.
+if [ -d "$MEM_DIR/.outl" ] && [ -x "$OUTL_PATH" ]; then
+  OUTL="$OUTL_PATH" WS="$MEM_DIR" TEMPLATE="$SRC/templates-journal.md" python3 - <<'PY'
+import json, os, subprocess, sys
+
+outl, ws, slug = os.environ["OUTL"], os.environ["WS"], "templates-journal"
+with open(os.environ["TEMPLATE"], encoding="utf-8") as f:
+    want = [ln[2:].strip() for ln in f if ln.startswith("- ")]
+
+def run(*args):
+    return subprocess.run([outl, "-w", ws, *args], check=True, capture_output=True, text=True).stdout
+
+try:
+    try:
+        top = json.loads(run("page", "get", slug, "--json"))["data"]["outline"]
+    except subprocess.CalledProcessError:
+        top = None  # no template page yet
+    if top is not None and [b.get("text", "") for b in top] == want:
+        print("• journal template already has the shipped sections; left as-is")
+        sys.exit(0)
+    if top is None:
+        run("page", "create", slug, "--title", "templates/journal",
+            "--content", json.dumps([{"text": t} for t in want]))
+    else:
+        for b in top:
+            run("block", "delete", b["id"], "--confirm")
+        for t in want:
+            run("block", "append", "--page", slug, "--text", t)
+    run("page", "prop", "set", slug, "template=journal")
+    print("✔ journal template -> " + " / ".join(want)
+          + ("" if top is None else "  (previous blocks are in outl's trash)"))
+except subprocess.CalledProcessError as e:
+    print("✖ journal template -> `outl %s` failed: %s" % (" ".join(e.cmd[3:5]), (e.stderr or "").strip()),
+          file=sys.stderr)
+except (KeyError, ValueError) as e:
+    print(f"✖ journal template -> unexpected `outl page get` output ({e})", file=sys.stderr)
+PY
+else
+  echo "• journal template -> needs outl and an initialized $MEM_DIR; re-run install.sh after 'outl init'"
+fi
+
 # ================================= Claude Code ======================================
 if [ "$WANT_CLAUDE" = 1 ]; then
 
@@ -262,19 +305,22 @@ append_memory_section "$CLAUDEMD" yes
 # ---- 5. wire hooks + auto-allow read-only recall tools into settings.json ----
 if command -v python3 >/dev/null 2>&1; then
   SETTINGS="$SETTINGS" HOOK="$HOOK" MEM_DIR="$MEM_DIR" python3 - <<'PY'
-import json, os
+import json, os, sys, tempfile
 
 path = os.environ['SETTINGS']
 cmd  = os.environ['HOOK']
 mem  = os.environ['MEM_DIR']
 
+# An unparsable settings.json is the user's to fix: rewriting it would drop everything in it.
 try:
     with open(path) as f:
         data = json.load(f)
-    if not isinstance(data, dict):
-        data = {}
-except (FileNotFoundError, ValueError):
+except FileNotFoundError:
     data = {}
+except ValueError as e:
+    sys.exit("✖ %s is not valid JSON (%s); left untouched — fix it and re-run install.sh" % (path, e))
+if not isinstance(data, dict):
+    sys.exit("✖ %s is not a JSON object; left untouched — fix it and re-run install.sh" % path)
 
 hooks = data.setdefault('hooks', {})
 
@@ -344,10 +390,21 @@ allow.extend(added)
 perms_changed = bool(added) or collapsed > 0
 
 if hooks_changed or perms_changed:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2)
-        f.write('\n')
+    real = os.path.realpath(path)  # a symlinked settings.json is written through, as before
+    os.makedirs(os.path.dirname(real), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix='.settings.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.write('\n')
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp, os.stat(real).st_mode & 0o777 if os.path.exists(real) else 0o666 & ~umask)
+        os.replace(tmp, real)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 if hooks_changed:
     print("✔ settings.json  -> wired SessionStart + PreCompact + SessionEnd + "
